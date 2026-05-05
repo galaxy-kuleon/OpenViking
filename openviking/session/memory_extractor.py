@@ -281,9 +281,15 @@ class MemoryExtractor:
             from openviking.session.memory.utils.language import resolve_with_override
 
             config = get_openviking_config()
+            # Note: resolve_with_override calls detect() with no args, so
+            # the callable must accept zero positional arguments.  Earlier
+            # versions passed a `lambda fb: ...` here which raised TypeError
+            # at the call site.  The default fallback inside
+            # _detect_output_language is "en", which matches the previous
+            # caller's intent.
             output_language = resolve_with_override(
                 config,
-                lambda fb: self._detect_output_language(messages, fallback_language=fb),
+                lambda: self._detect_output_language(messages),
             )
             history_summary = str(context.get("summary") or "")
 
