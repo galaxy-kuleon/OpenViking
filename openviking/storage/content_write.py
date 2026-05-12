@@ -69,6 +69,8 @@ class ContentWriteCoordinator:
             raise InvalidArgumentError(f"write only supports existing files, got directory: {uri}")
 
         context_type = self._context_type_for_uri(normalized_uri)
+        if context_type == "signal":
+            raise InvalidArgumentError(f"signal writes are append-only; use create mode: {uri}")
         root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx)
         written_bytes = len(content.encode("utf-8"))
         telemetry_id = get_current_telemetry().telemetry_id
@@ -182,27 +184,34 @@ class ContentWriteCoordinator:
                 get_request_wait_tracker().register_request(telemetry_id)
             await self._write_in_place(uri, content, mode=mode, ctx=ctx)
             content_written = True
-            await self._enqueue_semantic_refresh(
-                root_uri=root_uri,
-                changed_uri=uri,
-                context_type=context_type,
-                ctx=ctx,
-                lifecycle_lock_handle_id=handle.id,
-                change_type="added" if mode == "create" else "modified",
-            )
-            lock_transferred = True
-            queue_status = (
-                await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
-                if wait
-                else None
-            )
+            result_wait = wait
+            if context_type == "signal":
+                queue_status = None
+                await lock_manager.release(handle)
+                lock_transferred = True
+                result_wait = True
+            else:
+                await self._enqueue_semantic_refresh(
+                    root_uri=root_uri,
+                    changed_uri=uri,
+                    context_type=context_type,
+                    ctx=ctx,
+                    lifecycle_lock_handle_id=handle.id,
+                    change_type="added" if mode == "create" else "modified",
+                )
+                lock_transferred = True
+                queue_status = (
+                    await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
+                    if wait
+                    else None
+                )
             return self._build_write_result(
                 uri=uri,
                 root_uri=root_uri,
                 context_type=context_type,
                 mode=mode,
                 written_bytes=written_bytes,
-                wait=wait,
+                wait=result_wait,
                 queue_status=queue_status,
             )
         except Exception:
@@ -561,17 +570,24 @@ class ContentWriteCoordinator:
             if len(parts) >= 2:
                 root_uri = VikingURI.build("resources", parts[1])
         elif parts[0] == "user":
-            try:
-                memories_idx = parts.index("memories")
-            except ValueError as exc:
-                raise InvalidArgumentError(
-                    f"write only supports memory files under user scope: {uri}"
-                ) from exc
-            if len(parts) <= memories_idx + 1:
-                raise InvalidArgumentError(
-                    f"memory write target must be inside a memory type directory: {uri}"
-                )
-            root_uri = VikingURI.build(*parts[: memories_idx + 2])
+            # OpenWebUI/Hermes bridge stores append-only raw user signals under
+            # viking://user/{uid}/signals/{signal_type}/... .  Check this before
+            # looking for "memories" so signal payload paths cannot be routed
+            # into memory refresh/vectorization.
+            if len(parts) >= 4 and parts[2] == "signals":
+                root_uri = VikingURI.build(*parts[:4])
+            else:
+                try:
+                    memories_idx = parts.index("memories")
+                except ValueError as exc:
+                    raise InvalidArgumentError(
+                        f"write only supports memory or signal files under user scope: {uri}"
+                    ) from exc
+                if len(parts) <= memories_idx + 1:
+                    raise InvalidArgumentError(
+                        f"memory write target must be inside a memory type directory: {uri}"
+                    )
+                root_uri = VikingURI.build(*parts[: memories_idx + 2])
         elif parts[0] == "agent":
             if len(parts) >= 3 and parts[1] == "skills":
                 root_uri = VikingURI.build(*parts[:3])
@@ -597,7 +613,10 @@ class ContentWriteCoordinator:
         return root_uri
 
     def _context_type_for_uri(self, uri: str) -> str:
-        if "/memories/" in uri:
+        parts = [part for part in VikingURI(uri).full_path.split("/") if part]
+        if len(parts) >= 4 and parts[0] == "user" and parts[2] == "signals":
+            return "signal"
+        if parts and parts[0] in {"user", "agent"} and "memories" in parts:
             return "memory"
         if "/skills/" in uri or uri.startswith("viking://agent/skills/"):
             return "skill"

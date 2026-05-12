@@ -741,6 +741,218 @@ async def test_create_mode_resource_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_mode_resource_path_containing_signals_still_refreshes(monkeypatch):
+    file_uri = "viking://resources/demo/signals/test.md"
+    root_uri = "viking://resources/demo"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+    lock_manager = _FakeLockManager()
+    captured_enqueue = {}
+
+    monkeypatch.setattr("openviking.storage.content_write.get_lock_manager", lambda: lock_manager)
+
+    async def _fake_enqueue_semantic_refresh(**kwargs):
+        captured_enqueue.update(kwargs)
+
+    async def _fake_wait_for_queues(*, timeout):
+        del timeout
+        return None
+
+    monkeypatch.setattr(coordinator, "_enqueue_semantic_refresh", _fake_enqueue_semantic_refresh)
+    monkeypatch.setattr(coordinator, "_wait_for_queues", _fake_wait_for_queues)
+
+    result = await coordinator.write(
+        uri=file_uri,
+        content="content",
+        mode="create",
+        ctx=ctx,
+        wait=True,
+    )
+
+    assert result["context_type"] == "resource"
+    assert captured_enqueue["changed_uri"] == file_uri
+    assert captured_enqueue["context_type"] == "resource"
+
+
+@pytest.mark.asyncio
+async def test_create_mode_resource_path_containing_memories_still_refreshes(monkeypatch):
+    file_uri = "viking://resources/demo/memories/test.md"
+    root_uri = "viking://resources/demo"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+    lock_manager = _FakeLockManager()
+    captured_enqueue = {}
+
+    monkeypatch.setattr("openviking.storage.content_write.get_lock_manager", lambda: lock_manager)
+
+    async def _fake_enqueue_semantic_refresh(**kwargs):
+        captured_enqueue.update(kwargs)
+
+    async def _fake_wait_for_queues(*, timeout):
+        del timeout
+        return None
+
+    monkeypatch.setattr(coordinator, "_enqueue_semantic_refresh", _fake_enqueue_semantic_refresh)
+    monkeypatch.setattr(coordinator, "_wait_for_queues", _fake_wait_for_queues)
+
+    result = await coordinator.write(
+        uri=file_uri,
+        content="content",
+        mode="create",
+        ctx=ctx,
+        wait=True,
+    )
+
+    assert result["context_type"] == "resource"
+    assert captured_enqueue["changed_uri"] == file_uri
+    assert captured_enqueue["context_type"] == "resource"
+
+
+@pytest.mark.asyncio
+async def test_create_mode_user_signal_scope(monkeypatch):
+    file_uri = "viking://user/default/signals/openwebui-feedback/event-1.json"
+    root_uri = "viking://user/default/signals/openwebui-feedback"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+    lock_manager = _FakeLockManager()
+    captured_enqueue = {}
+
+    monkeypatch.setattr("openviking.storage.content_write.get_lock_manager", lambda: lock_manager)
+
+    async def _fake_enqueue_semantic_refresh(**kwargs):
+        captured_enqueue.update(kwargs)
+
+    async def _fake_wait_for_queues(*, timeout):
+        del timeout
+        return None
+
+    monkeypatch.setattr(coordinator, "_enqueue_semantic_refresh", _fake_enqueue_semantic_refresh)
+    monkeypatch.setattr(coordinator, "_wait_for_queues", _fake_wait_for_queues)
+
+    result = await coordinator.write(
+        uri=file_uri,
+        content='{"event_id":"event-1"}',
+        mode="create",
+        ctx=ctx,
+        wait=True,
+    )
+
+    assert result["context_type"] == "signal"
+    assert result["root_uri"] == root_uri
+    assert result["semantic_status"] == "complete"
+    assert result["vector_status"] == "complete"
+    assert captured_enqueue == {}
+    assert lock_manager.release_calls == ["lock-1"]
+    assert viking_fs.content[file_uri] == '{"event_id":"event-1"}'
+
+
+@pytest.mark.asyncio
+async def test_create_mode_user_signal_scope_is_complete_without_wait(monkeypatch):
+    file_uri = "viking://user/default/signals/openwebui-feedback/event-1.json"
+    root_uri = "viking://user/default/signals/openwebui-feedback"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+    lock_manager = _FakeLockManager()
+    captured_enqueue = {}
+
+    monkeypatch.setattr("openviking.storage.content_write.get_lock_manager", lambda: lock_manager)
+
+    async def _fake_enqueue_semantic_refresh(**kwargs):
+        captured_enqueue.update(kwargs)
+
+    monkeypatch.setattr(coordinator, "_enqueue_semantic_refresh", _fake_enqueue_semantic_refresh)
+
+    result = await coordinator.write(
+        uri=file_uri,
+        content='{"event_id":"event-1"}',
+        mode="create",
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert result["context_type"] == "signal"
+    assert result["root_uri"] == root_uri
+    assert result["semantic_status"] == "complete"
+    assert result["vector_status"] == "complete"
+    assert captured_enqueue == {}
+    assert lock_manager.release_calls == ["lock-1"]
+
+
+@pytest.mark.asyncio
+async def test_existing_user_signal_scope_rejects_replace_and_append():
+    file_uri = "viking://user/default/signals/openwebui-feedback/event-1.json"
+    root_uri = "viking://user/default/signals/openwebui-feedback"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=True)
+    viking_fs.content[file_uri] = '{"event_id":"event-1"}'
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+
+    for mode in ("replace", "append"):
+        with pytest.raises(InvalidArgumentError, match="signal writes are append-only"):
+            await coordinator.write(
+                uri=file_uri,
+                content='{"event_id":"event-1","changed":true}',
+                mode=mode,
+                ctx=ctx,
+                wait=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_create_mode_user_signal_path_containing_memories_stays_signal(monkeypatch):
+    file_uri = "viking://user/default/signals/openwebui-feedback/memories/event-1.json"
+    root_uri = "viking://user/default/signals/openwebui-feedback"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+    lock_manager = _FakeLockManager()
+    captured_enqueue = {}
+
+    monkeypatch.setattr("openviking.storage.content_write.get_lock_manager", lambda: lock_manager)
+
+    async def _fake_enqueue_semantic_refresh(**kwargs):
+        captured_enqueue.update(kwargs)
+
+    monkeypatch.setattr(coordinator, "_enqueue_semantic_refresh", _fake_enqueue_semantic_refresh)
+
+    result = await coordinator.write(
+        uri=file_uri,
+        content='{"event_id":"event-1"}',
+        mode="create",
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert result["context_type"] == "signal"
+    assert result["root_uri"] == root_uri
+    assert result["semantic_status"] == "complete"
+    assert result["vector_status"] == "complete"
+    assert captured_enqueue == {}
+
+
+@pytest.mark.asyncio
+async def test_create_mode_rejects_non_memory_non_signal_user_scope():
+    file_uri = "viking://user/default/profile/event-1.json"
+    root_uri = "viking://user/default/profile"
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
+    coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
+
+    with pytest.raises(InvalidArgumentError, match="memory or signal files"):
+        await coordinator.write(
+            uri=file_uri,
+            content='{"event_id":"event-1"}',
+            mode="create",
+            ctx=ctx,
+            wait=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_mode_regression_replace_unchanged(monkeypatch):
     file_uri = "viking://user/default/memories/theme.md"
     root_uri = "viking://user/default/memories"
