@@ -11,7 +11,10 @@ from openviking.server.identity import RequestContext
 from openviking_cli.utils.uri import VikingURI
 
 _CONTENT_TYPES_BY_SCOPE = {
-    "user": {"memories": "memory", "resources": "resource", "skills": "skill"},
+    # kg: "signals" classifies as the dedicated "signal" content type so that
+    # OpenWebUI/Hermes feedback payloads under viking://user/{uid}/signals/...
+    # are never treated as memory/resource and thus never vectorized.
+    "user": {"memories": "memory", "resources": "resource", "skills": "skill", "signals": "signal"},
     "agent": {"memories": "memory", "resources": "resource", "skills": "skill"},
 }
 _PEER_CONTENT_SEGMENTS = frozenset({"memories", "resources"})

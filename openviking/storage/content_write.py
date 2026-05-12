@@ -80,6 +80,10 @@ class ContentWriteCoordinator:
             raise InvalidArgumentError(f"write only supports existing files, got directory: {uri}")
 
         context_type = context_type_for_uri(normalized_uri)
+        if context_type == "signal":
+            # kg: feedback signals are append-only — updates must use create mode
+            # with a fresh event file so a signal is never re-vectorized.
+            raise InvalidArgumentError(f"signal writes are append-only; use create mode: {uri}")
         root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx)
         written_bytes = len(content.encode("utf-8"))
         telemetry_id = get_current_telemetry().telemetry_id
@@ -259,6 +263,24 @@ class ContentWriteCoordinator:
                 get_request_wait_tracker().register_request(telemetry_id)
             await self._write_in_place(uri, content, mode=mode, ctx=ctx)
             content_written = True
+            if context_type == "signal":
+                # kg: OpenWebUI/Hermes feedback signals are append-only and must
+                # NOT be vectorized into memory. Skip the semantic refresh entirely
+                # and report completion immediately — there is nothing to wait on.
+                await lock_manager.release(handle)
+                lock_released = True
+                queue_status = None
+                return self._build_write_result(
+                    uri=uri,
+                    root_uri=root_uri,
+                    context_type=context_type,
+                    mode=mode,
+                    written_bytes=written_bytes,
+                    wait=wait,
+                    queue_status=queue_status,
+                    semantic_status="complete",
+                    vector_status="complete",
+                )
             await self._enqueue_semantic_refresh(
                 root_uri=root_uri,
                 changed_uri=uri,
@@ -790,7 +812,13 @@ class ContentWriteCoordinator:
             if len(parts) >= 2:
                 root_uri = VikingURI.build("resources", parts[1])
         elif parts[0] == "user":
-            if "resources" in parts:
+            # kg: OpenWebUI/Hermes bridge stores append-only raw user signals under
+            # viking://user/{uid}/signals/{signal_type}/... .  Resolve their root
+            # before "resources"/"memories" so signal payloads are never routed
+            # into memory/resource semantic refresh or vectorization.
+            if len(parts) >= 4 and parts[2] == "signals":
+                root_uri = VikingURI.build(*parts[:4])
+            elif "resources" in parts:
                 resources_idx = parts.index("resources")
                 if len(parts) <= resources_idx + 1:
                     raise InvalidArgumentError(
@@ -802,7 +830,7 @@ class ContentWriteCoordinator:
                     memories_idx = parts.index("memories")
                 except ValueError as exc:
                     raise InvalidArgumentError(
-                        f"write only supports memory or resource files under user scope: {uri}"
+                        f"write only supports memory, resource, or signal files under user scope: {uri}"
                     ) from exc
                 if len(parts) <= memories_idx + 1:
                     raise InvalidArgumentError(
