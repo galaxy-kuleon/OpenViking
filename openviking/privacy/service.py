@@ -5,8 +5,7 @@
 import json
 from typing import Any, Optional
 
-from openviking_cli.exceptions import NotFoundError
-
+from openviking.core.namespace import canonical_user_root
 from openviking.privacy.helpers import (
     canonicalize_values,
     config_root_uri,
@@ -20,6 +19,7 @@ from openviking.privacy.models import UserPrivacyConfigMeta, UserPrivacyConfigVe
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.time_utils import get_current_timestamp
+from openviking_cli.exceptions import NotFoundError
 
 
 class UserPrivacyConfigService:
@@ -28,8 +28,11 @@ class UserPrivacyConfigService:
     def __init__(self, viking_fs: VikingFS):
         self._viking_fs = viking_fs
 
+    def _user_root(self, ctx: RequestContext) -> str:
+        return canonical_user_root(ctx)
+
     def _user_space(self, ctx: RequestContext) -> str:
-        return ctx.user.user_space_name()
+        return self._user_root(ctx)[len("viking://user/") :]
 
     def get_config_root(self, ctx: RequestContext, category: str, target_key: str) -> str:
         return config_root_uri(self._user_space(ctx), category, target_key)
@@ -44,7 +47,9 @@ class UserPrivacyConfigService:
     async def _ensure_root(self, ctx: RequestContext, category: str, target_key: str) -> None:
         root_uri = self.get_config_root(ctx, category, target_key)
         await self._viking_fs.mkdir(root_uri, exist_ok=True, ctx=ctx)
-        await self._viking_fs.mkdir(history_dir_uri(self._user_space(ctx), category, target_key), exist_ok=True, ctx=ctx)
+        await self._viking_fs.mkdir(
+            history_dir_uri(self._user_space(ctx), category, target_key), exist_ok=True, ctx=ctx
+        )
 
     async def get_meta(
         self, ctx: RequestContext, category: str, target_key: str
@@ -90,7 +95,7 @@ class UserPrivacyConfigService:
         return UserPrivacyConfigVersion.from_dict(json.loads(content))
 
     async def list_categories(self, ctx: RequestContext) -> list[str]:
-        uri = f"viking://user/{self._user_space(ctx)}/privacy"
+        uri = f"{self._user_root(ctx)}/privacy"
         try:
             entries = await self._viking_fs.ls(uri, ctx=ctx)
         except Exception:
@@ -98,7 +103,7 @@ class UserPrivacyConfigService:
         return sorted(entry["name"] for entry in entries if entry.get("name"))
 
     async def list_targets(self, ctx: RequestContext, category: str) -> list[str]:
-        uri = f"viking://user/{self._user_space(ctx)}/privacy/{category}"
+        uri = f"{self._user_root(ctx)}/privacy/{category}"
         try:
             entries = await self._viking_fs.ls(uri, ctx=ctx)
         except Exception:

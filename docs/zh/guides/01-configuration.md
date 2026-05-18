@@ -512,8 +512,10 @@ openviking-server doctor
 | `thinking` | bool | 启用思考模式（仅对部分火山模型生效，默认：`false`） |
 | `max_concurrent` | int | 语义处理阶段 LLM 最大并发调用数（默认：`100`） |
 | `max_retries` | int | VLM provider 瞬时错误的最大重试次数（默认：`3`；`0` 表示禁用重试） |
+| `backup` | object | 可选的备用 VLM 配置（结构与 `vlm` 相同），当主 VLM 遇到限流、`5xx`、超时或连接失败等可重试错误时自动切换。仅支持 1 层备用 &mdash; 备用 VLM 本身不能再嵌套 `backup` |
 | `timeout` | float | 单次 VLM API 请求的 HTTP 超时时间（秒），传递给底层 OpenAI/LiteLLM 客户端。慢端点（如 DashScope、本地推理）可调大。必须 `> 0`（默认：`60.0`） |
 | `extra_headers` | object | 兼容 HTTP provider 的自定义请求头。`kimi` 默认已注入所需订阅请求头，也支持在这里覆盖或扩展 |
+| `extra_request_body` | object | 传给 OpenAI 兼容 completion 请求的额外 JSON body 字段，可用于 Ollama `{"think": false}` 等 provider 专有参数 |
 | `stream` | bool | 启用流式模式（OpenAI 兼容 provider 可用，默认：`false`） |
 
 `vlm.max_retries` 仅对瞬时错误生效，例如 `429`、`5xx`、超时和连接错误；认证、鉴权、欠费等永久错误不会自动重试。退避策略为指数退避，初始延迟 `0.5s`，上限 `8s`，并带随机抖动。
@@ -565,6 +567,24 @@ openviking-server doctor
 - **Kimi Coding**: 需要自定义 user agent 或追加订阅请求头时可以在这里覆盖
 - **自定义代理**: 添加认证头或追踪头
 - **API 网关**: 添加版本或路由标识
+
+**自定义请求 Body**
+
+对于接受 provider 专有 JSON body 字段的 OpenAI 兼容 provider，可以通过 `extra_request_body` 配置。OpenViking 会把这些字段合并到 OpenAI SDK 或 LiteLLM 发送的 `extra_body` 中：
+
+```json
+{
+  "vlm": {
+    "provider": "litellm",
+    "api_key": "ollama",
+    "model": "ollama/llama3.1",
+    "api_base": "http://127.0.0.1:11434",
+    "extra_request_body": {
+      "think": false
+    }
+  }
+}
+```
 
 **流式模式**
 
@@ -707,7 +727,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 {
   "retrieval": {
     "hotness_alpha": 0.0,
-    "score_propagation_alpha": 0.5
+    "score_propagation_alpha": 1.0
   }
 }
 ```
@@ -715,7 +735,7 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `hotness_alpha` | float | hotness 分数在最终召回分数中的混合权重。`0.0` 表示关闭 hotness boost，最终分数等于语义相似度；`1.0` 表示只使用 hotness。有效范围：`0.0` 到 `1.0`。 | `0.0` |
-| `score_propagation_alpha` | float | 层级检索中，子节点自身分数与父节点传播分数混合时，子节点自身分数的权重。`0.5` 保持当前 50/50 行为；`1.0` 表示忽略父节点分数；`0.0` 表示只使用父节点分数。有效范围：`0.0` 到 `1.0`。 | `0.5` |
+| `score_propagation_alpha` | float | 层级检索中，子节点自身分数与父节点传播分数混合时，子节点自身分数的权重。`1.0` 表示忽略父节点分数（仅使用语义相似度）；`0.5` 表示与父节点分数等权混合；`0.0` 表示只使用父节点分数。有效范围：`0.0` 到 `1.0`。 | `1.0` |
 
 如果需要分数严格反映向量相似度，保持 `hotness_alpha` 为 `0.0`。只有当希望高频访问或最近更新的上下文获得排序提升时，才将它设置为大于 `0.0`。
 
@@ -753,13 +773,79 @@ AST 提取支持：Python、JavaScript/TypeScript、Rust、Go、Java、C/C++。�
 |------|------|------|--------|
 | `backend` | str | `"local"`、`"s3"` 或 `"memory"` | `"local"` |
 | `timeout` | float | 请求超时时间（秒） | `10.0` |
-| `queue_db_path` | str（可选）| 覆盖 queuefs sqlite 数据库文件路径。未设置时默认为 `{storage.workspace}/_system/queue/queue.db`。适用于 workspace 卷不支持 sqlite 的场景（例如某些网络文件系统） | `null` |
+| `queuefs` | object | QueueFS 配置。控制 `/queue` 的命名空间模式、后端和运行时参数 | `{ "mode": "shared", "backend": "sqlite", "recover_stale_sec": 0, "busy_timeout_ms": 5000 }` |
+| `queue_db_path` | str（可选）| 旧版兼容字段，用于覆盖 QueueFS 的 sqlite 数据库文件路径。已被 `storage.agfs.queuefs.db_path` 取代。未设置时默认为 `{storage.workspace}/_system/queue/queue.db`。适用于 workspace 卷不支持 sqlite 的场景（例如某些网络文件系统） | `null` |
 | `s3` | object | S3 backend configuration (when backend is 's3') | - |
 
 
 **配置示例**
 
 RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系统。
+
+##### QueueFS 配置
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `mode` | str | QueueFS 命名空间模式：`"shared"` 使用 `/queue`；`"worker"` 为每个 worker 隔离到 `/queue/worker-<index\|pid>` | `"shared"` |
+| `backend` | str | QueueFS 后端：`"memory"`、`"sqlite"` 或 `"sqlite3"` | `"sqlite"` |
+| `db_path` | str（可选） | 当 backend 为 `"sqlite"` 或 `"sqlite3"` 时使用的 QueueFS sqlite 数据库路径 | `null` |
+| `recover_stale_sec` | int | 启动时恢复超过该秒数的 `processing` 队列消息；`0` 表示恢复全部 stale processing 消息 | `0` |
+| `busy_timeout_ms` | int | QueueFS sqlite 的 busy timeout，单位毫秒 | `5000` |
+
+说明：
+
+- 即使主 AGFS 存储后端是 `local`、`s3` 或 `memory`，QueueFS 默认仍使用 `sqlite`。
+- `mode=shared` 会继续使用历史上的全局队列命名空间 `/queue`；`mode=worker` 会为每个 worker 隔离到 `/queue/worker-<index|pid>`。
+- `db_path` 仅在 QueueFS backend 为 `sqlite` 或 `sqlite3` 时生效。
+- 如果同时设置了 `storage.agfs.queuefs.db_path` 和旧字段 `storage.agfs.queue_db_path`，以前者为准。
+- 如果 QueueFS backend 为 `memory`，则 `db_path` 和旧字段 `queue_db_path` 都会被忽略。
+
+示例：
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "queuefs": {
+        "mode": "shared",
+        "backend": "sqlite",
+        "db_path": "./data/_system/queue/custom-queue.db"
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "queuefs": {
+        "mode": "worker",
+        "backend": "memory"
+      }
+    }
+  }
+}
+```
+
+旧字段兼容示例：
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "agfs": {
+      "backend": "local",
+      "queue_db_path": "./data/_system/queue/queue.db"
+    }
+  }
+}
+```
 
 
 ##### S3 后端配置
@@ -940,6 +1026,8 @@ openviking-server --config /path/to/ov.conf
 
 ### ovcli.conf
 
+你可以手动编辑此文件，也可以用 `ov config setup-cli` 交互式生成。如果你维护着多个服务端的配置，可以用 `ov config switch` 在它们之间切换。
+
 HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远程服务端的配置文件：
 
 ```json
@@ -949,8 +1037,8 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
   "account": "acme",
   "user": "alice",
   "agent_id": "my-agent",
-  "output": "table",
   "upload": {
+    "mode": "local",
     "ignore_dirs": "node_modules,.cache,.nx",
     "include": "*.md,*.pdf",
     "exclude": "*.tmp,*.log"
@@ -965,10 +1053,12 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
 | `account` | 默认发送为 `X-OpenViking-Account` 的租户标识 | `null` |
 | `user` | 默认发送为 `X-OpenViking-User` 的用户标识 | `null` |
 | `agent_id` | Agent 标识，用于 agent space 隔离 | `null` |
-| `output` | 默认输出格式：`"table"` 或 `"json"` | `"table"` |
 | `upload.ignore_dirs` | `add-resource` 默认忽略目录列表（CSV） | `null` |
 | `upload.include` | `add-resource` 默认包含模式（CSV） | `null` |
 | `upload.exclude` | `add-resource` 默认排除模式（CSV） | `null` |
+| `upload.mode` | 临时上传后端：`"local"`（仅当前实例本地磁盘）或 `"shared"`（分布式共享存储，当消费请求可能落到不同实例时必需）。可通过 `OPENVIKING_UPLOAD_MODE` 单次覆盖。 | `null`（使用服务端 `temp_upload.default_mode`，默认仍为 `"local"`） |
+
+本地目录上传会默认遵循 `.gitignore`（根目录和子目录，含 `!` 反向规则）。`ignore_dirs/include/exclude` 会在此基础上进一步过滤。
 
 也可以在单次命令里用 CLI 参数覆盖这些身份字段：
 
@@ -997,7 +1087,12 @@ openviking add-resource ./docs --exclude "*.tmp"
     "port": 1933,
     "auth_mode": "api_key",
     "root_api_key": "your-secret-root-key",
-    "cors_origins": ["*"]
+    "cors_origins": ["*"],
+    "temp_upload": {
+      "default_mode": "local",
+      "shared_max_size_bytes": 536870912,
+      "shared_prefix": "viking://upload"
+    }
   }
 }
 ```
@@ -1009,6 +1104,9 @@ openviking add-resource ./docs --exclude "*.tmp"
 | `auth_mode` | str | 认证模式：`"api_key"` 或 `"trusted"`。默认值为 `"api_key"` | `"api_key"` |
 | `root_api_key` | str | Root API Key。在 `api_key` 模式下启用多租户认证；在 `trusted` 模式下它只是可选附加保护，不负责解析普通用户身份 | `null` |
 | `cors_origins` | list | CORS 允许的来源 | `["*"]` |
+| `temp_upload.default_mode` | str | `POST /api/v1/resources/temp_upload` 的服务端默认模式（客户端未显式传 `upload_mode` 时使用）：`"local"`（仅当前实例本地磁盘，单机默认行为）或 `"shared"`（分布式共享存储，多副本部署可跨实例消费）。 | `"local"` |
+| `temp_upload.shared_max_size_bytes` | int | `shared` 模式下接受的最大文件大小（字节）。超过此阈值的请求会在写入对象存储之前被拒绝。 | `536870912`（512 MiB） |
+| `temp_upload.shared_prefix` | str | 分配 shared `temp_file_id` 对象时使用的 URI 前缀。 | `"viking://upload"` |
 
 `api_key` 模式使用 API Key 认证，也是默认模式；`trusted` 模式信任上游网关或受信调用方注入的 `X-OpenViking-Account` / `X-OpenViking-User` 请求头。
 
@@ -1131,6 +1229,26 @@ openviking add-resource ./docs --exclude "*.tmp"
 
 路径锁机制的详细说明见 [路径锁与崩溃恢复](../concepts/09-transaction.md)。
 
+## storage.task_tracker 段
+
+任务跟踪器记录异步任务状态，适用于返回 `task_id` 的接口（任务类型包括 `session_commit`、`add_resource`、`add_skill`、`admin_reindex`）。`persistent` 后端把任务状态写到 workspace 卷上，因此**一个实例返回的 `task_id` 可以在另一个实例上查询**，并且任务历史在重启后仍可访问。默认 `memory` 后端把任务状态保留在进程内存中——适合单实例部署。
+
+```json
+{
+  "storage": {
+    "task_tracker": {
+      "backend": "memory"
+    }
+  }
+}
+```
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `backend` | str | 任务跟踪器后端。`"memory"` 把任务状态保留在进程内存（单实例）；`"persistent"` 启用跨实例任务查询并在重启后仍可访问 | `"memory"` |
+
+多实例部署中如果调用方可能从任一实例 poll `GET /api/v1/tasks/{task_id}`，或者任务历史需要超过进程生命周期，请把 `backend` 设为 `"persistent"`。
+
 ## 完整 Schema
 
 ```json
@@ -1157,6 +1275,7 @@ openviking add-resource ./docs --exclude "*.tmp"
     "max_concurrent": 100,
     "max_retries": 3,
     "extra_headers": {},
+    "extra_request_body": {},
     "stream": false
   },
   "rerank": {
@@ -1169,7 +1288,7 @@ openviking add-resource ./docs --exclude "*.tmp"
   },
   "retrieval": {
     "hotness_alpha": 0.0,
-    "score_propagation_alpha": 0.5
+    "score_propagation_alpha": 1.0
   },
   "encryption": {
     "enabled": false,

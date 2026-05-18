@@ -15,7 +15,7 @@
 | 入口 | 适合看什么 | 典型场景 |
 | --- | --- | --- |
 | `/health`、`observer/*` | 服务是否健康、队列是否堆积、VikingDB/VLM 状态 | 部署验收、值班巡检 |
-| `ov tui` | `viking://` 文件树、目录摘要、文件正文、向量记录 | 开发调试、核对资源是否真正落库 |
+| `ov tui` | `viking://` 文件树、目录摘要、文件正文、向量记录、受支持图片文件的预览 | 开发调试、核对资源是否真正落库 |
 | `OpenViking Console` | Web UI 里的文件浏览、检索、资源导入、租户与系统状态 | 不想手敲命令时做交互式排查 |
 | `telemetry` | 单次请求耗时、token、向量检索、资源处理阶段 | 排查一次具体调用为什么慢、为什么结果异常 |
 | `/metrics` | 请求量趋势、错误率、时延分布、队列与探针状态 | Prometheus 抓取、Grafana 看板、告警规则 |
@@ -152,7 +152,7 @@ ov tui viking://resources
 一个常见排查流程是：
 
 1. 用 `ov tui viking://resources` 找到目标文档或目录。
-2. 确认右侧能看到 `abstract` / `overview` / 正文内容。
+2. 确认右侧能看到 `abstract` / `overview` / 正文内容（受支持的图片文件 —— `png` / `jpg` / `jpeg` / `gif` / `bmp` / `webp` / `tiff` / `tif` —— 会直接渲染预览）。
 3. 按 `v` 进入向量记录视图，确认该 URI 下是否已经有向量数据。
 4. 按 `c` 查看总量，必要时按 `n` 翻页继续核对。
 
@@ -297,7 +297,8 @@ OpenViking 将信号级别的可观测性配置统一放在 `server.observabilit
             },
             "endpoint": "otel-collector:4317",
             "service_name": "openviking-server",
-            "export_interval_ms": 10000
+            "export_interval_ms": 10000,
+            "headers": {}
           }
         }
       },
@@ -308,7 +309,8 @@ OpenViking 将信号级别的可观测性配置统一放在 `server.observabilit
           "insecure": true
         },
         "endpoint": "otel-collector:4317",
-        "service_name": "openviking-server"
+        "service_name": "openviking-server",
+        "headers": {}
       },
       "logs": {
         "enabled": true,
@@ -317,12 +319,20 @@ OpenViking 将信号级别的可观测性配置统一放在 `server.observabilit
           "insecure": true
         },
         "endpoint": "otel-collector:4317",
-        "service_name": "openviking-server"
+        "service_name": "openviking-server",
+        "headers": {}
       }
     }
   }
 }
 ```
+
+说明：
+
+- `headers` 用于给 OTLP exporter 透传自定义请求头或 gRPC metadata。
+- 常见场景包括直连需要额外鉴权头的 OTLP 后端；请只配置 header key/value，不要把敏感值写入日志或截图中。
+- 对 `traces`、`logs` 和 `metrics.exporters.otel` 三条链路，`headers` 的配置方式保持一致。
+- 当 `protocol="grpc"` 时，`headers` 会作为 gRPC metadata 发送，key 需要使用小写形式，例如 `x-byteapm-appkey`；该限制不适用于 `protocol="http"`。
 
 完整字段、支持范围和更多示例见：
 
@@ -425,4 +435,3 @@ OpenViking 仓库里已经提供了可直接导入的 dashboard JSON：
 - [操作级 Telemetry 参考](07-operation-telemetry.md) - 请求级结构化追踪
 - [系统 API](../api/07-system.md) - 系统与 observer 接口参考
 - [指标](../concepts/12-metrics.md) - 时序指标与配置
-

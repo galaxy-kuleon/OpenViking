@@ -80,7 +80,7 @@ pip install openviking --upgrade --force-reinstall
 #### Rust CLI（オプション）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/crates/ov_cli/install.sh | bash
+npm i -g @openviking/cli
 ```
 
 またはソースからビルド：
@@ -310,8 +310,7 @@ set "OPENVIKING_CONFIG_FILE=%USERPROFILE%\.openviking\ov.conf"
 ```json
 {
   "url": "http://localhost:1933",
-  "timeout": 60.0,
-  "output": "table"
+  "timeout": 60.0
 }
 ```
 

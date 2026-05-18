@@ -289,7 +289,7 @@ class MemoryExtractor:
             # caller's intent.
             output_language = resolve_with_override(
                 config,
-                lambda: self._detect_output_language(messages),
+                lambda: self._detect_output_language(messages, fallback_language="en"),
             )
             history_summary = str(context.get("summary") or "")
 

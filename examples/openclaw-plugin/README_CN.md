@@ -1,14 +1,55 @@
-# OpenClaw + OpenViking 上下文引擎插件
+# @openclaw/openviking — OpenViking OpenClaw 插件
 
-使用 [OpenViking](https://github.com/volcengine/OpenViking) 作为 [OpenClaw](https://github.com/openclaw/openclaw) 的长期记忆后端。在 OpenClaw 中，此插件注册为 `openviking` 上下文引擎。
+OpenClaw 上下文引擎插件，用于接入 OpenViking 远程记忆、上下文数据库、RAG 和语义检索。
 
-本文档不是安装教程，而是面向集成方和工程师的"当前实现设计说明"。它基于 `examples/openclaw-plugin` 里的现有代码，重点解释这套插件今天实际上如何工作，而不是未来可能的重构方向。
+## 重要：插件 vs Skill 区分
+
+本页面是 **OpenClaw 插件包**：
+
+```
+@openclaw/openviking
+```
+
+**不要** 使用 `clawhub install openviking` 安装插件——那安装的是 `openviking` AgentSkill（`skills/openviking` 下的技能描述），不是本插件。
+
+如需 **Agent 辅助安装插件**，让 agent 按 [INSTALL-AGENT.md](./INSTALL-AGENT.md) 执行。主安装方式仍然是 `openclaw plugins install @openclaw/openviking`。
+
+## 安装（自然语言）
+
+对你的 agent 说：
+
+> 帮我安装 OpenViking 远程记忆插件 @openclaw/openviking。我的服务器地址是 `http://my-server:1933`，API key 是 `sk-xxx`。
+
+Agent 会自动完成安装 → 配置 → 重启 → 验证，无需手动操作。
+
+## 安装（命令行）
+
+```bash
+openclaw plugins install @openclaw/openviking
+openclaw openviking setup --base-url http://my-server:1933 --api-key sk-xxx --json
+openclaw gateway restart
+openclaw openviking status --json
+```
+
+`setup` 命令会自动激活 context-engine slot 并验证服务器连接。
+
+## 搜索关键词
+
+@openclaw/openviking, openclaw openviking 插件, openviking 远程记忆插件, OpenViking 上下文数据库插件, install-openviking-memory
 
 ## 文档入口
 
 - 安装与升级：[INSTALL-ZH.md](./INSTALL-ZH.md)
 - English install guide: [INSTALL.md](./INSTALL.md)
 - Agent 专用操作文档：[INSTALL-AGENT.md](./INSTALL-AGENT.md)
+
+---
+
+## 技术概述
+
+使用 [OpenViking](https://github.com/volcengine/OpenViking) 作为 [OpenClaw](https://github.com/openclaw/openclaw) 的长期记忆后端。在 OpenClaw 中，此插件注册为 `openviking` 上下文引擎。
+
+以下内容是面向集成方和工程师的实现设计说明。
 
 ## 设计定位
 
@@ -19,7 +60,7 @@
 按当前代码职责看，插件同时扮演四个角色：
 
 - `context-engine`：实现 `assemble`、`afterTurn`、`compact`
-- Hook 层：接管 `before_prompt_build`、`session_start`、`session_end`、`agent_end`、`before_reset`
+- Hook 层：接管 `session_start`、`session_end`、`before_reset`
 - Tool 提供者：注册 memory/archive 工具，以及 OpenViking resource 和 skill 导入工具
 - 运行时管理器：连接并监控远程 OpenViking 服务
 
@@ -46,8 +87,10 @@
 - `sessionKey` 存在时优先用它生成稳定的 `ovSessionId`。
 - 非安全路径字符会被规整或退化成稳定的 SHA-256。
 - `X-OpenViking-Agent` 按 session 解析，不按进程写死。
-- 若 `plugins.entries.openviking.config.agent_prefix` 不是 `default`，会形成 `<agent_prefix>_<sessionAgent>` 的前缀形式。
-- client 层会发送 `X-OpenViking-Agent`；只有显式配置了 `accountId` / `userId` 时才发送 `X-OpenViking-Account` / `X-OpenViking-User`。
+- 若 `plugins.entries.openviking.config.agent_prefix` 非空，会形成 `<agent_prefix>_<sessionAgent>` 的前缀形式。
+- OpenClaw 没有提供 session agent 时，使用其默认 agent `main`。
+- OpenViking 请求都会发送 `X-OpenViking-Agent`，包括启动阶段的 health check。
+- 只有显式配置了 `accountId` / `userId` 时才发送 `X-OpenViking-Account` / `X-OpenViking-User`。
 
 这样做是为了支持多 agent、多 session 并发时的记忆隔离，避免不同 OpenClaw 会话串用同一套长期上下文。
 
@@ -77,18 +120,23 @@
 
 插件当前无法从 `/api/v1/system/status` 自动发现这两个 policy，因此需要显式配置，使其与服务端 account policy 保持一致。
 
-## Prompt 前召回链路
+## assemble 召回链路
 
 ![Prompt 前的自动召回流程](./images/openclaw-plugin-recall-flow.png)
 
-当前主召回路径仍然挂在 `before_prompt_build`，流程是：
+自动召回现在由 `assemble()` 承接。OpenClaw 会在同一个 context engine 上调用两次 `assemble()`，插件按调用形态区分职责：
 
-1. 从 `messages` 或 `prompt` 中提取最后一条用户文本。
+1. preflight assemble：调用参数里带 `prompt`，`messages` 还是旧历史；插件从 OpenViking 回读 archive/session context 并重建历史。
+2. transformContext assemble：调用参数里不带 `prompt`，最后一条 `messages` 已经是本轮 user；插件只做长期记忆召回，并把记忆块 prepend 到这条 user message 的 content 开头。
+
+召回阶段会：
+
+1. 从最后一条 user message 提取查询文本。
 2. 基于当前 `sessionId/sessionKey` 解析本轮的 agent 路由。
-3. 先做一次快速可用性检查，避免在 OpenViking 不可用时把 prompt 前链路拖死。
+3. 先做一次快速可用性检查，避免在 OpenViking 不可用时拖慢模型请求。
 4. 并行检索 `viking://user/memories` 和 `viking://agent/memories`。
 5. 在插件侧做去重、阈值筛选、重排和 token budget 裁剪。
-6. 把最终记忆块以 `<relevant-memories>` 形式 prepend 到 prompt。
+6. 把最终记忆块以 `<relevant-memories>` 形式 prepend 到当前 user message；不会追加独立 synthetic user message。
 
 这里的重排不是单纯依赖向量分数。当前实现还会额外考虑：
 
@@ -105,7 +153,7 @@ Session 是这套设计的主轴。当前实现里，它覆盖了"历史组装�
 
 ### `assemble()` 负责什么
 
-`assemble()` 并不是简单地把旧聊天记录塞回来，而是按 token budget 从 OpenViking 回读当前 session context，然后重新组装成 OpenClaw 可消费的消息：
+preflight 阶段的 `assemble()` 并不是简单地把旧聊天记录塞回来，而是按 token budget 从 OpenViking 回读当前 session context，然后重新组装成 OpenClaw 可消费的消息：
 
 - `latest_archive_overview` 被改写成 `[Session History Summary]`
 - `pre_archive_abstracts` 被改写成 `[Archive Index]`
@@ -145,14 +193,15 @@ Session 是这套设计的主轴。当前实现里，它覆盖了"历史组装�
 
 ## 工具层与可展开能力
 
-这套插件除了自动行为，还直接暴露了 6 个工具：
+这套插件除了自动行为，还直接暴露了 7 个工具：
 
 - `memory_recall`：显式检索长期记忆
 - `memory_store`：把文本写入 OpenViking session 并立即触发 commit
 - `memory_forget`：按 URI 删除，或先搜索再删除唯一高置信候选
 - `ov_archive_expand`：展开某个 archive 的原始消息
-- `ov_import`：导入 resource 或 skill；默认 resource，导入 skill 时使用 `kind: "skill"`
-- `ov_search`：检索 OpenViking resources 和 skills，尤其用于导入后的确认和消费
+- `add_resource`：把文档、目录、URL 或 Git 仓库导入为 OpenViking resource
+- `add_skill`：导入或注册 OpenViking agent skill
+- `memory_search`：检索 OpenViking resources 和 skills，尤其用于导入后的确认和消费
 
 它们各自的作用不同：
 
@@ -160,8 +209,9 @@ Session 是这套设计的主轴。当前实现里，它覆盖了"历史组装�
 - `memory_recall` 给模型一个显式补查入口。
 - `memory_store` 适合把一段明确的重要信息立刻落入记忆管线。
 - `ov_archive_expand` 负责在 summary 不够细时回到 archive 级原文。
-- `ov_import` 让 agent 在用户明确提出导入需求时直接完成操作，不要求用户记住 slash command。
-- `ov_search` 补齐导入后的使用闭环，让用户或 agent 可以确认并消费 resources 和 skills。
+- `add_resource` 让 agent 在用户明确提出文档或仓库导入需求时直接完成操作，不要求用户记住 slash command。
+- `add_skill` 把 skill 导入 OpenViking，`add_resource` 把文档、目录、URL 或 Git 仓库导入为 resource。
+- `memory_search` 补齐导入后的使用闭环，让用户或 agent 可以确认并消费 resources 和 skills。
 
 其中 `ov_archive_expand` 是 `assemble()` 的重要补充，因为 `assemble()` 默认给的是压缩后的索引和摘要，而不是完整历史正文。
 
@@ -175,10 +225,10 @@ Resource 和 skill 保持两个入口，因为它们落在不同 OpenViking 命�
 插件也提供显式 slash command，方便手动导入：
 
 ```text
-/ov-import ./README.md --to viking://resources/openviking-readme --wait
-/ov-import ./skills/install-openviking-memory --kind skill --wait
-/ov-search "OpenViking install" --uri viking://resources/openviking-readme
-/ov-search "memory install skill" --uri viking://agent/skills
+/add-resource ./README.md --to viking://resources/openviking-readme --wait
+/add-skill ./skills/install-openviking-memory --wait
+/memory-search "OpenViking install" --uri viking://resources/openviking-readme
+/memory-search "memory install skill" --uri viking://agent/skills
 ```
 
 Resource 导入支持远程 URL、Git URL、本地文件、本地目录和 zip。OpenViking 内置 parser 覆盖常见文档和媒体类型，例如 Markdown、纯文本、PDF、HTML、Word、PowerPoint、Excel、EPUB、图片、音频和视频。目录导入还支持常见代码、文档和配置扩展名，例如 `.py`、`.js`、`.ts`、`.go`、`.rs`、`.java`、`.cpp`、`.json`、`.yaml`、`.toml`、`.csv`、`.rst`、`.proto`、`.tf`、`.vue`。
@@ -193,7 +243,7 @@ Resource 导入支持远程 URL、Git URL、本地文件、本地目录和 zip�
 
 - `baseUrl` 和可选 `apiKey` 由插件配置提供
 - 不会启动或管理本地子进程
-- session context、memory find/read、commit、archive expand 这些行为保持不变
+- session context、memory search/read、commit、archive expand 这些行为保持不变
 
 OpenViking 服务需要独立部署并运行，插件才能连接到它。
 
@@ -203,7 +253,7 @@ OpenViking 服务需要独立部署并运行，插件才能连接到它。
 
 - 本文描述的是当前实现已经落地的行为。
 - 旧设计稿讨论的是"进一步把更多主链路迁入 context-engine 生命周期"的目标态。
-- 当前版本里，自动 recall 的主入口仍然在 `before_prompt_build`，并没有完全迁到 `assemble()`。
+- 当前版本里，自动 recall 的主入口已经迁到 `assemble()`：preflight 重建历史，transformContext 注入长期记忆。
 - 当前版本里，`afterTurn()` 已经负责增量写入 OpenViking session，但它仍然依赖阈值触发异步 commit。
 - 当前版本里，`compact()` 已经走 `commit(wait=true)`，但它的职责仍以"同步提交 + 结果回读"为主，而不是承载一切上层编排。
 
@@ -216,7 +266,8 @@ OpenViking 服务需要独立部署并运行，插件才能连接到它。
 ### 查看当前配置
 
 ```bash
-ov-install --current-version
+openclaw openviking status --json
+openclaw plugins list
 openclaw config get plugins.entries.openviking.config
 openclaw config get plugins.slots.contextEngine
 ```
