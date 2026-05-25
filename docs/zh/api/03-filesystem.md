@@ -21,6 +21,7 @@ Phase 1 有意把范围控制得比较小：
 
 - 通过 WebDAV 新建文件时，会对该文件路径触发 OpenViking 的语义生成。
 - 通过 WebDAV 覆盖已有文件时，会像 `write()` 一样刷新相关语义和向量。
+- `PUT` 不会自动创建父目录。缺失的目录需要先用 `MKCOL` 创建。
 - 用户自己创建的点目录或点文件仍然可见，只有上面列出的保留内部文件名会被隐藏。
 
 ## API 参考
@@ -179,7 +180,7 @@ openviking read viking://resources/docs/api.md
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| uri | str | 是 | - | 已存在文件的 URI |
+| uri | str | 是 | - | 要写入的文件 URI。`mode="create"` 时目标文件必须不存在 |
 | content | str | 是 | - | 要写入的新内容 |
 | mode | str | 否 | `replace` | `replace`、`append` 或 `create` |
 | wait | bool | 否 | `false` | 是否等待后台语义/向量刷新完成 |
@@ -363,7 +364,6 @@ openviking ls viking://resources/ [--simple] [--recursive]
 | abs_limit | int | 否 | 256 | `agent` 输出中的摘要长度限制 |
 | show_all_hidden | bool | 否 | False | 像 `-a` 一样包含隐藏文件 |
 | node_limit | int | 否 | 1000 | 最大返回节点数 |
-| limit | int | 否 | None | `node_limit` 的别名 |
 | level_limit | int | 否 | 3 | 最大目录遍历深度 |
 
 **Python SDK (Embedded / HTTP)**
@@ -704,7 +704,7 @@ openviking mv viking://resources/old-name/ viking://resources/new-name/
 | pattern | str | 是 | - | 搜索模式（正则表达式） |
 | case_insensitive | bool | 否 | False | 忽略大小写 |
 | exclude_uri | str | 否 | None | 搜索时要排除的 URI 前缀 |
-| node_limit | int | 否 | None | 最大搜索节点数 |
+| node_limit | int | 否 | None | 最大返回节点数 |
 | level_limit | int | 否 | 5 | 最大目录遍历深度 |
 
 **Python SDK (Embedded / HTTP)**
