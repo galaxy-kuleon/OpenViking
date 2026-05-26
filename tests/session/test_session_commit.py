@@ -262,6 +262,34 @@ class TestCommit:
         with pytest.raises(FailedPreconditionError, match="unresolved failed archive"):
             await session.commit_async()
 
+    async def test_commit_fails_when_previous_archive_never_finalizes(
+        self, client: AsyncOpenViking, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Phase 2 must not wait forever on an incomplete archive chain."""
+        monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_TIMEOUT_SECONDS", 0.2)
+
+        session = client.session(session_id="incomplete_archive_timeout_test")
+        archive_uri = f"{session._session_uri}/history/archive_001"
+        await session._viking_fs.write_file(
+            f"{archive_uri}/messages.jsonl",
+            json.dumps({"id": "orphan", "role": "user", "parts": []}) + "\n",
+            ctx=session.ctx,
+        )
+        session._compression.compression_index = 1
+
+        session.add_message("user", [TextPart("Second round message")])
+        result = await session.commit_async()
+        task_result = await _wait_for_task(result["task_id"], timeout=5.0)
+
+        assert task_result["status"] == "failed"
+        failed_marker = await session._viking_fs.read_file(
+            f"{result['archive_uri']}/.failed.json",
+            ctx=session.ctx,
+        )
+        failed_payload = json.loads(failed_marker)
+        assert failed_payload["stage"] == "waiting_previous_done"
+        assert failed_payload["blocked_by"] == "archive_001"
+
     async def test_commit_skips_redo_when_recovery_disabled(
         self, session_with_messages: Session, monkeypatch: pytest.MonkeyPatch
     ):

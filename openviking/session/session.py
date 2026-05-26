@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _ARCHIVE_WAIT_POLL_SECONDS = 0.1
+_ARCHIVE_WAIT_TIMEOUT_SECONDS = 1800.0
 _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
 
 
@@ -1834,6 +1835,8 @@ class Session:
             return True
 
         previous_archive_uri = f"{self._session_uri}/history/archive_{archive_index - 1:03d}"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, _ARCHIVE_WAIT_TIMEOUT_SECONDS)
         while True:
             try:
                 await self._viking_fs.read_file(f"{previous_archive_uri}/.done", ctx=self.ctx)
@@ -1849,6 +1852,14 @@ class Session:
                 return False
             except Exception:
                 pass
+
+            if loop.time() >= deadline:
+                logger.warning(
+                    "Timed out waiting for previous archive %s to finish before archive_%03d",
+                    previous_archive_uri,
+                    archive_index,
+                )
+                return False
 
             await asyncio.sleep(_ARCHIVE_WAIT_POLL_SECONDS)
 
