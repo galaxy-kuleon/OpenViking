@@ -335,6 +335,11 @@ class _FakeVikingFS:
         del ctx
         return f"/fake/{uri.replace('://', '/').strip('/')}"
 
+    def _ensure_mutable_access(self, uri: str, ctx=None):
+        # v0.4.5 write() guards writes against immutable scopes before dispatch;
+        # these fakes only model mutable scopes, so this is a no-op stub.
+        del uri, ctx
+
     async def delete_temp(self, temp_uri: str, ctx=None):
         del ctx
         self.delete_temp_calls.append(temp_uri)
@@ -641,6 +646,11 @@ class _FakeVikingFSForCreate:
     def _uri_to_path(self, uri: str, ctx=None):
         del ctx
         return f"/fake/{uri.replace('://', '/').strip('/')}"
+
+    def _ensure_mutable_access(self, uri: str, ctx=None):
+        # v0.4.5 write() guards writes against immutable scopes before dispatch;
+        # these fakes only model mutable scopes, so this is a no-op stub.
+        del uri, ctx
 
     async def delete_temp(self, temp_uri: str, ctx=None):
         del ctx
@@ -1134,7 +1144,7 @@ async def test_create_mode_rejects_non_memory_non_signal_user_scope():
     viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
     coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
 
-    with pytest.raises(InvalidArgumentError, match="memory or signal files"):
+    with pytest.raises(InvalidArgumentError, match="memory, resource, or signal files"):
         await coordinator.write(
             uri=file_uri,
             content='{"event_id":"event-1"}',
