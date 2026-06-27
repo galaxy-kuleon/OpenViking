@@ -1282,7 +1282,29 @@ class Session:
         redo_log = lock_manager.redo_log
 
         try:
-            await self._wait_for_previous_archive_done(archive_index)
+            if not await self._wait_for_previous_archive_done(archive_index):
+                # kg: the previous archive never reached a terminal state within
+                # _ARCHIVE_WAIT_TIMEOUT_SECONDS (or otherwise failed to finalize).
+                # v0.4.5 refactored this caller to ignore the wait result; restore
+                # the short-circuit so we record a waiting_previous_done failure
+                # instead of proceeding into LLM/embedding work on an unsafe chain.
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="waiting_previous_done",
+                    error=(
+                        f"Previous archive archive_{archive_index - 1:03d} failed; "
+                        "this archive cannot proceed"
+                    ),
+                    blocked_by=f"archive_{archive_index - 1:03d}",
+                )
+                await tracker.fail(
+                    task_id,
+                    f"Previous archive archive_{archive_index - 1:03d} failed; "
+                    "cannot continue session commit",
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                )
+                return
 
             await tracker.start(
                 task_id,
