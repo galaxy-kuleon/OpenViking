@@ -1,4 +1,6 @@
 import re
+import subprocess
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +48,49 @@ def test_root_dockerfile_does_not_bake_zero_openviking_version_by_default():
     assert "OPENVIKING_VERSION build arg is required" in dockerfile
 
 
+def test_root_dockerfile_never_refreshes_the_lock_during_build():
+    dockerfile = _read_text("Dockerfile")
+
+    assert "uv sync --locked --no-editable --extra bot --extra gemini" in dockerfile
+    assert "UV_LOCK_STRATEGY" not in dockerfile
+    assert "uv lock" not in dockerfile
+
+
+def test_committed_uv_lock_matches_project_metadata_offline():
+    result = subprocess.run(
+        ["uv", "lock", "--check", "--offline"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_pep517_build_dependency_closure_is_exact():
+    pyproject = tomllib.loads(_read_text("pyproject.toml"))
+
+    assert set(pyproject["build-system"]["requires"]) == {
+        "cmake==4.4.0",
+        "maturin==1.14.1",
+        "packaging==26.2",
+        "setuptools==83.0.0",
+        "setuptools-scm==10.2.1",
+        "vcs-versioning==2.2.3",
+        "wheel==0.47.0",
+    }
+
+
+def test_native_builds_refuse_to_refresh_cargo_lock():
+    setup_py = _read_text("setup.py")
+
+    assert 'build_args = ["cargo", "build", "--release", "--locked"]' in setup_py
+    assert re.search(
+        r'"maturin",\s+"build",\s+"--release",\s+"--locked",',
+        setup_py,
+    )
+
+
 def test_openviking_package_includes_console_static_assets():
     pyproject = _read_text("pyproject.toml")
     setup_py = _read_text("setup.py")
@@ -73,7 +118,7 @@ def test_root_build_system_includes_maturin_for_isolated_builds():
     pyproject = _read_text("pyproject.toml")
     setup_py = _read_text("setup.py")
 
-    assert '"maturin>=1.0,<2.0",' in pyproject
+    assert '"maturin==1.14.1",' in pyproject
     assert "sys.executable," in setup_py
     assert '"maturin",' in setup_py
     assert '"build",' in setup_py
