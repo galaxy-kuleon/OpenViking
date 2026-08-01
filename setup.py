@@ -209,7 +209,7 @@ class OpenVikingBuildExt(build_ext):
                 env["OPENVIKING_VERSION"] = resolve_openviking_version(
                     env=env, project_root=SETUP_DIR
                 )
-                build_args = ["cargo", "build", "--release"]
+                build_args = ["cargo", "build", "--release", "--locked"]
                 target = env.get("CARGO_BUILD_TARGET")
                 if target:
                     print(f"Cross-compiling with CARGO_BUILD_TARGET={target}")
@@ -303,6 +303,7 @@ class OpenVikingBuildExt(build_ext):
                     "maturin",
                     "build",
                     "--release",
+                    "--locked",
                     "--out",
                     tmpdir,
                 ]

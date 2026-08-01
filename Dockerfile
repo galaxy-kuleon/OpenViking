@@ -20,7 +20,6 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
 ARG OPENVIKING_VERSION=
 ARG TARGETPLATFORM
-ARG UV_LOCK_STRATEGY=auto
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -56,10 +55,9 @@ COPY third_party/ third_party/
 COPY web-studio/ web-studio/
 
 # Install project and dependencies (triggers setup.py build_py → web-studio
-# SPA build + build_ext → native extensions).
-# Default to auto-refreshing uv.lock inside the ephemeral build context when it is
-# stale, so Docker builds stay unblocked after dependency changes. Set
-# UV_LOCK_STRATEGY=locked to keep fail-fast reproducibility checks.
+# SPA build + build_ext → native extensions). The committed lockfile is part
+# of the image provenance: a stale lock must fail the build instead of silently
+# resolving a different dependency graph under the same source revision.
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
     --mount=type=cache,target=/root/.npm,id=npm-${TARGETPLATFORM} \
     --mount=type=cache,target=/cargo-target,id=cargo-target-${TARGETPLATFORM} \
@@ -74,21 +72,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
         echo "OPENVIKING_VERSION build arg is required when building without openviking/_version.py" >&2; \
         exit 2; \
     fi; \
-    case "${UV_LOCK_STRATEGY}" in \
-        locked) \
-            uv sync --locked --no-editable --extra bot --extra gemini \
-            ;; \
-        auto) \
-            if ! uv lock --check; then \
-                uv lock; \
-            fi; \
-            uv sync --locked --no-editable --extra bot --extra gemini \
-            ;; \
-        *) \
-            echo "Unsupported UV_LOCK_STRATEGY: ${UV_LOCK_STRATEGY}" >&2; \
-            exit 2 \
-            ;; \
-    esac
+    uv sync --locked --no-editable --extra bot --extra gemini
 
 # Stage 3: runtime
 FROM python:3.13-slim-trixie
