@@ -38,14 +38,17 @@ def test_dockerfile_and_makefile_share_the_same_minimum_rust_version():
     assert docker_rust_version == make_rust_version
 
 
-def test_root_dockerfile_does_not_bake_zero_openviking_version_by_default():
+def test_root_dockerfile_bakes_the_archive_build_version_into_provenance():
     dockerfile = _read_text("Dockerfile")
 
     assert "ARG OPENVIKING_VERSION=0.0.0" not in dockerfile
+    assert "ARG OPENVIKING_VERSION=0.4.5" in dockerfile
     assert "ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING" not in dockerfile
     assert "COPY .git/ .git/" not in dockerfile
-    assert 'if [ -n "${OPENVIKING_VERSION:-}" ]; then' in dockerfile
-    assert "OPENVIKING_VERSION build arg is required" in dockerfile
+    assert (
+        'export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"'
+        in dockerfile
+    )
 
 
 def test_root_dockerfile_never_refreshes_the_lock_during_build():
