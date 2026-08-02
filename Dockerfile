@@ -18,7 +18,10 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
-ARG OPENVIKING_VERSION=
+# Archive builds have no .git metadata. Keep the package version in this
+# committed Dockerfile so the image contents are a function of the gitlink.
+# The arg remains overridable for upstream release workflows.
+ARG OPENVIKING_VERSION=0.4.5
 ARG TARGETPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -64,14 +67,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
     --mount=type=cache,target=/root/.ccache,id=ccache-${TARGETPLATFORM} \
-    if [ -n "${OPENVIKING_VERSION:-}" ]; then \
-        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"; \
-    elif [ -f openviking/_version.py ]; then \
-        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="$(python -c "import runpy; print(runpy.run_path('openviking/_version.py')['version'])")"; \
-    else \
-        echo "OPENVIKING_VERSION build arg is required when building without openviking/_version.py" >&2; \
-        exit 2; \
-    fi; \
+    export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"; \
     uv sync --locked --no-editable --extra bot --extra gemini
 
 # Stage 3: runtime
