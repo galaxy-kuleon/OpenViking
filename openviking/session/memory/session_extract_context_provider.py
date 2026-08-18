@@ -25,6 +25,7 @@ from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
     resolve_memory_templates_dir,
 )
+from openviking.session.memory.prompt_budget import budget_prompt_sections
 from openviking.session.memory.tools import (
     add_tool_call_pair_to_messages,
     get_tool,
@@ -78,6 +79,9 @@ class SessionExtractContextProvider(ExtractContextProvider):
         config = get_openviking_config()
         self._eager_prefetch = config.memory.eager_prefetch if config.memory else False
         self._prefetch_search_topn = config.memory.prefetch_search_topn if config.memory else 5
+        self._extraction_prompt_max_tokens = (
+            getattr(config.memory, "extraction_prompt_max_tokens", 2048) if config.memory else 2048
+        )
         self._ctx = ctx
         self._viking_fs = viking_fs
         self._transaction_handle = transaction_handle
@@ -320,9 +324,20 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             speaker = msg.peer_id or msg.role
             return f"[{idx}][{msg.role}][{speaker}]: {format_message_with_parts(msg)}"
 
-        conversation_sections.append(
-            "\n".join([format_message_header(msg, idx) for idx, msg in enumerate(messages)])
+        result = budget_prompt_sections(
+            [format_message_header(msg, idx) for idx, msg in enumerate(messages)],
+            max_tokens=self._extraction_prompt_max_tokens,
         )
+        if result.omitted_sections or result.truncated_sections:
+            tracer.info(
+                "memory_extraction_prompt_budget "
+                f"max_tokens={self._extraction_prompt_max_tokens} "
+                f"original_tokens={result.original_tokens} final_tokens={result.final_tokens} "
+                f"included_messages={result.included_sections} "
+                f"omitted_messages={result.omitted_sections} "
+                f"truncated_messages={result.truncated_sections}"
+            )
+        conversation_sections.append(result.text)
 
         return "\n\n".join(section for section in conversation_sections if section)
 

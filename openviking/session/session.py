@@ -20,6 +20,7 @@ from openviking.message.part import ContextPart, TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.constants import EXECUTION_MEMORY_TYPES
+from openviking.session.memory.prompt_budget import budget_prompt_sections
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.session.tool_result_store import (
     ToolResultStore,
@@ -2190,6 +2191,28 @@ class Session:
         body = "\n".join(lines) if lines else "(no content)"
         return f"[{m.role}]: {body}"
 
+    @staticmethod
+    def _format_messages_for_wm(messages: List[Message]) -> str:
+        config = get_openviking_config()
+        max_tokens = getattr(config.memory, "extraction_prompt_max_tokens", 2048)
+        result = budget_prompt_sections(
+            [Session._format_message_for_wm(message) for message in messages],
+            max_tokens=max_tokens,
+        )
+        if result.omitted_sections or result.truncated_sections:
+            logger.info(
+                "working_memory_prompt_budget max_tokens=%d original_tokens=%d "
+                "final_tokens=%d included_messages=%d omitted_messages=%d "
+                "truncated_messages=%d",
+                max_tokens,
+                result.original_tokens,
+                result.final_tokens,
+                result.included_sections,
+                result.omitted_sections,
+                result.truncated_sections,
+            )
+        return result.text
+
     def _generate_archive_summary(
         self,
         messages: List[Message],
@@ -2199,7 +2222,7 @@ class Session:
         if not messages:
             return ""
 
-        formatted = "\n".join(self._format_message_for_wm(m) for m in messages)
+        formatted = self._format_messages_for_wm(messages)
 
         vlm = get_openviking_config().vlm
         if vlm and vlm.is_available():
@@ -2244,7 +2267,7 @@ class Session:
         if not messages:
             return ""
 
-        formatted = "\n".join(self._format_message_for_wm(m) for m in messages)
+        formatted = self._format_messages_for_wm(messages)
 
         vlm = get_openviking_config().vlm
         if not (vlm and vlm.is_available()):
