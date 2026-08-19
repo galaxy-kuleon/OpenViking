@@ -134,7 +134,9 @@ class VLMConfig(BaseModel):
     thinking: bool = Field(default=False, description="Enable thinking mode for VolcEngine models")
 
     max_concurrent: int = Field(
-        default=32, description="Maximum number of concurrent LLM calls for semantic processing"
+        default=32,
+        ge=1,
+        description="Process-wide maximum concurrent calls to this VLM",
     )
 
     media: VLMMediaConfig = Field(
@@ -561,7 +563,12 @@ class VLMConfig(BaseModel):
     def get_vlm_instance(self) -> Any:
         """Get VLM instance with multi-credential failover support."""
         if self._vlm_instance is None:
-            from openviking.models.vlm import FailoverVLM, MultiCredentialVLM, VLMFactory
+            from openviking.models.vlm import (
+                ConcurrencyLimitedVLM,
+                FailoverVLM,
+                MultiCredentialVLM,
+                VLMFactory,
+            )
 
             if self.credentials:
                 # Build VLM instances for each credential
@@ -590,6 +597,11 @@ class VLMConfig(BaseModel):
                     self._vlm_instance = FailoverVLM(primary, backup)
                 else:
                     self._vlm_instance = primary
+
+            self._vlm_instance = ConcurrencyLimitedVLM(
+                self._vlm_instance,
+                max_concurrent=self.max_concurrent,
+            )
 
         return self._vlm_instance
 

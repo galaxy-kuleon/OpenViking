@@ -406,6 +406,7 @@ class SessionService:
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
         min_raw_tail_steps: Optional[int] = None,
+        memory_policy: Optional[Dict[str, Any]] = None,
         event_tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Async commit a session.
@@ -434,6 +435,8 @@ class SessionService:
         commit_kwargs.update(
             {key: value for key, value in optional_retention.items() if value is not None}
         )
+        if memory_policy is not None:
+            commit_kwargs["memory_policy"] = memory_policy
         if event_tags is not None:
             commit_kwargs["event_tags"] = event_tags
         result = await session.commit_async(**commit_kwargs)

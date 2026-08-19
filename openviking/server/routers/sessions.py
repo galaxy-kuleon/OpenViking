@@ -13,7 +13,7 @@ from openviking.message.part import Part, TextPart, part_from_dict
 from openviking.server.auth import get_session_request_context
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
-from openviking.server.models import ErrorInfo, Response
+from openviking.server.models import Response
 from openviking.server.responses import error_response
 from openviking.server.telemetry import run_operation
 from openviking.telemetry import TelemetryRequest
@@ -607,6 +607,13 @@ class CommitRequest(BaseModel):
         le=10_000,
         description="Minimum number of latest atomic assistant Steps kept raw.",
     )
+    memory_policy: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-commit memory extraction policy. This overrides the session "
+            "default for this commit without mutating stored session config."
+        ),
+    )
     extraction_metadata: Optional[ExtractionMetadataRequest] = Field(
         default=None,
         description=(
@@ -656,6 +663,8 @@ async def commit_session(
     commit_kwargs.update(
         {key: value for key, value in optional_retention.items() if value is not None}
     )
+    if body.memory_policy is not None:
+        commit_kwargs["memory_policy"] = body.memory_policy
     event_tags = _commit_event_tags(body.extraction_metadata)
     if event_tags is not None:
         commit_kwargs["event_tags"] = event_tags

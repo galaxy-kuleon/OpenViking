@@ -12,6 +12,19 @@ from openviking.session.retention import (
 )
 
 
+def test_commit_request_accepts_per_commit_memory_policy():
+    policy = {
+        "self": {"enabled": True},
+        "peer": {"enabled": False},
+        "memory_types": ["profile", "preferences"],
+        "working_memory": {"enabled": False},
+    }
+
+    request = CommitRequest(memory_policy=policy)
+
+    assert request.memory_policy == policy
+
+
 def _message(message_id: str, role: str, text: str) -> Message:
     return Message(id=message_id, role=role, parts=[TextPart(text)])
 

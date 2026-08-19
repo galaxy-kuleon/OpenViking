@@ -10,6 +10,7 @@ from .backends.openai_vlm import OpenAIVLM
 from .backends.volcengine_vlm import VolcEngineVLM
 from .base import (
     AllCredentialsFailedError,
+    ConcurrencyLimitedVLM,
     FailoverVLM,
     MultiCredentialVLM,
     VLMBase,
@@ -20,6 +21,7 @@ from .registry import get_all_provider_names, is_valid_provider
 __all__ = [
     "VLMBase",
     "VLMFactory",
+    "ConcurrencyLimitedVLM",
     "FailoverVLM",
     "MultiCredentialVLM",
     "AllCredentialsFailedError",

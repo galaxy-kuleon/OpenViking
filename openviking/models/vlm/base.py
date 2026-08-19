@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VLM base interface and abstract classes"""
 
+import asyncio
 import logging
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +24,9 @@ from .token_usage import TokenUsageTracker
 
 _THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>")
 logger = get_logger(__name__)
+
+_ASYNC_GATE_POLL_SECONDS = 0.05
+_GATE_WAIT_LOG_SECONDS = 1.0
 
 
 class UnsupportedMediaInputError(RuntimeError):
@@ -359,6 +365,133 @@ class VLMFactory:
             from .backends.litellm_vlm import LiteLLMVLMProvider
 
             return LiteLLMVLMProvider(config)
+
+
+class ConcurrencyLimitedVLM(VLMBase):
+    """Process-wide concurrency gate around one configured VLM instance.
+
+    OpenViking runs semantic and session-commit workers on separate threads and
+    event loops. Queue-local semaphores therefore cannot stop their combined
+    traffic from overloading a small local model. This wrapper is the single
+    model-client chokepoint and uses a thread semaphore so all callers share
+    one limit.
+    """
+
+    def __init__(self, delegate: VLMBase, max_concurrent: int):
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be at least 1")
+        super().__init__(
+            {
+                "provider": delegate.provider,
+                "model": delegate.model,
+                "api_key": delegate.api_key,
+                "api_base": delegate.api_base,
+                "temperature": delegate.temperature,
+                "max_retries": delegate.max_retries,
+                "timeout": delegate.timeout,
+                "max_tokens": delegate.max_tokens,
+                "thinking": delegate.thinking,
+                "extra_headers": delegate.extra_headers,
+                "extra_request_body": delegate.extra_request_body,
+                "stream": delegate.stream,
+            }
+        )
+        self._delegate = delegate
+        self.max_concurrent = max_concurrent
+        self._gate = threading.BoundedSemaphore(max_concurrent)
+
+    def _acquire(self) -> None:
+        started = time.monotonic()
+        self._gate.acquire()
+        waited = time.monotonic() - started
+        if waited >= _GATE_WAIT_LOG_SECONDS:
+            logger.info(
+                "VLM concurrency gate admitted request after %.2fs (limit=%d)",
+                waited,
+                self.max_concurrent,
+            )
+
+    async def _acquire_async(self) -> None:
+        started = time.monotonic()
+        while not self._gate.acquire(blocking=False):
+            await asyncio.sleep(_ASYNC_GATE_POLL_SECONDS)
+        waited = time.monotonic() - started
+        if waited >= _GATE_WAIT_LOG_SECONDS:
+            logger.info(
+                "VLM concurrency gate admitted async request after %.2fs (limit=%d)",
+                waited,
+                self.max_concurrent,
+            )
+
+    def get_completion(self, *args, **kwargs):
+        self._acquire()
+        try:
+            return self._delegate.get_completion(*args, **kwargs)
+        finally:
+            self._gate.release()
+
+    async def get_completion_async(self, *args, **kwargs):
+        await self._acquire_async()
+        try:
+            return await self._delegate.get_completion_async(*args, **kwargs)
+        finally:
+            self._gate.release()
+
+    def get_vision_completion(self, *args, **kwargs):
+        self._acquire()
+        try:
+            return self._delegate.get_vision_completion(*args, **kwargs)
+        finally:
+            self._gate.release()
+
+    async def get_vision_completion_async(self, *args, **kwargs):
+        await self._acquire_async()
+        try:
+            return await self._delegate.get_vision_completion_async(*args, **kwargs)
+        finally:
+            self._gate.release()
+
+    def supports_media(self, *, media_type: str, filename: str, size_bytes: int) -> bool:
+        return self._delegate.supports_media(
+            media_type=media_type,
+            filename=filename,
+            size_bytes=size_bytes,
+        )
+
+    async def get_media_completion_async(
+        self,
+        *,
+        prompt: str,
+        media_path: Path,
+        filename: str,
+        media_type: str,
+    ) -> str:
+        await self._acquire_async()
+        try:
+            return await self._delegate.get_media_completion_async(
+                prompt=prompt,
+                media_path=media_path,
+                filename=filename,
+                media_type=media_type,
+            )
+        finally:
+            self._gate.release()
+
+    @property
+    def token_tracker(self):
+        return self._delegate.token_tracker
+
+    def get_token_usage(self) -> Dict[str, Any]:
+        return self._delegate.get_token_usage()
+
+    def reset_token_usage(self) -> None:
+        self._delegate.reset_token_usage()
+
+    def update_token_usage(self, *args, **kwargs) -> None:
+        self._delegate.update_token_usage(*args, **kwargs)
+
+    def is_available(self) -> bool:
+        return self._delegate.is_available()
 
 
 def _annotate_vlm_error(exc: Exception, vlm_instance: "VLMBase") -> None:
