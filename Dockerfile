@@ -21,7 +21,7 @@ ENV PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
 # Archive builds have no .git metadata. Keep the package version in this
 # committed Dockerfile so the image contents are a function of the gitlink.
 # The arg remains overridable for upstream release workflows.
-ARG OPENVIKING_VERSION=0.4.5
+ARG OPENVIKING_VERSION=0.4.15
 ARG TARGETPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -2,9 +2,12 @@ memory_type: preferences
 description: |
   User preference memory - captures "what the user likes/dislikes or is accustomed to".
   Extract specific preferences the user has expressed across conversations.
+  Keep each preference memory Complete but minimal.
   Each preference should be about a specific topic (not generic).
   Topics can be: code style, communication style, tools, workflow, food, commute, etc.
-  Store different topics as separate memory files, do NOT mix unrelated preferences.
+  Store different topics as separate memory files; do not mix unrelated preferences.
+  Each topic should stay small and should not become a second profile.
+  Keep each topic to roughly 3-8 bullets; if it grows beyond that or past 800 characters, split it into semantic subtopics.
 directory: "viking://user/{{ user_space }}/memories/preferences"
 filename_template: "{{ user }}/{{ topic }}.md"
 enabled: true
@@ -38,13 +41,17 @@ fields:
       Preference topic used to uniquely identify this preference memory.
       Should be a semantic topic description such as "Python code style", "Communication style", "Food preference", "Commute preference", etc.
       Store unrelated preferences separately, but merge overlapping or synonymous topics into one stable topic.
+      If a topic becomes too broad, split it into smaller semantic subtopics.
     merge_op: immutable
 
   - name: content
     type: string
     description: |
       Preference content in Markdown format describing "what the user prefers/is accustomed to".
-      Write one concise bullet per distinct, reusable preference; omit duplicates, events, dates, plans, and supporting evidence.
+      Rewrite each topic into a Complete but minimal version rather than letting it grow indefinitely.
+      Keep each topic concise, usually 3-8 bullets; if it exceeds 8 bullets or 800 characters, split it into semantic subtopics.
+      Write one concise bullet per distinct, reusable preference; omit duplicates, events, dates, and plans.
+      Slight identity context is allowed only when it helps explain the preference, but this memory should not become a second profile.
       Example:
       - Prefers concise written updates with decisions and next actions.
       - Chooses lightweight tools when they cover the workflow.

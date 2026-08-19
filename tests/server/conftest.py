@@ -26,6 +26,7 @@ from openviking.service.task_tracker import get_task_tracker
 from openviking.storage.queuefs import QueueManager, SessionCommitMsg, get_queue_manager
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.embedding_config import EmbeddingConfig
+from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
 # ---------------------------------------------------------------------------
@@ -190,6 +191,24 @@ async def service(temp_dir: Path, monkeypatch):
     """Create and initialize an OpenVikingService for in-process API tests."""
     fake_embedder_cls = _install_fake_embedder(monkeypatch)
     _install_fake_vlm(monkeypatch)
+    OpenVikingConfigSingleton.reset_instance()
+    OpenVikingConfigSingleton.initialize(
+        config_dict={
+            "storage": {
+                "workspace": str(temp_dir / "data"),
+                "agfs": {"backend": "local"},
+                "vectordb": {"backend": "local"},
+            },
+            "embedding": {
+                "dense": {
+                    "provider": "openai",
+                    "model": "test-embedder",
+                    "api_key": "test-key",
+                    "dimension": 2048,
+                }
+            },
+        }
+    )
     svc = OpenVikingService(
         path=str(temp_dir / "data"), user=UserIdentifier.the_default_user("test_user")
     )
@@ -198,6 +217,7 @@ async def service(temp_dir: Path, monkeypatch):
     _install_session_commit_queue_fallback(svc, monkeypatch)
     yield svc
     await svc.close()
+    OpenVikingConfigSingleton.reset_instance()
 
 
 @pytest_asyncio.fixture(scope="function")

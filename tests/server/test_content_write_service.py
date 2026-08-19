@@ -113,6 +113,46 @@ async def test_resource_append_is_plain_concatenation(service):
 
 
 @pytest.mark.asyncio
+async def test_feedback_signal_is_append_only_and_never_vectorized(service, monkeypatch):
+    ctx = RequestContext(user=service.user, role=Role.USER)
+    signal_dir = f"viking://user/{ctx.user.user_space_name()}/signals/feedback"
+    signal_uri = f"{signal_dir}/event-001.json"
+    await service.fs.mkdir(signal_dir, ctx=ctx)
+
+    async def fail_if_semantic_refresh_runs(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("feedback signal entered semantic refresh")
+
+    monkeypatch.setattr(
+        ContentWriteCoordinator,
+        "_enqueue_semantic_refresh",
+        fail_if_semantic_refresh_runs,
+    )
+
+    result = await service.fs.write(
+        signal_uri,
+        content='{"rating":"down"}',
+        ctx=ctx,
+        mode="create",
+        wait=True,
+    )
+
+    assert result["context_type"] == "signal"
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "skipped"
+    assert result["queue_status"] is None
+    assert await service.viking_fs.read_file(signal_uri, ctx=ctx) == '{"rating":"down"}'
+
+    with pytest.raises(InvalidArgumentError, match="append-only"):
+        await service.fs.write(
+            signal_uri,
+            content='{"rating":"up"}',
+            ctx=ctx,
+            mode="replace",
+        )
+
+
+@pytest.mark.asyncio
 async def test_memory_append_preserves_metadata(service):
     ctx = RequestContext(user=service.user, role=Role.USER)
     memory_uri = f"viking://user/{ctx.user.user_space_name()}/memories/preferences/theme.md"

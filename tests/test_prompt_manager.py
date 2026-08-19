@@ -66,7 +66,7 @@ def teardown_function() -> None:
     OpenVikingConfigSingleton.reset_instance()
 
 
-def test_profile_memory_template_includes_stable_identity_work_style_and_preferences():
+def test_profile_memory_template_keeps_identity_minimal_and_separates_preferences():
     template_path = PromptManager._get_bundled_templates_dir() / "memory" / "profile.yaml"
     schema = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     text = "\n".join(
@@ -77,12 +77,20 @@ def test_profile_memory_template_includes_stable_identity_work_style_and_prefere
     )
 
     assert '"who the user is"' in text
-    assert "identity, work style, and preferences" in text
+    assert "identity summary" in text
     assert "profession, experience level, technical background" in text
     assert "communication style, work habits" in text
     assert "Do NOT include transient conversation content" in text
     assert "Each item: self-contained" in text
     assert "Only record objective statuses" in text
+    assert "migrate it to preferences" in text
+    assert "5-8 bullets" in text
+    assert "signed-in account holder" in text
+    assert "pasted or uploaded source material" in text
+    assert "explicit first-person self-disclosure" in text
+    assert "do not create or edit profile.md" in text
+    assert "client, counterparty, case party" in text
+    assert "Keep the existing heading" in text
 
 
 def test_preferences_memory_template_keeps_topic_specific_preferences():

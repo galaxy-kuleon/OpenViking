@@ -56,15 +56,6 @@ class MemoryConfig(BaseModel):
             "When multiple directories are searched, results are merged and top-N are read."
         ),
     )
-    extraction_prompt_max_tokens: int = Field(
-        default=2048,
-        ge=512,
-        description=(
-            "Maximum estimated tokens from archived conversation messages included in each "
-            "memory-extraction or working-memory prompt. Earlier messages are explicitly "
-            "omitted when needed while the newest user intent is retained."
-        ),
-    )
     extraction_enabled: bool = Field(
         default=True,
         description=(

@@ -42,7 +42,7 @@ def test_root_dockerfile_bakes_the_archive_build_version_into_provenance():
     dockerfile = _read_text("Dockerfile")
 
     assert "ARG OPENVIKING_VERSION=0.0.0" not in dockerfile
-    assert "ARG OPENVIKING_VERSION=0.4.5" in dockerfile
+    assert "ARG OPENVIKING_VERSION=0.4.15" in dockerfile
     assert "ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING" not in dockerfile
     assert "COPY .git/ .git/" not in dockerfile
     assert (
@@ -94,13 +94,12 @@ def test_native_builds_refuse_to_refresh_cargo_lock():
     )
 
 
-def test_openviking_package_includes_console_static_assets():
+def test_openviking_package_includes_web_studio_static_assets():
     pyproject = _read_text("pyproject.toml")
     setup_py = _read_text("setup.py")
 
-    assert '"console/static/**/*"' in pyproject
-    assert '"console/static/**/*"' in pyproject.split("vikingbot = [", maxsplit=1)[0]
-    assert '"console/static/**/*"' in setup_py
+    assert '"web_studio/dist/**/*"' in pyproject
+    assert '"web_studio/dist/**/*"' in setup_py
 
 
 def test_build_workflow_invokes_maturin_via_python_module():
@@ -126,8 +125,7 @@ def test_root_build_system_includes_maturin_for_isolated_builds():
     assert '"maturin",' in setup_py
     assert '"build",' in setup_py
     assert '"--release",' in setup_py
-    assert '"--features",' in setup_py
-    assert '"s3",' in setup_py
+    assert '"--locked",' in setup_py
     assert '"--out",' in setup_py
     assert "tmpdir," in setup_py
     assert 'shutil.which("maturin")' not in setup_py

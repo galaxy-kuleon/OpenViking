@@ -108,6 +108,12 @@ class ContentWriteCoordinator:
         self._validate_target_uri(normalized_uri)
         self._viking_fs._ensure_mutable_access(normalized_uri, ctx)
 
+        context_type = context_type_for_uri(normalized_uri)
+        if context_type == "signal" and mode != "create":
+            raise InvalidArgumentError(
+                f"signal writes are append-only; use create mode with a fresh event URI: {uri}"
+            )
+
         if mode == "create":
             return await self._create_and_write(
                 uri=normalized_uri,
@@ -122,7 +128,6 @@ class ContentWriteCoordinator:
         if stat.get("isDir"):
             raise InvalidArgumentError(f"write only supports existing files, got directory: {uri}")
 
-        context_type = context_type_for_uri(normalized_uri)
         root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx, anchor_to_parent=True)
         written_bytes = len(content.encode("utf-8"))
         telemetry_id = get_current_telemetry().telemetry_id
@@ -731,6 +736,23 @@ class ContentWriteCoordinator:
                 get_request_wait_tracker().register_request(telemetry_id)
             await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
             content_written = True
+            if context_type == "signal":
+                # Raw feedback is an append-only operational signal, not model
+                # memory. Persist it, but never summarize, embed, or recall it.
+                await self._viking_fs._async_agfs.pathlock_release(lease)
+                lock_released = True
+                post_process_started = True
+                return self._build_write_result(
+                    uri=uri,
+                    root_uri=root_uri,
+                    context_type=context_type,
+                    mode=mode,
+                    written_bytes=written_bytes,
+                    wait=wait,
+                    queue_status=None,
+                    semantic_status="skipped",
+                    vector_status="skipped",
+                )
             if processing_mode == VECTORS_ONLY:
                 vector_enqueued = await self._vectorize_written_file(
                     uri=uri,
@@ -1314,7 +1336,11 @@ class ContentWriteCoordinator:
                 else:
                     root_uri = VikingURI.build("resources", parts[1])
         elif parts[0] == "user":
-            if "resources" in parts:
+            if len(parts) >= 5 and parts[2] == "signals":
+                # One directory per signal kind; each child file is one
+                # immutable event. Nothing under this root enters RAG.
+                root_uri = VikingURI.build(*parts[:4])
+            elif "resources" in parts:
                 resources_idx = parts.index("resources")
                 if len(parts) <= resources_idx + 1:
                     raise InvalidArgumentError(
