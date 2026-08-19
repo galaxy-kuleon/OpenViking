@@ -7,14 +7,14 @@
 hermes memory setup
 ```
 
-## 步骤 2：复制 Base URL 和 API Key
-执行 setup 命令后会依次提示输入 Base URL 和 API Key，可复制后粘贴到你的 Hermes：
+## 步骤 2：复制 Base URL 和 鉴权管理
+执行 setup 命令后会依次提示输入 Base URL 和 鉴权管理，可复制后粘贴到你的 Hermes：
 
 - Base URL: 复制以下 Base URL 到你的 Hermes：
 ```text
 https://api.vikingdb.cn-beijing.volces.com/openviking
 ```
-- API Key: 复制页面中展示的 API Key 到你的 Hermes 终端
+- 鉴权管理: 复制页面中展示的 鉴权管理 到你的 Hermes 终端
 - 租户 account / user / agent ID：多租户部署时使用
 
 配置保存在 Hermes 的 `config.yaml` 和 `.env` 文件中。
@@ -26,7 +26,7 @@ https://api.vikingdb.cn-beijing.volces.com/openviking
 hermes memory status
 ```
 
-配置完成后，Hermes 自动使用 OpenViking 作为长期记忆——`viking_remember`、`viking_recall` 等记忆工具即刻可用。
+配置完成后，Hermes 会通过 OpenViking memory provider 自动注入上下文、预取相关记忆，并在会话后同步和抽取记忆。可用工具包括 `viking_search`、`viking_read`、`viking_browse`、`viking_remember`、`viking_forget` 和 `viking_add_resource`。
 
 ## 参考文档
 

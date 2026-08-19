@@ -7,34 +7,46 @@ Handles coordinated writes and self-iteration processes
 as described in the OpenViking design document.
 """
 
+import asyncio
 import inspect
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from openviking.core.context import ContextLevel
+from openviking.core.namespace import context_type_for_uri
 from openviking.parse.image_rewrite import rewrite_image_uris
+from openviking.parse.mode import ParseMode, normalize_parse_mode
 from openviking.parse.tree_builder import TreeBuilder
-from openviking.server.identity import RequestContext
-from openviking.storage import VikingDBManager
-from openviking.storage.errors import LockAcquisitionError
-from openviking.storage.transaction import (
-    LOCK_TIMEOUT_DEFAULT,
-    NO_LOCK,
-    LockLease,
-    OwnedLockLease,
+from openviking.resource.processing_mode import (
+    DEFAULT_PROCESSING_MODE,
+    VECTORS_ONLY,
+    ProcessingMode,
+    normalize_processing_mode,
 )
-from openviking.storage.viking_fs import get_viking_fs
+from openviking.server.identity import RequestContext
+from openviking.storage.errors import LockAcquisitionError
+from openviking.storage.expr import And, Eq, PathScope
+from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
+from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
+from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry
-from openviking.utils.embedding_utils import index_resource
+from openviking.utils.embedding_utils import index_resource, vectorize_file
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.exceptions import OpenVikingError
-from openviking_cli.utils import get_logger
+from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.storage import StoragePath
 
 if TYPE_CHECKING:
+    from openviking.parse.accessors.base import LocalResource
     from openviking.parse.vlm import VLMProcessor
 
 logger = get_logger(__name__)
+_MAX_FILE_VECTORIZATION_CONCURRENCY = 64
+VECTORDB_MAX_QUERY_LIMIT = 100_000
 
 
 class ResourceProcessor:
@@ -91,12 +103,50 @@ class ResourceProcessor:
             )
         return self._media_processor
 
+    async def prepare_resource(
+        self,
+        path: str,
+        ctx: RequestContext,
+        *,
+        allow_local_path_resolution: bool = True,
+        **kwargs,
+    ) -> "LocalResource":
+        """Resolve a source once before selecting an async parser route."""
+        with get_viking_fs().bind_request_context(ctx):
+            return await self._get_media_processor().prepare(
+                path,
+                allow_local_path_resolution=allow_local_path_resolution,
+                **kwargs,
+            )
+
+    def understanding_api_enabled(self) -> bool:
+        return self._get_media_processor().understanding_api_enabled()
+
+    def should_use_understanding_api(self, source: Union[str, "LocalResource"]) -> bool:
+        return self._get_media_processor().should_use_understanding_api(source)
+
+    def should_use_understanding_directly(self, source: str, **kwargs) -> bool:
+        return self._get_media_processor().should_use_understanding_directly(source, **kwargs)
+
+    async def submit_understanding(self, source: Union[str, "LocalResource"], **kwargs) -> str:
+        return await self._get_media_processor().submit_understanding(source, **kwargs)
+
     async def build_index(
         self, resource_uris: List[str], ctx: RequestContext, **kwargs
     ) -> Dict[str, Any]:
         """Expose index building as a standalone method."""
+        ingest_options = IngestOptions.from_value(kwargs.get("ingest_options"))
+        if ingest_options.search_tags is None and kwargs.get("search_tags") is not None:
+            ingest_options = IngestOptions.from_search_tags(
+                kwargs.get("search_tags"),
+                mode=kwargs.get("search_tag_mode", "replace"),
+            )
         for uri in resource_uris:
-            await index_resource(uri, ctx)
+            await index_resource(
+                uri,
+                ctx,
+                ingest_options=ingest_options,
+            )
         return {"status": "success", "message": f"Indexed {len(resource_uris)} resources"}
 
     async def summarize(
@@ -117,6 +167,7 @@ class ResourceProcessor:
         parent: Optional[str] = None,
         summarize: bool = False,
         stage_callback: Optional[Callable[[str], Any]] = None,
+        prepared_resource: Optional["LocalResource"] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -134,7 +185,10 @@ class ResourceProcessor:
             "errors": [],
             "source_path": None,
         }
-        preacquired_lock = kwargs.pop("resource_lock", NO_LOCK) or NO_LOCK
+        defer_post_processing = bool(kwargs.pop("defer_post_processing", False))
+        preacquired_lock = kwargs.pop("resource_lock", None)
+        ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
+        to_is_directory = bool(kwargs.pop("to_is_directory", False))
         telemetry = get_current_telemetry()
 
         async def _set_stage(stage: str) -> None:
@@ -167,6 +221,7 @@ class ResourceProcessor:
                     parse_result = await media_processor.process(
                         source=path,
                         instruction=effective_instruction,
+                        prepared_resource=prepared_resource,
                         **kwargs,
                     )
                 result["source_path"] = parse_result.source_path or path
@@ -237,10 +292,21 @@ class ResourceProcessor:
                         source_path=parse_result.source_path,
                         source_format=parse_result.source_format,
                         create_parent=kwargs.get("create_parent", False),
+                        flatten_single_file=(
+                            normalize_parse_mode(
+                                kwargs.get("parse_mode", ParseMode.DEFAULT)
+                            )
+                            is ParseMode.NO_SPLIT
+                            and parse_result.source_format not in {"directory", "repository"}
+                            and not to_is_directory
+                        ),
                     )
                     if context_tree and context_tree.root:
                         result["root_uri"] = context_tree.root.uri
                         result["temp_uri"] = context_tree.root.temp_uri
+                    root_is_file = bool(
+                        getattr(context_tree, "_root_is_file", False)
+                    )
                 telemetry.set(
                     "resource.finalize.duration_ms",
                     round((time.perf_counter() - finalize_start) * 1000, 3),
@@ -275,38 +341,76 @@ class ResourceProcessor:
             temp_uri = result.get("temp_uri")  # temp_doc_uri
             original_temp_uri = temp_uri  # 保存原始 temp_uri 用于最终输出
             candidate_uri = getattr(context_tree, "_candidate_uri", None) if context_tree else None
-            resource_lock: LockLease = preacquired_lock
+            resource_lock: Optional[Dict[str, Any]] = preacquired_lock
             target_preexisting = False
             source_committed = False
 
             if root_uri and temp_uri:
-                from openviking.storage.transaction import get_lock_manager
-
                 stage_start = time.perf_counter()
                 stage_status = "ok"
                 viking_fs = get_viking_fs()
-                lock_manager = get_lock_manager()
                 try:
                     if candidate_uri:
-                        if resource_lock.active:
+                        if resource_lock is not None:
                             root_uri = candidate_uri
                         else:
                             root_uri, resource_lock = await self.reserve_unique_candidate(
                                 candidate_uri=candidate_uri,
                                 ctx=ctx,
+                                root_is_file=root_is_file,
                             )
                             result["root_uri"] = root_uri
+                            if root_uri != candidate_uri:
+                                result.setdefault("warnings", []).append(
+                                    f"'{candidate_uri}' already exists. Creating '{root_uri}'. "
+                                    f"Tip: Use --to <path> to specify exact target."
+                                )
                     else:
                         target_preexisting = await viking_fs.exists(root_uri, ctx=ctx)
-                        if not resource_lock.active:
+                        if target_preexisting:
+                            try:
+                                stat = await viking_fs.stat(root_uri, ctx=ctx)
+                                if isinstance(stat, dict) and stat.get("isDir"):
+                                    entries = await viking_fs.ls(
+                                        root_uri,
+                                        show_all_hidden=True,
+                                        node_limit=LS_ALL_NODES,
+                                        ctx=ctx,
+                                    )
+                                    names: list[str] = []
+                                    for entry in entries:
+                                        name = entry.get("name", "")
+                                        if not name or name in {".", ".."}:
+                                            continue
+                                        names.append(str(name))
+                                    if all(name in STORAGE_INTERNAL_ENTRY_NAMES for name in names):
+                                        target_preexisting = False
+                            except Exception:
+                                pass
+                        if resource_lock is None:
                             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
                             resource_lock = await self.acquire_resource_lock(
-                                lock_manager, dst_path, uri=root_uri
+                                dst_path,
+                                uri=root_uri,
+                                root_is_file=root_is_file,
                             )
                     if not target_preexisting:
-                        await viking_fs.persist_temp_tree(temp_uri, root_uri, ctx=ctx)
-                        await rewrite_image_uris(root_uri, ctx=ctx, lock_handle=resource_lock.handle)
-                        await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
+                        await viking_fs.persist_temp_tree(
+                            temp_uri,
+                            root_uri,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
+                        )
+                        if not root_is_file:
+                            await rewrite_image_uris(
+                                root_uri,
+                                ctx=ctx,
+                                lease_ref=resource_lock,
+                            )
+                        await viking_fs.delete_temp(
+                            parse_result.temp_dir_path,
+                            ctx=ctx,
+                        )
                         temp_uri = root_uri
                         source_committed = True
                 except Exception:
@@ -332,56 +436,29 @@ class ResourceProcessor:
                     except Exception:
                         pass
 
-            # ============ Phase 4: Optional Steps ============
-            build_index = kwargs.get("build_index", True)
-            temp_uri_for_summarize = temp_uri or parse_result.temp_dir_path
-            should_summarize = summarize or build_index
-            if should_summarize:
-                skip_vec = not build_index
-                is_code_repo = parse_result.source_format == "repository"
-                try:
-                    stage_start = time.perf_counter()
-                    stage_status = "ok"
-                    with telemetry.measure("resource.summarize"):
-                        summary_result = await self._get_summarizer().summarize(
-                            resource_uris=[result["root_uri"]],
-                            ctx=ctx,
-                            skip_vectorization=skip_vec,
-                            lock=resource_lock,
-                            temp_uris=[temp_uri_for_summarize],
-                            is_code_repo=is_code_repo,
-                            target_preexisting=target_preexisting,
-                            **kwargs,
-                        )
-                        if (
-                            resource_lock.active
-                            and summary_result.get("status") == "success"
-                            and summary_result.get("enqueued_count", 0) > 0
-                        ):
-                            await resource_lock.handoff()
-                            resource_lock = NO_LOCK
-                except Exception as e:
-                    logger.error(f"Summarization failed: {e}")
-                    result["warnings"] = result.get("warnings", []) + [f"Summarization failed: {e}"]
-                    stage_status = "error"
-                finally:
-                    try:
-                        ResourceIngestionEventDataSource.record_stage(
-                            stage="summarize",
-                            status=str(stage_status),
-                            duration_seconds=float(time.perf_counter() - stage_start),
-                            account_id=getattr(ctx, "account_id", None),
-                        )
-                    except Exception:
-                        pass
-
-            if resource_lock.active:
-                if not should_summarize and temp_uri and not source_committed:
-                    viking_fs = get_viking_fs()
-                    await viking_fs.persist_temp_tree(temp_uri, root_uri, ctx=ctx)
-                    await rewrite_image_uris(root_uri, ctx=ctx, lock_handle=resource_lock.handle)
-                    await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
-                await resource_lock.close()
+            prepared = {
+                "root_uri": root_uri,
+                "temp_uri": temp_uri or parse_result.temp_dir_path,
+                "temp_dir_path": parse_result.temp_dir_path,
+                "source_committed": source_committed,
+                "target_preexisting": target_preexisting,
+                "is_code_repo": parse_result.source_format == "repository",
+                "root_is_file": root_is_file,
+            }
+            if defer_post_processing:
+                result["_post_process"] = prepared
+                result["_resource_lock"] = resource_lock
+            else:
+                post_result = await self.finish_prepared_resource(
+                    prepared,
+                    ctx=ctx,
+                    resource_lock=resource_lock,
+                    summarize=summarize,
+                    ingest_options=ingest_options,
+                    **kwargs,
+                )
+                if post_result.get("warnings"):
+                    result.setdefault("warnings", []).extend(post_result["warnings"])
 
             # 恢复原始 temp_uri 用于输出
             if original_temp_uri is not None:
@@ -389,19 +466,273 @@ class ResourceProcessor:
 
             return result
 
+    async def finish_prepared_resource(
+        self,
+        prepared: Dict[str, Any],
+        *,
+        ctx: RequestContext,
+        resource_lock: Optional[Dict[str, Any]] = None,
+        summarize: bool = False,
+        processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Run the queue-producing phase for a resource already stored in VikingFS."""
+        from openviking.metrics.datasources.resource import ResourceIngestionEventDataSource
+
+        root_uri = str(prepared.get("root_uri") or "")
+        temp_uri = prepared.get("temp_uri")
+        temp_dir_path = prepared.get("temp_dir_path")
+        source_committed = bool(prepared.get("source_committed"))
+        target_preexisting = bool(prepared.get("target_preexisting"))
+        build_index = bool(kwargs.get("build_index", True))
+        processing_mode = normalize_processing_mode(processing_mode)
+        vectors_only = processing_mode == VECTORS_ONLY
+        root_is_file = bool(prepared.get("root_is_file"))
+        ingest_options = IngestOptions.from_value(kwargs.pop("ingest_options", None))
+        should_summarize = not root_is_file and not vectors_only and (summarize or build_index)
+        should_refresh_file_parent = (
+            root_is_file and not vectors_only and (summarize or build_index)
+        )
+        result: Dict[str, Any] = {"status": "success", "root_uri": root_uri}
+
+        if should_summarize:
+            stage_start = time.perf_counter()
+            stage_status = "ok"
+            try:
+                with get_current_telemetry().measure("resource.summarize"):
+                    summary_result = await self._get_summarizer().summarize(
+                        resource_uris=[root_uri],
+                        ctx=ctx,
+                        skip_vectorization=not build_index,
+                        lock=resource_lock,
+                        temp_uris=[temp_uri],
+                        is_code_repo=bool(prepared.get("is_code_repo")),
+                        target_preexisting=target_preexisting,
+                        ingest_options=ingest_options,
+                        **kwargs,
+                    )
+                    if (
+                        resource_lock is not None
+                        and summary_result.get("status") == "success"
+                        and summary_result.get("enqueued_count", 0) > 0
+                    ):
+                        await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
+                        resource_lock = None
+            except Exception as exc:
+                logger.error("Summarization failed: %s", exc)
+                result["warnings"] = [f"Summarization failed: {exc}"]
+                stage_status = "error"
+            finally:
+                try:
+                    ResourceIngestionEventDataSource.record_stage(
+                        stage="summarize",
+                        status=stage_status,
+                        duration_seconds=float(time.perf_counter() - stage_start),
+                        account_id=getattr(ctx, "account_id", None),
+                    )
+                except Exception:
+                    pass
+
+        if resource_lock is not None:
+            try:
+                sync_deleted_files: list[str] = []
+                sync_deleted_dirs: list[str] = []
+                if not should_summarize and temp_uri and not source_committed:
+                    viking_fs = get_viking_fs()
+                    if vectors_only and target_preexisting and not root_is_file:
+                        diff = await SemanticProcessor()._sync_topdown_recursive(
+                            temp_uri,
+                            root_uri,
+                            ctx=ctx,
+                            lock=resource_lock,
+                        )
+                        sync_deleted_files = list(getattr(diff, "deleted_files", []))
+                        sync_deleted_dirs = list(getattr(diff, "deleted_dirs", []))
+                    else:
+                        await viking_fs.persist_temp_tree(
+                            temp_uri,
+                            root_uri,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
+                        )
+                    if not root_is_file:
+                        await rewrite_image_uris(
+                            root_uri,
+                            ctx=ctx,
+                            lease_ref=resource_lock,
+                        )
+                    if temp_dir_path:
+                        await viking_fs.delete_temp(temp_dir_path, ctx=ctx)
+                if vectors_only:
+                    if sync_deleted_files or sync_deleted_dirs:
+                        await self._delete_removed_resource_vectors(
+                            files=sync_deleted_files,
+                            dirs=sync_deleted_dirs,
+                            ctx=ctx,
+                        )
+                if should_refresh_file_parent:
+                    await self._get_summarizer().refresh_file_parent(
+                        file_uri=root_uri,
+                        ctx=ctx,
+                        skip_vectorization=not build_index,
+                        ingest_options=ingest_options,
+                    )
+                elif build_index:
+                    if root_is_file:
+                        await self._vectorize_resource_file(
+                            root_uri, ctx=ctx, ingest_options=ingest_options
+                        )
+                    elif vectors_only:
+                        await self._vectorize_resource_files(
+                            root_uri, ctx=ctx, ingest_options=ingest_options
+                        )
+            finally:
+                await get_viking_fs()._async_agfs.pathlock_release(resource_lock)
+        elif should_refresh_file_parent:
+            await self._get_summarizer().refresh_file_parent(
+                file_uri=root_uri,
+                ctx=ctx,
+                skip_vectorization=not build_index,
+                ingest_options=ingest_options,
+            )
+        elif vectors_only or root_is_file:
+            if not build_index:
+                return result
+            if root_is_file:
+                await self._vectorize_resource_file(
+                    root_uri, ctx=ctx, ingest_options=ingest_options
+                )
+            else:
+                await self._vectorize_resource_files(
+                    root_uri, ctx=ctx, ingest_options=ingest_options
+                )
+        return result
+
+    async def _delete_removed_resource_vectors(
+        self,
+        *,
+        files: list[str],
+        dirs: list[str],
+        ctx: RequestContext,
+    ) -> None:
+        for uri in dict.fromkeys(files):
+            records = await self.vikingdb.get_context_by_uri(
+                uri=uri,
+                level=int(ContextLevel.DETAIL),
+                limit=100,
+                ctx=ctx,
+            )
+            ids = [str(record["id"]) for record in records if record.get("id")]
+            if ids:
+                await self.vikingdb.delete(ids, ctx=ctx)
+        for uri in dict.fromkeys(dirs):
+            records = await self.vikingdb.filter(
+                filter=And([
+                    PathScope("uri", uri, depth=-1),
+                    Eq("level", int(ContextLevel.DETAIL)),
+                    Eq("account_id", ctx.account_id),
+                ]),
+                limit=VECTORDB_MAX_QUERY_LIMIT,
+                output_fields=["id"],
+                ctx=ctx,
+            )
+            ids = [str(record["id"]) for record in records if record.get("id")]
+            if ids:
+                await self.vikingdb.delete(ids, ctx=ctx)
+
+    async def _vectorize_resource_files(
+        self,
+        root_uri: str,
+        *,
+        ctx: RequestContext,
+        ingest_options: IngestOptions | None = None,
+    ) -> None:
+        ingest_options = IngestOptions.from_value(ingest_options)
+        viking_fs = get_viking_fs()
+        entries = await viking_fs.tree(
+            root_uri,
+            node_limit=None,
+            level_limit=None,
+            ctx=ctx,
+        )
+        files: list[tuple[str, str, str]] = []
+        for entry in entries:
+            entry_uri = entry.get("uri") if isinstance(entry, dict) else None
+            if not entry_uri or entry.get("isDir"):
+                continue
+            name = entry.get("name") or entry_uri.rsplit("/", 1)[-1]
+            if str(name).startswith("."):
+                continue
+            parent = VikingURI(entry_uri).parent
+            if parent is None:
+                continue
+            files.append((entry_uri, str(name), parent.uri))
+
+        config = get_openviking_config().queue_workers.add_resource
+        concurrency = max(
+            1,
+            min(
+                int(config.file_vectorization_concurrency),
+                _MAX_FILE_VECTORIZATION_CONCURRENCY,
+            ),
+        )
+
+        async def vectorize(entry_uri: str, name: str, parent_uri: str) -> None:
+            await vectorize_file(
+                file_path=entry_uri,
+                summary_dict={"name": name, "summary": ""},
+                parent_uri=parent_uri,
+                context_type=context_type_for_uri(entry_uri),
+                ctx=ctx,
+                ingest_options=ingest_options,
+            )
+
+        for start in range(0, len(files), concurrency):
+            tasks = [
+                asyncio.create_task(vectorize(entry_uri, name, parent_uri))
+                for entry_uri, name, parent_uri in files[start : start + concurrency]
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+    async def _vectorize_resource_file(
+        self,
+        file_uri: str,
+        *,
+        ctx: RequestContext,
+        ingest_options: IngestOptions | None = None,
+    ) -> None:
+        parent = VikingURI(file_uri).parent
+        if parent is None:
+            return
+        name = file_uri.rsplit("/", 1)[-1]
+        await vectorize_file(
+            file_path=file_uri,
+            summary_dict={"name": name, "summary": ""},
+            parent_uri=parent.uri,
+            context_type=context_type_for_uri(file_uri),
+            ctx=ctx,
+            ingest_options=IngestOptions.from_value(ingest_options),
+        )
+
     async def reserve_unique_candidate(
         self,
         *,
         candidate_uri: str,
         ctx: RequestContext,
         max_attempts: int = 100,
-    ) -> tuple[str, OwnedLockLease]:
-        """Pick the first free candidate URI and reserve it with a resource TreeLock."""
+        root_is_file: bool = False,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Pick the first free candidate URI and reserve it with a type-aware lock."""
         from openviking.storage.errors import ResourceBusyError
-        from openviking.storage.transaction import get_lock_manager
 
         viking_fs = get_viking_fs()
-        lock_manager = get_lock_manager()
+        last_busy_error: Optional[ResourceBusyError] = None
 
         for attempt in range(max_attempts + 1):
             root_uri = candidate_uri if attempt == 0 else f"{candidate_uri}_{attempt}"
@@ -411,11 +742,24 @@ class ResourceProcessor:
             dst_path = viking_fs._uri_to_path(root_uri, ctx=ctx)
             try:
                 resource_lock = await self.acquire_resource_lock(
-                    lock_manager, dst_path, uri=root_uri, timeout=0.0
+                    dst_path,
+                    uri=root_uri,
+                    timeout=0.0,
+                    root_is_file=root_is_file,
                 )
                 return root_uri, resource_lock
-            except ResourceBusyError:
+            except ResourceBusyError as exc:
+                last_busy_error = exc
                 continue
+
+        if last_busy_error is not None:
+            raise ResourceBusyError(
+                f"All auto-named candidates are temporarily busy for {candidate_uri} "
+                f"after checking {max_attempts + 1} candidates",
+                uri=candidate_uri,
+                conflict_type="auto_name_reservation_busy",
+                retryable=True,
+            ) from last_busy_error
 
         raise FileExistsError(
             f"Cannot resolve unique name for {candidate_uri} after {max_attempts} attempts"
@@ -423,17 +767,23 @@ class ResourceProcessor:
 
     @staticmethod
     async def acquire_resource_lock(
-        lock_manager,
         path: str,
         *,
         uri: str = "",
-        timeout: Any = LOCK_TIMEOUT_DEFAULT,
-    ) -> OwnedLockLease:
-        """Acquire the per-resource TreeLock or raise a structured conflict."""
+        timeout: float = 0.0,
+        root_is_file: bool = False,
+    ) -> Dict[str, Any]:
+        """Acquire a file-exact or directory-tree resource lock."""
         from openviking.storage.errors import ResourceBusyError
 
         try:
-            return await OwnedLockLease.acquire_tree(lock_manager, path, timeout=timeout)
+            pathlock = get_viking_fs()._async_agfs
+            acquire = (
+                pathlock.pathlock_acquire_exact
+                if root_is_file
+                else pathlock.pathlock_acquire_tree
+            )
+            return await acquire(path, timeout_secs=timeout)
         except LockAcquisitionError as exc:
             logger.warning(f"[ResourceProcessor] Failed to acquire resource lock on {path}")
             raise ResourceBusyError(

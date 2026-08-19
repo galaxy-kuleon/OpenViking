@@ -26,15 +26,28 @@ class UsageAuditStore(Protocol):
     async def record_batch(self, events: Sequence[ObservabilityEvent]) -> None:
         """Persist a batch of observability events."""
 
+    async def delete_user_data(self, *, account_id: str, user_id: str) -> dict[str, int]:
+        """Delete every persisted usage/audit row owned by one user."""
+
     async def get_today_tokens(
-        self, *, account_id: str, user_date: str, tz: tzinfo
+        self,
+        *,
+        account_id: str,
+        user_date: str,
+        tz: tzinfo,
+        user_id: str | None = None,
     ) -> dict[str, int]:
-        """Return token totals for one account and viewer-local date."""
+        """Return token totals for one account/user scope and viewer-local date."""
 
     async def get_today_retrievals(
-        self, *, account_id: str, user_date: str, tz: tzinfo
+        self,
+        *,
+        account_id: str,
+        user_date: str,
+        tz: tzinfo,
+        user_id: str | None = None,
     ) -> dict[str, int]:
-        """Return successful find/search counts for one account and date."""
+        """Return successful find/search counts for one account/user scope and date."""
 
     async def get_token_series(
         self,
@@ -44,8 +57,9 @@ class UsageAuditStore(Protocol):
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return token series rows for a viewer-local date range."""
+        """Return token series rows for a viewer-local date range and user scope."""
 
     async def get_context_commit_heatmap(
         self,
@@ -55,13 +69,15 @@ class UsageAuditStore(Protocol):
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return context write bucket rows for a viewer-local date range."""
+        """Return context write bucket rows for a viewer-local date range and user scope."""
 
     async def query_audit_logs(
         self,
         *,
         account_id: str,
+        user_id: str | None = None,
         request_id: str | None = None,
         statuses: list[str] | None = None,
         api_types: list[str] | None = None,

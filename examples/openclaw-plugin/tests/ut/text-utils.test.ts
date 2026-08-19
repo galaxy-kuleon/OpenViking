@@ -286,6 +286,82 @@ describe("extractNewTurnMessages", () => {
     expect(newCount).toBe(1);
     expect(extracted).toEqual([]);
   });
+
+  it("maps toolResult messages to assistant tool parts", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_1", name: "read", arguments: { path: "package.json" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "read",
+        content: [{ type: "text", text: "{\"name\":\"pkg\"}" }],
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool",
+            toolCallId: "call_1",
+            toolName: "read",
+            toolInput: { path: "package.json" },
+            toolOutput: "{\"name\":\"pkg\"}",
+            toolStatus: "completed",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("preserves failed toolResult status", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_failed",
+            name: "ov_read",
+            arguments: { uri: "viking://user/test/memories/experiences/missing.md" },
+          },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_failed",
+        toolName: "ov_read",
+        content: [{ type: "text", text: "OpenViking request failed" }],
+        isError: true,
+      },
+    ];
+
+    const { messages: extracted } = extractNewTurnMessages(messages, 0);
+
+    expect(extracted).toEqual([
+      {
+        role: "assistant",
+        parts: [
+          {
+            type: "tool",
+            toolCallId: "call_failed",
+            toolName: "ov_read",
+            toolInput: { uri: "viking://user/test/memories/experiences/missing.md" },
+            toolOutput: "OpenViking request failed",
+            toolStatus: "error",
+          },
+        ],
+      },
+    ]);
+  });
 });
 
 describe("extractLatestUserText", () => {

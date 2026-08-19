@@ -3,15 +3,30 @@
 """Search endpoints for OpenViking HTTP Server."""
 
 import math
-from dataclasses import replace
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict, model_validator
+from fastapi import Response as FastAPIResponse
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
-from openviking.core.peer_id import normalize_peer_selector
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
+from openviking.retrieve.context_assembler import (
+    CATEGORY_KEYS,
+    DEFAULT_LIMIT,
+    DEFAULT_MAX_TOKENS,
+    MAX_EXCLUDE_URIS,
+    REPORTED_CATEGORY_KEYS,
+    AssembleParams,
+    DetailRequest,
+    assemble_context,
+)
+from openviking.retrieve.context_assembler.recall_preset import (
+    DEFAULT_MAX_CHARS,
+    DEFAULT_MIN_SCORE,
+    deprecation_stats,
+    fold_recall_request,
+)
 from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
@@ -24,7 +39,7 @@ from openviking.utils.search_filters import (
     _resolve_levels,
     merge_search_filter,
 )
-from openviking.utils.tags import normalize_search_tags
+from openviking.utils.tags import build_search_tags_filter
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 
 
@@ -65,15 +80,12 @@ def _resolve_search_filter(
             until=until,
             time_field=time_field,
         )
-        normalized_tags = normalize_search_tags(tags)
-        if not normalized_tags:
+        tag_filter = build_search_tags_filter(tags)
+        if not tag_filter:
             return merged
-        tag_filter: Dict[str, Any] = {
-            "op": "must",
-            "field": "search_tags",
-            "conds": normalized_tags,
-        }
         if merged:
+            if tag_filter.get("op") == "and" and isinstance(tag_filter.get("conds"), list):
+                return {"op": "and", "conds": [merged, *tag_filter["conds"]]}
             return {"op": "and", "conds": [merged, tag_filter]}
         return tag_filter
     except ValueError as exc:
@@ -87,32 +99,16 @@ def _resolve_uri_or_uris(uri: Union[str, List[str]]) -> Union[str, List[str]]:
     return resolve_path_variables(uri)
 
 
-def _ctx_with_legacy_actor_peer(
-    ctx: RequestContext,
-    legacy_peer_id: Optional[str],
-) -> RequestContext:
-    if legacy_peer_id is None:
-        return ctx
-    if ctx.actor_peer_id and ctx.actor_peer_id != legacy_peer_id:
-        raise InvalidArgumentError(
-            "actor_peer_id cannot be used with a different legacy agent_id/agent_uri"
-        )
-    if ctx.actor_peer_id == legacy_peer_id and ctx.legacy_agent_id == legacy_peer_id:
-        return ctx
-    return replace(ctx, actor_peer_id=legacy_peer_id, legacy_agent_id=legacy_peer_id)
-
-
 class FindRequest(BaseModel):
     """Request model for find."""
 
     model_config = ConfigDict(extra="forbid")
 
-    query: str
+    query: str = ""
+    image_url: Optional[str] = None
     target_uri: Union[str, List[str]] = ""
     context_type: Optional[Union[str, List[str]]] = None
-    agent_id: Optional[str] = None
-    agent_uri: Optional[str] = None
-    limit: int = 10
+    limit: int = DEFAULT_LIMIT
     node_limit: Optional[int] = None
     score_threshold: Optional[float] = None
     filter: Optional[Dict[str, Any]] = None
@@ -124,47 +120,131 @@ class FindRequest(BaseModel):
     level: Optional[Union[int, str, List[int]]] = None
     telemetry: TelemetryRequest = False
 
-    @model_validator(mode="after")
-    def normalize_request_peer_id(self) -> "FindRequest":
-        self.agent_id = normalize_peer_selector(
-            None,
-            agent_id=self.agent_id,
-            agent_uri=self.agent_uri,
+
+def _reject_unknown_categories(value: Any, label: str, allowed: Sequence[str]) -> None:
+    if not isinstance(value, dict):
+        return
+    unknown = sorted(set(value) - set(allowed))
+    if unknown:
+        raise ValueError(
+            f"unknown {label} keys: {', '.join(unknown)}; allowed: {', '.join(allowed)}"
         )
-        return self
+
+
+def _reject_unknown_quota_and_detail(quotas: Any, detail: Any) -> None:
+    # Quotas name a retrieval bucket, `detail` names a reported category: the
+    # catch-all memory category is reportable but owns no bucket to size.
+    _reject_unknown_categories(quotas, "quota", CATEGORY_KEYS)
+    _reject_unknown_categories(detail, "detail", REPORTED_CATEGORY_KEYS)
+
+
+CONTEXT_ONLY_FIELDS = (
+    "query_expansion",
+    "max_tokens",
+    "quotas",
+    "purpose",
+    "detail",
+    "dedup_turns",
+    "exclude_uris",
+    "peer_scope",
+    "other_peer_penalty",
+    "rewrite",
+    "rewrite_max_bullets",
+)
 
 
 class SearchRequest(BaseModel):
-    """Request model for search with session."""
+    """Request model for search with session.
+
+    ``mode="list"`` is the historical ranked-hit response. ``mode="context"``
+    turns the endpoint into the context assembly face: budgeting, detail tiers,
+    cross-turn dedup and the optional digest all live behind it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = ""
+    image_url: Optional[str] = None
+    target_uri: Union[str, List[str]] = ""
+    context_type: Optional[Union[str, List[str]]] = None
+    session_id: Optional[str] = None
+    limit: int = DEFAULT_LIMIT
+    node_limit: Optional[int] = None
+    score_threshold: Optional[float] = None
+    filter: Optional[Dict[str, Any]] = None
+    include_provenance: bool = False
+    tags: Optional[List[str]] = None
+
+    since: Optional[str] = None
+    until: Optional[str] = None
+    time_field: Optional[TimeField] = None
+    level: Optional[Union[int, str, List[int]]] = None
+    telemetry: TelemetryRequest = False
+
+    mode: Literal["list", "context"] = "list"
+
+    query_expansion: Literal["off", "auto"] = "auto"
+    max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=64, le=32000)
+    quotas: Optional[Dict[str, int]] = None
+    purpose: Optional[Literal["chat", "coding"]] = None
+    detail: Optional[DetailRequest] = None
+    dedup_turns: int = Field(default=0, ge=0, le=100)
+    exclude_uris: List[str] = Field(default_factory=list, max_length=MAX_EXCLUDE_URIS)
+    peer_scope: Literal["actor", "all"] = "all"
+    other_peer_penalty: Optional[Union[float, Dict[str, float]]] = None
+    rewrite: Union[bool, Literal["auto"]] = False
+    rewrite_max_bullets: int = Field(default=6, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> "SearchRequest":
+        if self.mode == "list":
+            used = sorted(set(CONTEXT_ONLY_FIELDS) & self.model_fields_set)
+            if used:
+                raise ValueError(
+                    f"{', '.join(used)} require mode='context'; "
+                    "set mode='context' or drop these fields"
+                )
+            return self
+
+        if self.target_uri:
+            raise ValueError("target_uri is not supported in mode='context'")
+        _reject_unknown_quota_and_detail(self.quotas, self.detail)
+        return self
+
+
+class RecallRequest(BaseModel):
+    """Request model for the recall preset over context assembly.
+
+    Deprecated in favour of ``POST /search`` with ``mode="context"``. The v1
+    fields (``max_chars``, ``min_score``, ``render``) are accepted as aliases
+    here only, and are folded onto the context contract.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     query: str
-    target_uri: Union[str, List[str]] = ""
-    context_type: Optional[Union[str, List[str]]] = None
-    agent_id: Optional[str] = None
-    agent_uri: Optional[str] = None
-    session_id: Optional[str] = None
-    limit: int = 10
-    node_limit: Optional[int] = None
-    score_threshold: Optional[float] = None
-    filter: Optional[Dict[str, Any]] = None
-    include_provenance: bool = False
-    tags: Optional[List[str]] = None
-
-    since: Optional[str] = None
-    until: Optional[str] = None
-    time_field: Optional[TimeField] = None
-    level: Optional[Union[int, str, List[int]]] = None
+    quotas: Optional[Dict[str, int]] = None
+    max_chars: int = DEFAULT_MAX_CHARS
+    min_score: float = DEFAULT_MIN_SCORE
+    peer_scope: Literal["actor", "all"] = "all"
+    other_peer_penalty: Optional[Union[float, Dict[str, float]]] = None
+    render: Union[bool, Literal["full", "compact"]] = True
     telemetry: TelemetryRequest = False
 
+    session_id: Optional[str] = None
+    query_expansion: Optional[Literal["off", "auto"]] = None
+    max_tokens: Optional[int] = Field(default=None, ge=64, le=32000)
+    purpose: Optional[Literal["chat", "coding"]] = None
+    detail: Optional[DetailRequest] = None
+    score_threshold: Optional[float] = None
+    dedup_turns: Optional[int] = Field(default=None, ge=0, le=100)
+    exclude_uris: List[str] = Field(default_factory=list, max_length=MAX_EXCLUDE_URIS)
+    rewrite: Union[bool, Literal["auto"]] = False
+    rewrite_max_bullets: int = Field(default=6, ge=1, le=20)
+
     @model_validator(mode="after")
-    def normalize_request_peer_id(self) -> "SearchRequest":
-        self.agent_id = normalize_peer_selector(
-            None,
-            agent_id=self.agent_id,
-            agent_uri=self.agent_uri,
-        )
+    def _validate_quotas(self) -> "RecallRequest":
+        _reject_unknown_quota_and_detail(self.quotas, self.detail)
         return self
 
 
@@ -175,8 +255,8 @@ class GrepRequest(BaseModel):
     exclude_uri: Optional[str] = None
     pattern: str
     case_insensitive: bool = False
-    node_limit: Optional[int] = None
-    level_limit: int = 5
+    node_limit: Optional[int] = 256
+    level_limit: int = 10
 
 
 class GlobRequest(BaseModel):
@@ -184,7 +264,7 @@ class GlobRequest(BaseModel):
 
     pattern: str
     uri: str = "viking://"
-    node_limit: Optional[int] = None
+    node_limit: Optional[int] = 256
 
 
 @router.post("/find")
@@ -194,7 +274,6 @@ async def find(
 ):
     """Semantic search without session context."""
     service = get_service()
-    ctx = _ctx_with_legacy_actor_peer(_ctx, request.agent_id)
     actual_limit = _resolve_search_limit(request.limit, request.node_limit)
     effective_filter = _resolve_search_filter(
         request.filter,
@@ -210,12 +289,13 @@ async def find(
         telemetry=request.telemetry,
         fn=lambda: service.search.find(
             query=request.query,
-            ctx=ctx,
+            ctx=_ctx,
             target_uri=resolved_target_uri,
             limit=actual_limit,
             score_threshold=request.score_threshold,
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
+            image_url=request.image_url,
         ),
     )
     result = execution.result
@@ -229,6 +309,62 @@ async def find(
     ).model_dump(exclude_none=True)
 
 
+def _context_ignored_fields(request: SearchRequest) -> List[str]:
+    """Fields accepted but inert in context mode, surfaced through stats."""
+    ignored: List[str] = []
+    if request.level is not None:
+        ignored.append("level")
+    if (request.quotas is not None or request.purpose is not None) and (
+        "limit" in request.model_fields_set or request.node_limit is not None
+    ):
+        ignored.append("limit")
+    return ignored
+
+
+async def _search_context(
+    *,
+    service: Any,
+    ctx: RequestContext,
+    request: SearchRequest,
+    effective_filter: Optional[Dict[str, Any]],
+    actual_limit: int,
+):
+    """Assemble an injection-ready context block for one request."""
+    params = AssembleParams(
+        query=request.query,
+        image_url=request.image_url,
+        limit=actual_limit,
+        score_threshold=request.score_threshold,
+        filter=effective_filter,
+        session_id=request.session_id,
+        query_expansion=request.query_expansion,
+        max_tokens=request.max_tokens,
+        quotas=request.quotas,
+        purpose=request.purpose,
+        detail=request.detail,
+        dedup_turns=request.dedup_turns,
+        exclude_uris=request.exclude_uris,
+        peer_scope=request.peer_scope,
+        other_peer_penalty=request.other_peer_penalty,
+        rewrite=request.rewrite,
+        rewrite_max_bullets=request.rewrite_max_bullets,
+    )
+    execution = await run_operation(
+        operation="search.context",
+        telemetry=request.telemetry,
+        fn=lambda: assemble_context(service=service, ctx=ctx, params=params),
+    )
+    result = execution.result
+    ignored = _context_ignored_fields(request)
+    if ignored:
+        result.stats["ignored"] = ignored
+    return Response(
+        status="ok",
+        result=_sanitize_floats(result.to_dict()),
+        telemetry=execution.telemetry,
+    ).model_dump(exclude_none=True)
+
+
 @router.post("/search")
 async def search(
     request: SearchRequest,
@@ -236,7 +372,6 @@ async def search(
 ):
     """Semantic search with optional session context."""
     service = get_service()
-    ctx = _ctx_with_legacy_actor_peer(_ctx, request.agent_id)
     actual_limit = _resolve_search_limit(request.limit, request.node_limit)
     effective_filter = _resolve_search_filter(
         request.filter,
@@ -246,22 +381,32 @@ async def search(
         request.time_field,
         request.tags,
     )
+    if request.mode == "context":
+        return await _search_context(
+            service=service,
+            ctx=_ctx,
+            request=request,
+            effective_filter=effective_filter,
+            actual_limit=actual_limit,
+        )
     resolved_target_uri = _resolve_uri_or_uris(request.target_uri)
 
     async def _search():
         session = None
-        if request.session_id:
-            session = service.sessions.session(ctx, request.session_id)
+        # Intent off: skip session.load — SearchService will not scan session either.
+        if request.session_id and service.search.is_intent_enabled():
+            session = service.sessions.session(_ctx, request.session_id)
             await session.load()
         return await service.search.search(
             query=request.query,
-            ctx=ctx,
+            ctx=_ctx,
             target_uri=resolved_target_uri,
             session=session,
             limit=actual_limit,
             score_threshold=request.score_threshold,
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
+            image_url=request.image_url,
         )
 
     execution = await run_operation(
@@ -276,6 +421,31 @@ async def search(
     return Response(
         status="ok",
         result=result,
+        telemetry=execution.telemetry,
+    ).model_dump(exclude_none=True)
+
+
+@router.post("/recall", deprecated=True)
+async def recall(
+    request: RecallRequest,
+    response: FastAPIResponse,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Deprecated preset over context assembly; use /search with mode="context"."""
+    service = get_service()
+    params, aliases = fold_recall_request(request.model_dump(), request.model_fields_set)
+    execution = await run_operation(
+        operation="search.recall",
+        telemetry=request.telemetry,
+        fn=lambda: assemble_context(service=service, ctx=_ctx, params=params),
+    )
+    result = execution.result
+    result.stats["deprecated"] = deprecation_stats(aliases)
+    response.headers["Deprecation"] = "true"
+    response.headers["Link"] = '</api/v1/search/search>; rel="successor-version"'
+    return Response(
+        status="ok",
+        result=_sanitize_floats(result.to_dict()),
         telemetry=execution.telemetry,
     ).model_dump(exclude_none=True)
 

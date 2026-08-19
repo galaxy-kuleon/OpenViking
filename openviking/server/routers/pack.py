@@ -12,10 +12,14 @@ from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
 
 from openviking.core.path_variables import resolve_path_variables
-from openviking.server.auth import get_request_context, require_auth_root_or_admin
+from openviking.server.auth import (
+    get_request_context,
+    require_auth_role,
+    require_auth_root_or_admin,
+)
 from openviking.server.dependencies import get_service
 from openviking.server.error_mapping import map_exception
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.server.temp_upload_store import TempUploadStore
 
@@ -67,7 +71,7 @@ class RestoreRequest(BaseModel):
 
 
 @router.post("/export")
-@require_auth_root_or_admin
+@require_auth_role(Role.ROOT, Role.ADMIN, Role.USER)
 async def export_ovpack(
     request: Request,
     body: ExportRequest,
@@ -159,7 +163,7 @@ async def backup_ovpack(
 
 
 @router.post("/import")
-@require_auth_root_or_admin
+@require_auth_role(Role.ROOT, Role.ADMIN, Role.USER)
 async def import_ovpack(
     request: Request,
     body: ImportRequest,
@@ -182,10 +186,7 @@ async def import_ovpack(
             vector_mode=body.vector_mode,
         )
     except Exception:
-        await store.mark_failed(resolved, ctx)
         raise
-    else:
-        await store.mark_consumed(resolved, ctx)
     finally:
         await resolved.cleanup()
 
@@ -212,10 +213,7 @@ async def restore_ovpack(
             vector_mode=body.vector_mode,
         )
     except Exception:
-        await store.mark_failed(resolved, ctx)
         raise
-    else:
-        await store.mark_consumed(resolved, ctx)
     finally:
         await resolved.cleanup()
 

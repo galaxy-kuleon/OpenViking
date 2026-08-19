@@ -23,7 +23,7 @@ For `/api/v1/admin/*`, `trusted` mode permits requests with no explicit identity
 | Register/remove users | Y | Y (own account) | N |
 | List agents (deprecated, returns empty list) | Y | Y (own account) | N |
 | Regenerate user key | Y | Y (own account) | N |
-| Change user role | Y | N | N |
+| Promote user to ADMIN | Y | Y (own account) | N |
 
 ## CLI `--sudo` Option
 
@@ -57,6 +57,68 @@ Configure `root_api_key` in `~/.openviking/ovcli.conf`:
 
 ## API Reference
 
+### get_agent_evolution_status
+
+Return the effective Agent Evolution switch for the caller's account. ROOT
+operates on the configured default account; ADMIN operates on its own account.
+
+**HTTP API**
+
+```
+GET /api/v1/admin/agent-evolution
+```
+
+```bash
+curl http://localhost:1933/api/v1/admin/agent-evolution \
+  -H "X-API-Key: <root-key>"
+```
+
+**Response Example**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "enabled": false,
+    "account_id": "default"
+  },
+  "time": 0.1
+}
+```
+
+`enabled` is the account override from
+`/local/{account_id}/_system/setting.json`, or
+`server.agent_evolution.enabled` when no override exists. Session commits read
+this effective value without restarting the server.
+
+The existing update endpoint name is unchanged:
+
+```http
+PUT /api/v1/admin/agent-evolution
+Content-Type: application/json
+
+{"enabled": true}
+```
+
+### account_settings
+
+ROOT can manage any account and ADMIN can manage only its own account. The
+generic settings endpoint accepts only explicitly allowlisted fields; currently
+only `agent_evolution.enabled` is writable.
+
+```http
+GET /api/v1/admin/accounts/{account_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/settings
+Content-Type: application/json
+
+{"agent_evolution": {"enabled": true}}
+```
+
+Before an existing setting is replaced, it is backed up to
+`/local/{account_id}/_system/setting.backup.json`.
+
+---
+
 ### create_account
 
 #### 1. API Implementation Overview
@@ -68,7 +130,8 @@ Create a new workspace with its first admin user.
 2. Use API Key Manager to create account and initial admin user
 3. Initialize account-level directory structure
 4. Initialize admin user's personal directory
-5. Return account info and user key (not in trusted mode)
+5. Write optional initial admin user config
+6. Return account info and user key (not in trusted mode)
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:create_account` - HTTP route
@@ -83,10 +146,15 @@ Create a new workspace with its first admin user.
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
 | admin_user_id | str | Yes | - | First admin user ID |
+| seed | str | No | `null` | Optional deterministic API key seed. When set, the key secret is `sha256(user_id + "\0" + seed)` |
+| user_config | object | No | `null` | Initial config for the first admin user. Currently supports `add_targets.resource_uri` and `add_targets.skill_uri` |
 
 **Notes:**
 - In `trusted` mode, `user_key` is omitted from the response
+- Omit `seed` for the default random API key. Treat seed values as secret material; short seeds can make the key guessable.
 - Account-level namespace isolation settings are no longer supported. User memory uses user-scoped namespaces, and one-to-many external participants are represented with `peer_id`.
+- `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://user/resources` or `viking://user/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
+- `user_config.add_targets.skill_uri` must be `viking://user/skills` or `viking://agent/skills`. Explicit `viking://user/{user_id}/skills` is not accepted in v1.
 
 #### 3. Usage Examples
 
@@ -102,7 +170,8 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
   -H "X-API-Key: <root-key>" \
   -d '{
     "account_id": "acme",
-    "admin_user_id": "alice"
+    "admin_user_id": "alice",
+    "seed": "alice-seed"
   }'
 ```
 
@@ -118,13 +187,7 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
     "admin_user_id": "gateway-admin"
   }'
 
-# Then promote it to root for cross-account admin operations
-curl -X PUT http://localhost:1933/api/v1/admin/accounts/platform/users/gateway-admin/role \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
-  -d '{"role": "root"}'
-
-# Then use in trusted mode
+# Then use it in trusted mode; admin authorization comes from root_api_key
 curl -X POST http://localhost:1933/api/v1/admin/accounts \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
@@ -156,10 +219,27 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_create_account("acme", "alice")
+result = client.admin_create_account("acme", "alice", seed="alice-seed")
 print(f"Account created: {result['account_id']}")
 print(f"Admin user: {result['admin_user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
+
+result = client.admin_create_account(
+    "acme-private",
+    "alice",
+    user_config={
+        "add_targets": {
+            "resource_uri": "viking://user/resources",
+            "skill_uri": "viking://user/skills",
+        }
+    },
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminCreateAccount("account-id", "admin-user-id"));
 ```
 
 **Go SDK**
@@ -170,6 +250,17 @@ if err != nil {
     return err
 }
 fmt.Println(result["account_id"])
+
+seed := "alice-seed"
+result, err = client.AdminCreateAccountWithOptions(ctx, "acme-private", "alice", &openviking.AdminCreateAccountOptions{
+    Seed: &seed,
+    UserConfig: map[string]any{
+        "add_targets": map[string]any{
+            "resource_uri": "viking://user/resources",
+            "skill_uri":    "viking://user/skills",
+        },
+    },
+})
 ```
 
 **CLI**
@@ -177,6 +268,10 @@ fmt.Println(result["account_id"])
 ```bash
 # Requires ROOT privileges, use --sudo
 ov --sudo admin create-account acme --admin alice
+ov --sudo admin create-account acme --admin alice --seed alice-seed
+
+ov --sudo admin create-account acme-private --admin alice \
+  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources","skill_uri":"viking://user/skills"}}'
 ```
 
 **Response Example**
@@ -241,6 +336,12 @@ client.initialize()
 accounts = client.admin_list_accounts()
 for account in accounts:
     print(f"Account: {account['account_id']}, created: {account['created_at']}, users: {account['user_count']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminListAccounts());
 ```
 
 **Go SDK**
@@ -329,6 +430,12 @@ result = client.admin_delete_account("acme")
 print(f"Account deleted: {result['deleted']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.adminDeleteAccount("account-id");
+```
+
 **Go SDK**
 
 ```go
@@ -370,7 +477,8 @@ Register a new user in a workspace.
 1. Verify requester has ROOT privileges or is an ADMIN of the account
 2. Call API Key Manager to register new user
 3. Initialize new user's personal directory
-4. Return user info and user key (not in trusted mode)
+4. Write optional initial user config
+5. Return user info and user key (not in trusted mode)
 
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:register_user` - HTTP route
@@ -385,12 +493,17 @@ Register a new user in a workspace.
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
 | user_id | str | Yes | - | User ID |
-| role | str | No | "user" | Role to assign. `ROOT` and same-account `ADMIN` may register `"user"` or `"admin"`. `"root"` must be assigned through the dedicated role-change endpoint. |
+| role | str | No | "user" | Role to assign. `ROOT` and same-account `ADMIN` may register `"user"` or `"admin"`. ROOT identity comes only from `server.root_api_key`. |
+| seed | str | No | `null` | Optional deterministic API key seed. When set, the key secret is `sha256(user_id + "\0" + seed)` |
+| user_config | object | No | `null` | Initial config for the new user. Currently supports `add_targets.resource_uri` and `add_targets.skill_uri` |
 
 **Notes:**
 - In `trusted` mode, `user_key` is omitted from the response
+- Omit `seed` for the default random API key. Treat seed values as secret material; short seeds can make the key guessable.
 - ADMIN can only register users in their own account
 - The `"root"` role cannot be minted through user registration
+- `user_config.add_targets.resource_uri` must be a writable resource directory URI: `viking://resources` or `viking://resources/...`, `viking://user/resources` or `viking://user/resources/...`, `viking://user/{user_id}/resources` or `viking://user/{user_id}/resources/...`, or `viking://user/{user_id}/peers/{peer_id}/resources` or `viking://user/{user_id}/peers/{peer_id}/resources/...`.
+- `user_config.add_targets.skill_uri` must be `viking://user/skills` or `viking://agent/skills`. Explicit `viking://user/{user_id}/skills` is not accepted in v1.
 
 #### 3. Usage Examples
 
@@ -406,7 +519,8 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <root-or-admin-key>" \
   -d '{
     "user_id": "bob",
-    "role": "user"
+    "role": "user",
+    "seed": "bob-seed"
   }'
 ```
 
@@ -418,9 +532,22 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_register_user("acme", "bob", role="user")
+result = client.admin_register_user("acme", "bob", role="user", seed="bob-seed")
 print(f"User registered: {result['user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
+
+result = client.admin_register_user(
+    "acme",
+    "bob-private",
+    role="user",
+    user_config={"add_targets": {"resource_uri": "viking://user/resources/project-a"}},
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminRegisterUser("account-id", "user-id", "user"));
 ```
 
 **Go SDK**
@@ -431,6 +558,14 @@ if err != nil {
     return err
 }
 fmt.Println(result["user_id"])
+
+seed := "bob-seed"
+result, err = client.AdminRegisterUserWithOptions(ctx, "acme", "bob-private", "user", &openviking.AdminRegisterUserOptions{
+    Seed: &seed,
+    UserConfig: map[string]any{
+        "add_targets": map[string]any{"resource_uri": "viking://user/resources/project-a"},
+    },
+})
 ```
 
 **CLI**
@@ -439,8 +574,12 @@ fmt.Println(result["user_id"])
 # Either ROOT or account ADMIN can execute
 # If using regular user's api_key who is an ADMIN of acme:
 ov admin register-user acme bob --role user
+ov admin register-user acme bob --role user --seed bob-seed
 # If using root_api_key (--sudo):
 ov --sudo admin register-user acme bob --role user
+
+ov admin register-user acme bob-private --role user \
+  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources/project-a"}}'
 ```
 
 **Response Example**
@@ -520,6 +659,12 @@ client.initialize()
 users = client.admin_list_users("acme")
 for user in users:
     print(f"User: {user['user_id']}, role: {user['role']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminListUsers("account-id"));
 ```
 
 **Go SDK**
@@ -612,6 +757,12 @@ result = client.admin_remove_user("acme", "bob")
 print(f"User deleted: {result['deleted']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.adminRemoveUser("account-id", "user-id");
+```
+
 **Go SDK**
 
 ```go
@@ -650,10 +801,10 @@ ov --sudo admin remove-user acme bob
 
 #### 1. API Implementation Overview
 
-Change a user's role (ROOT only).
+Promote an account user to ADMIN. ROOT may operate on any account; ADMIN is limited to its own account.
 
 **Processing Flow:**
-1. Verify requester has ROOT privileges
+1. Verify the requester has ROOT or ADMIN privileges and keep ADMIN within its own account
 2. Call API Key Manager to update user role
 3. Return updated user info
 
@@ -670,11 +821,11 @@ Change a user's role (ROOT only).
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
 | user_id | str | Yes | - | User ID |
-| role | str | Yes | - | New role: "admin", "user", or "root" |
+| role | str | Yes | - | Must be "admin" |
 
 **Notes:**
-- Only ROOT can change user roles
-- Role can be set to "admin", "user", or "root"
+- ROOT and ADMIN can promote users to ADMIN; ADMIN is limited to its own account
+- This endpoint cannot set "user" or "root"; ROOT comes only from `server.root_api_key`
 
 #### 3. Usage Examples
 
@@ -701,6 +852,12 @@ client.initialize()
 
 result = client.admin_set_role("acme", "bob", "admin")
 print(f"User: {result['user_id']}, new role: {result['role']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.adminSetRole("account-id", "user-id", "admin");
 ```
 
 **Go SDK**
@@ -761,10 +918,12 @@ Regenerate a user's API key. The old key is immediately invalidated.
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
 | user_id | str | Yes | - | User ID |
+| seed | str | No | `null` | Optional deterministic API key seed in the JSON request body. When set, the key secret is `sha256(user_id + "\0" + seed)` |
 
 **Notes:**
 - ADMIN can only regenerate keys for users in their own account
 - Old key is immediately invalidated, clients using it need to be updated
+- Omit `seed` for the default random regenerated key.
 
 #### 3. Usage Examples
 
@@ -777,7 +936,8 @@ POST /api/v1/admin/accounts/{account_id}/users/{user_id}/key
 ```bash
 curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users/bob/key \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-or-admin-key>"
+  -H "X-API-Key: <root-or-admin-key>" \
+  -d '{"seed": "bob-new-seed"}'
 ```
 
 **Python SDK**
@@ -788,8 +948,14 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_regenerate_key("acme", "bob")
+result = client.admin_regenerate_key("acme", "bob", seed="bob-new-seed")
 print(f"New user key: {result['user_key']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminRegenerateKey("account-id", "user-id"));
 ```
 
 **Go SDK**
@@ -800,6 +966,11 @@ if err != nil {
     return err
 }
 fmt.Println(result["user_key"])
+
+seed := "bob-new-seed"
+result, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "bob", &openviking.AdminRegenerateKeyOptions{
+    Seed: &seed,
+})
 ```
 
 **CLI**
@@ -808,6 +979,7 @@ fmt.Println(result["user_key"])
 # Either ROOT or account ADMIN can execute
 # If using regular user's api_key who is an ADMIN of acme:
 ov admin regenerate-key acme bob
+ov admin regenerate-key acme bob --seed bob-new-seed
 # If using root_api_key (--sudo):
 ov --sudo admin regenerate-key acme bob
 ```
@@ -879,22 +1051,32 @@ POST /api/v1/admin/migrate
 
 #### 3. Usage Examples
 
-**Run migration**
+**HTTP API**
 
 ```bash
+# Run migration
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "migrate"}'
-```
 
-**Clean old namespaces**
-
-```bash
+# Clean old namespaces
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "cleanup"}'
+```
+
+**Python SDK**
+
+```python
+print(client.admin_migrate(cleanup=False))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminMigrate(false));
 ```
 
 **Go SDK**
@@ -925,6 +1107,8 @@ ov --sudo admin migrate --cleanup --output json
 ```
 
 ---
+
+<a id="user-add-location-settings"></a>
 
 ## Full Example
 
@@ -976,10 +1160,10 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users \
 curl -X GET http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <alice-key>"
 
-# Step 4: Change role (requires ROOT key)
+# Step 4: Promote the user to admin
 curl -X PUT http://localhost:1933/api/v1/admin/accounts/acme/users/bob/role \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
+  -H "X-API-Key: <alice-key>" \
   -d '{"role": "admin"}'
 
 # Step 5: Regenerate key

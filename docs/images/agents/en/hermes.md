@@ -6,15 +6,15 @@
 hermes memory setup
 ```
 
-## Step 2: Copy the Base URL and API Key
+## Step 2: Copy the Base URL and Authentication management
 
-After running the setup command, Hermes prompts for the Base URL and API Key. Copy them and paste them into Hermes:
+After running the setup command, Hermes prompts for the Base URL and Authentication management. Copy them and paste them into Hermes:
 
 - Base URL: Copy the following Base URL into Hermes:
 ```text
 https://api.vikingdb.cn-beijing.volces.com/openviking
 ```
-- API Key: Copy the API Key shown on the page into your Hermes terminal
+- Authentication management: Copy the Authentication management shown on the page into your Hermes terminal
 - Tenant account / user / agent ID: Used for multi-tenant deployments
 
 The configuration is saved to Hermes `config.yaml` and `.env` files.
@@ -25,7 +25,7 @@ The configuration is saved to Hermes `config.yaml` and `.env` files.
 hermes memory status
 ```
 
-After configuration, Hermes automatically uses OpenViking as long-term memory. Memory tools such as `viking_remember` and `viking_recall` are available immediately.
+After configuration, Hermes uses the OpenViking memory provider to inject context, prefetch relevant memories, and sync and extract memories after sessions. Available tools include `viking_search`, `viking_read`, `viking_browse`, `viking_remember`, `viking_forget`, and `viking_add_resource`.
 
 ## Reference docs
 

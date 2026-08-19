@@ -2,8 +2,12 @@
     "server": {
         "host": "0.0.0.0",
         "port": 1933,
+        "timeout_keep_alive": 5,
         "root_api_key": null,
         "cors_origins": ["*"],
+        "agent_evolution": {
+            "enabled": false,
+        },
         "observability": {
             "metrics": {
                 "enabled": true,
@@ -61,6 +65,10 @@
         "agfs": {
             "backend": "local",
             "timeout": 10,
+            "pathlock": {
+                "provider": "filesystem",
+                "lock_expire_secs": 30.0
+            },
             "s3": {
                 "bucket": null,
                 "region": null,
@@ -73,6 +81,17 @@
                 "disable_batch_delete": false,
             },
         },
+    },
+    "queue_workers": {
+        "external_parse": {"max_concurrent": 4},
+        "add_resource": {
+            "max_concurrent": 4,
+            "file_vectorization_concurrency": 8
+        },
+        "session_commit": {"max_concurrent": 8},
+    },
+    "reindex": {
+        "file_vectorization_concurrency": 8
     },
     "embedding": {
         "dense": {
@@ -98,13 +117,20 @@
         },
     },
     "vlm": {
-        "model": "doubao-seed-2-0-pro-260215",
+        "model": "doubao-seed-2-0-lite-260428",
         "api_key": "{your-api-key}",
         "api_base": "https://ark.cn-beijing.volces.com/api/v3",
         "temperature": 0.0,
         "max_retries": 2,
         "provider": "volcengine",
         "thinking": false,
+        "media": {
+            "enabled": false,
+            "file_processing_timeout": 1800,
+            "file_poll_interval": 3,
+            "max_concurrent": 2,
+            "video_fps": 1.0,
+        },
     },
     "vlm_codex_example": {
         "_comment": "For Codex OAuth via subscription. Complete sign-in from `openviking-server init`. OV stores tokens in ~/.openviking/codex_auth.json and can bootstrap from an existing Codex CLI auth file if needed.",
@@ -149,7 +175,13 @@
         "model": "qwen3-rerank",
         "threshold": 0.1,
     },
-    "retrieval": {"hotness_alpha": 0.0, "score_propagation_alpha": 1.0},
+    "retrieval": {
+        "hotness_alpha": 0.0,
+        "score_propagation_alpha": 1.0,
+        "recall_intent_timeout_s": 5.0,
+        "recall_rewrite_timeout_s": 30.0,
+    },
+    "grep": {"engine": "auto", "switch_to_remote_threshold": 10000},
     "auto_generate_l0": true,
     "auto_generate_l1": true,
     "default_search_mode": "thinking",
@@ -160,6 +192,32 @@
         "version": "v2",
         "extraction_enabled": true,
         "session_skill_extraction_enabled": false,
+    },
+    "ingest": {
+        "enabled": false,
+        "server_url": "$OPENVIKING_URL",
+        "api_key": "$OPENVIKING_API_KEY",
+        "account": "default",
+        "user": "default",
+        "harnesses": {
+            "claude_code": {"enabled": false, "mode": "both"},
+            "codex": {"enabled": false, "mode": "backfill"},
+            "opencode": {"enabled": false, "mode": "watch", "experimental": true},
+            "hermes": {"enabled": false, "mode": "both", "user_field": "sender"},
+            "openclaw": {"enabled": false, "mode": "both", "user_field": "sender"},
+        },
+    },
+    "bot": {
+        "gateway": {
+            "host": "127.0.0.1",
+            "port": 18790,
+            "token": null,
+        },
+        "ov_server": {
+            "server_url": null,
+            "api_key_type": "user",
+            "api_key": null,
+        },
     },
     "log": {
         "level": "INFO",
@@ -176,22 +234,27 @@
             "max_section_size": 4000,
             "section_size_flexibility": 0.3,
             "max_section_chars": 6000,
-            "mineru_endpoint": "https://mineru.example.com/api/v1",
-            "mineru_api_key": "{your-mineru-api-key}",
+            "mineru_endpoint": "http://127.0.0.1:8000",
             "mineru_timeout": 300.0,
+            "mineru_bodys": {
+                "backend": "hybrid-auto-engine",
+                "lang_list": ["ch"],
+                "parse_method": "auto"
+            },
         },
         "code": {
-            "code_summary_mode": "ast",
-            "extract_functions": true,
-            "extract_classes": true,
-            "extract_imports": true,
-            "include_comments": true,
-            "max_line_length": 1000,
-            "max_token_limit": 50000,
-            "truncation_strategy": "head",
-            "warn_on_truncation": true,
             "github_raw_domain": "raw.githubusercontent.com",
-            "code_hosting_domains": ["github.com", "gitlab.com"],
+            "code_hosting_domains": [
+                "github.com",
+                "gitlab.com",
+                "gitcode.com",
+                "gitee.com",
+                "bitbucket.org",
+                "codeberg.org",
+                "gitea.com",
+                "atomgit.com",
+                "git.sr.ht"
+            ],
             "github_domains": ["github.com", "www.github.com"],
             "gitlab_domains": ["gitlab.com", "www.gitlab.com"],
         },
@@ -200,7 +263,11 @@
             "enable_vlm": true,
             "ocr_lang": "eng",
             "vlm_model": "gpt-4-vision",
-            "max_dimension": 2048,
+            "preview_max_dimension": 2048,
+            "max_file_size_mb": 10.0,
+            "max_tile_dimension_px": 2048,
+            "tile_overlap_px": 2,
+            "large_image_threshold_dimension": 4096
         },
         "audio": {
             "enable_transcription": true,
@@ -232,6 +299,16 @@
             "split_by_paragraphs": true,
             "max_paragraph_length": 1000,
             "preserve_line_breaks": false,
+        },
+        "webfeed": {
+            "max_pages": 200,
+            "max_concurrency": 5,
+            "request_timeout": 30.0,
+            "politeness_delay": 0.2,
+            "same_host_only": true,
+            "respect_robots": true,
+            "max_depth": 2,
+            "suggest_feed": true,
         },
     },
     "encryption": {

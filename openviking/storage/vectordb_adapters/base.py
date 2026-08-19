@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import random
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, Optional
@@ -26,9 +28,33 @@ from openviking.storage.expr import (
 from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.result import FetchDataInCollectionResult
 from openviking_cli.utils import get_logger
+from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# VikingDB text field byte limit
+# ---------------------------------------------------------------------------
+# VikingDB rejects upsert when any text field exceeds this byte length.
+# Truncation is applied at a valid UTF-8 character boundary so that
+# multi-byte sequences are never split in the middle.
+VIKINGDB_TEXT_FIELD_BYTE_LIMIT: int = 1024 * 1024
+
+
+def _truncate_text_field(text: str, byte_limit: int = VIKINGDB_TEXT_FIELD_BYTE_LIMIT) -> str:
+    """Truncate *text* so its UTF-8 encoding does not exceed *byte_limit*.
+
+    Walks backwards from *byte_limit* to find the nearest valid UTF-8 lead
+    byte, ensuring no multi-byte character is split.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= byte_limit:
+        return text
+    cut = byte_limit
+    while cut > 0 and (encoded[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return encoded[:cut].decode("utf-8")
 
 
 def _parse_url(url: str) -> tuple[str, int]:
@@ -53,6 +79,13 @@ def _normalize_collection_names(raw_collections: Iterable[Any]) -> list[str]:
     return names
 
 
+def _normalize_result_score(value: Any) -> float:
+    """Return a finite numeric score; scalar sort values may be strings or datetimes."""
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    return 0.0
+
+
 class CollectionAdapter(ABC):
     """Backend-specific adapter for single-collection operations.
 
@@ -67,6 +100,20 @@ class CollectionAdapter(ABC):
 
     mode: str
     _URI_FIELD_NAMES = {"uri", "parent_uri"}
+
+    # Text fields subject to byte-limit truncation before upsert.
+    _TRUNCATABLE_TEXT_FIELDS: tuple[str, ...] = ("content", "abstract")
+
+    # Per-backend byte limit for text fields.  ``None`` means no truncation.
+    # Subclasses backed by VikingDB should set this to ``VIKINGDB_TEXT_FIELD_BYTE_LIMIT``.
+    _TEXT_FIELD_BYTE_LIMIT: int | None = None
+
+    # Whether this backend actually stores the ``content`` (full text) field.
+    # Only VikingDB-backed adapters use ``content`` (for server-side full-text grep).
+    # All other backends leave this ``False`` so that ``content`` is silently dropped
+    # on write -- a new backend that does not need ``content`` requires no extra code.
+    # See ``viking_fs._resolve_grep_engine`` which must stay consistent with this flag.
+    USE_CONTENT_FIELD: bool = False
 
     def __init__(self, collection_name: str, index_name: str = DEFAULT_INDEX_NAME):
         self._collection_name = collection_name
@@ -170,6 +217,16 @@ class CollectionAdapter(ABC):
             self._collection.close()
             self._collection = None
 
+    def begin_bulk_ingest(self) -> None:
+        """Begin a derived-index maintenance suppression scope.
+
+        Remote adapters and backends without derived indexes intentionally use
+        this default no-op implementation.
+        """
+
+    def end_bulk_ingest(self) -> None:
+        """End a matching bulk-ingest maintenance scope."""
+
     def get_collection_info(self) -> Optional[Dict[str, Any]]:
         if not self.collection_exists():
             return None
@@ -218,6 +275,11 @@ class CollectionAdapter(ABC):
         for key in self._URI_FIELD_NAMES:
             if key in normalized:
                 normalized[key] = self._encode_uri_field_value(normalized[key])
+        if self._TEXT_FIELD_BYTE_LIMIT is not None:
+            for field in self._TRUNCATABLE_TEXT_FIELDS:
+                value = normalized.get(field)
+                if isinstance(value, str):
+                    normalized[field] = _truncate_text_field(value, self._TEXT_FIELD_BYTE_LIMIT)
         return normalized
 
     @staticmethod
@@ -348,39 +410,6 @@ class CollectionAdapter(ABC):
         raise TypeError(f"Unsupported filter expr type: {type(expr)!r}")
 
     # Backward-compatible aliases: keep old non-underscore names callable.
-    def sanitize_scalar_index_fields(
-        self,
-        scalar_index_fields: list[str],
-        fields_meta: list[dict[str, Any]],
-    ) -> list[str]:
-        return self._sanitize_scalar_index_fields(
-            scalar_index_fields=scalar_index_fields,
-            fields_meta=fields_meta,
-        )
-
-    def build_default_index_meta(
-        self,
-        *,
-        index_name: str,
-        distance: str,
-        use_sparse: bool,
-        sparse_weight: float,
-        scalar_index_fields: list[str],
-    ) -> Dict[str, Any]:
-        return self._build_default_index_meta(
-            index_name=index_name,
-            distance=distance,
-            use_sparse=use_sparse,
-            sparse_weight=sparse_weight,
-            scalar_index_fields=scalar_index_fields,
-        )
-
-    def normalize_record_for_read(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        return self._normalize_record_for_read(record)
-
-    def compile_filter(self, expr: FilterExpr | Dict[str, Any] | None) -> Dict[str, Any]:
-        return self._compile_filter(expr)
-
     def upsert(self, data: Dict[str, Any] | list[Dict[str, Any]]) -> list[str]:
         coll = self.get_collection()
         records = [data] if isinstance(data, dict) else data
@@ -469,8 +498,13 @@ class CollectionAdapter(ABC):
                 output_fields=output_fields,
             )
         else:
-            result = coll.search_by_random(
+            # Approximate random sampling with a client-generated random
+            # vector so every backend behaves consistently.
+            dim = get_openviking_config().embedding.dimension
+            random_vector = [random.uniform(-1, 1) for _ in range(dim)]
+            result = coll.search_by_vector(
                 index_name=self._index_name,
+                dense_vector=random_vector,
                 limit=limit,
                 offset=offset,
                 filters=vectordb_filter,
@@ -481,10 +515,7 @@ class CollectionAdapter(ABC):
         for item in result.data:
             record = dict(item.fields) if item.fields else {}
             record["id"] = item.id
-            raw_score = item.score if item.score is not None else 0.0
-            if not math.isfinite(raw_score):
-                raw_score = 0.0
-            record["_score"] = raw_score
+            record["_score"] = _normalize_result_score(item.score)
             record = self._normalize_record_for_read(record)
             records.append(record)
         return records
@@ -499,7 +530,11 @@ class CollectionAdapter(ABC):
         coll = self.get_collection()
         delete_ids = list(ids or [])
         if not delete_ids and filter is not None:
-            matched = self.query(filter=filter, limit=limit)
+            matched = self.query(
+                filter=filter,
+                limit=limit,
+                output_fields=["id"],
+            )
             delete_ids = [record["id"] for record in matched if record.get("id")]
 
         if not delete_ids:
@@ -549,6 +584,47 @@ class CollectionAdapter(ABC):
             return parsed_total
 
         return 0
+
+    def search_by_keywords(
+        self,
+        keywords: Optional[list[str]] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
+        filter: Optional[Dict[str, Any] | FilterExpr] = None,
+        output_fields: Optional[list[str]] = None,
+    ) -> list[Dict[str, Any]]:
+        coll = self.get_collection()
+        compiled_filter = self._compile_filter(filter)
+        logger.debug(
+            "search_by_keywords: keywords=%s query=%s limit=%s offset=%s filter=%s output_fields=%s",
+            keywords,
+            query,
+            limit,
+            offset,
+            json.dumps(compiled_filter, ensure_ascii=False),
+            output_fields,
+        )
+        result = coll.search_by_keywords(
+            index_name=self._index_name,
+            keywords=keywords,
+            query=query,
+            limit=limit,
+            offset=offset,
+            filters=compiled_filter,
+            output_fields=output_fields,
+        )
+        records: list[Dict[str, Any]] = []
+        for item in result.data:
+            record = dict(item.fields) if item.fields else {}
+            record["id"] = item.id
+            raw_score = item.score if item.score is not None else 0.0
+            if not math.isfinite(raw_score):
+                raw_score = 0.0
+            record["_score"] = raw_score
+            record = self._normalize_record_for_read(record)
+            records.append(record)
+        return records
 
     def clear(self) -> bool:
         self.get_collection().delete_all_data()

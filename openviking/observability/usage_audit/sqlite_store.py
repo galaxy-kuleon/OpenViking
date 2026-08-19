@@ -103,6 +103,34 @@ class SQLiteUsageAuditStore:
             self._conn.close()
             self._conn = None
 
+    async def delete_user_data(self, *, account_id: str, user_id: str) -> dict[str, int]:
+        """Delete all usage/audit rows for an account/user pair."""
+        async with self._lock:
+            return await asyncio.to_thread(self._delete_user_data_sync, account_id, user_id)
+
+    def _delete_user_data_sync(self, account_id: str, user_id: str) -> dict[str, int]:
+        assert self._conn is not None
+        tables = (
+            "usage_token_hourly",
+            "usage_retrieval_hourly",
+            "usage_context_write_bucket",
+            "request_audit",
+        )
+        self._conn.execute("BEGIN")
+        try:
+            deleted = {
+                table: self._conn.execute(
+                    f"DELETE FROM {table} WHERE account_id = ? AND user_id = ?",
+                    (account_id, user_id),
+                ).rowcount
+                for table in tables
+            }
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return deleted
+
     async def record_batch(self, events: Sequence[ObservabilityEvent]) -> None:
         if not events:
             return
@@ -307,16 +335,27 @@ class SQLiteUsageAuditStore:
     # ------------------------------------------------------------------
 
     async def get_today_tokens(
-        self, *, account_id: str, user_date: str, tz: tzinfo
+        self,
+        *,
+        account_id: str,
+        user_date: str,
+        tz: tzinfo,
+        user_id: str | None = None,
     ) -> dict[str, int]:
         async with self._lock:
-            return await asyncio.to_thread(self._get_today_tokens_sync, account_id, user_date, tz)
+            return await asyncio.to_thread(
+                self._get_today_tokens_sync, account_id, user_date, tz, user_id
+            )
 
-    def _get_today_tokens_sync(self, account_id: str, user_date: str, tz: tzinfo) -> dict[str, int]:
+    def _get_today_tokens_sync(
+        self, account_id: str, user_date: str, tz: tzinfo, user_id: str | None
+    ) -> dict[str, int]:
         assert self._conn is not None
         day = date.fromisoformat(user_date)
         utc_start, utc_end = _user_day_window_utc(day, tz)
-        rows = self._fetch_hourly_token_rows(account_id, utc_start, utc_end)
+        rows = self._fetch_hourly_token_rows(
+            account_id, utc_start, utc_end, user_id=user_id
+        )
         result = {"vlm_input": 0, "vlm_output": 0, "embedding_input": 0}
         for source, token_type, _, _, total in rows:
             key = f"{source}_{token_type}"
@@ -326,21 +365,28 @@ class SQLiteUsageAuditStore:
         return result
 
     async def get_today_retrievals(
-        self, *, account_id: str, user_date: str, tz: tzinfo
+        self,
+        *,
+        account_id: str,
+        user_date: str,
+        tz: tzinfo,
+        user_id: str | None = None,
     ) -> dict[str, int]:
         async with self._lock:
             return await asyncio.to_thread(
-                self._get_today_retrievals_sync, account_id, user_date, tz
+                self._get_today_retrievals_sync, account_id, user_date, tz, user_id
             )
 
     def _get_today_retrievals_sync(
-        self, account_id: str, user_date: str, tz: tzinfo
+        self, account_id: str, user_date: str, tz: tzinfo, user_id: str | None
     ) -> dict[str, int]:
         assert self._conn is not None
         day = date.fromisoformat(user_date)
         utc_start, utc_end = _user_day_window_utc(day, tz)
         result = {"find": 0, "search": 0}
-        for operation, total in self._fetch_hourly_retrieval_rows(account_id, utc_start, utc_end):
+        for operation, total in self._fetch_hourly_retrieval_rows(
+            account_id, utc_start, utc_end, user_id=user_id
+        ):
             if operation in result:
                 result[operation] += total
         result["total"] = sum(result.values())
@@ -354,6 +400,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self._lock:
             return await asyncio.to_thread(
@@ -363,6 +410,7 @@ class SQLiteUsageAuditStore:
                 end_user_date,
                 bucket,
                 tz,
+                user_id,
             )
 
     def _get_token_series_sync(
@@ -372,6 +420,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None,
     ) -> list[dict[str, Any]]:
         assert self._conn is not None
         start_day = date.fromisoformat(start_user_date)
@@ -383,7 +432,7 @@ class SQLiteUsageAuditStore:
             for d in _date_range(start_user_date, end_user_date)
         }
         for source, token_type, date_utc, hour_utc, total in self._fetch_hourly_token_rows(
-            account_id, utc_start, utc_end
+            account_id, utc_start, utc_end, user_id=user_id
         ):
             local_date = (
                 datetime(
@@ -414,6 +463,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self._lock:
             return await asyncio.to_thread(
@@ -423,6 +473,7 @@ class SQLiteUsageAuditStore:
                 end_user_date,
                 bucket,
                 tz,
+                user_id,
             )
 
     def _get_context_commit_heatmap_sync(
@@ -432,6 +483,7 @@ class SQLiteUsageAuditStore:
         end_user_date: str,
         bucket: str,
         tz: tzinfo,
+        user_id: str | None,
     ) -> list[dict[str, Any]]:
         assert self._conn is not None
         bucket_size = 4 if bucket == "4h" else 1
@@ -443,11 +495,13 @@ class SQLiteUsageAuditStore:
         for event_date in _date_range(start_user_date, end_user_date):
             for hour in range(0, 24, bucket_size):
                 rows[(event_date, hour)] = self._empty_context_row(event_date, hour)
+        user_filter, user_params = self._user_scope_sql(user_id)
         cur = self._conn.execute(
             """
             SELECT date_utc, hour_utc, operation, SUM(count) AS total
             FROM usage_context_write_bucket
             WHERE account_id = ?
+              {user_filter}
               AND (
                 date_utc > ? OR (date_utc = ? AND hour_utc >= ?)
               )
@@ -455,9 +509,10 @@ class SQLiteUsageAuditStore:
                 date_utc < ? OR (date_utc = ? AND hour_utc < ?)
               )
             GROUP BY date_utc, hour_utc, operation
-            """,
+            """.format(user_filter=user_filter),
             (
                 account_id,
+                *user_params,
                 utc_start.date().isoformat(),
                 utc_start.date().isoformat(),
                 utc_start.hour,
@@ -488,23 +543,31 @@ class SQLiteUsageAuditStore:
         return [rows[key] for key in sorted(rows) if key[0] in in_range]
 
     def _fetch_hourly_token_rows(
-        self, account_id: str, utc_start: datetime, utc_end: datetime
+        self,
+        account_id: str,
+        utc_start: datetime,
+        utc_end: datetime,
+        *,
+        user_id: str | None = None,
     ) -> list[tuple[str, str, str, int, int]]:
         """Return rows [(source, token_type, date_utc, hour_utc, total)]."""
         assert self._conn is not None
         utc_start_d = utc_start.date().isoformat()
         utc_end_d = utc_end.date().isoformat()
+        user_filter, user_params = self._user_scope_sql(user_id)
         cur = self._conn.execute(
             """
             SELECT source, token_type, date_utc, hour_utc, SUM(token_count) AS total
             FROM usage_token_hourly
             WHERE account_id = ?
+              {user_filter}
               AND (date_utc > ? OR (date_utc = ? AND hour_utc >= ?))
               AND (date_utc < ? OR (date_utc = ? AND hour_utc < ?))
             GROUP BY source, token_type, date_utc, hour_utc
-            """,
+            """.format(user_filter=user_filter),
             (
                 account_id,
+                *user_params,
                 utc_start_d,
                 utc_start_d,
                 utc_start.hour,
@@ -525,24 +588,32 @@ class SQLiteUsageAuditStore:
         ]
 
     def _fetch_hourly_retrieval_rows(
-        self, account_id: str, utc_start: datetime, utc_end: datetime
+        self,
+        account_id: str,
+        utc_start: datetime,
+        utc_end: datetime,
+        *,
+        user_id: str | None = None,
     ) -> list[tuple[str, int]]:
         """Return [(operation, total_request_count)] for successful retrievals."""
         assert self._conn is not None
         utc_start_d = utc_start.date().isoformat()
         utc_end_d = utc_end.date().isoformat()
+        user_filter, user_params = self._user_scope_sql(user_id)
         cur = self._conn.execute(
             """
             SELECT operation, SUM(request_count) AS total
             FROM usage_retrieval_hourly
             WHERE account_id = ?
+              {user_filter}
               AND status = 'success'
               AND (date_utc > ? OR (date_utc = ? AND hour_utc >= ?))
               AND (date_utc < ? OR (date_utc = ? AND hour_utc < ?))
             GROUP BY operation
-            """,
+            """.format(user_filter=user_filter),
             (
                 account_id,
+                *user_params,
                 utc_start_d,
                 utc_start_d,
                 utc_start.hour,
@@ -552,6 +623,12 @@ class SQLiteUsageAuditStore:
             ),
         )
         return [(str(row["operation"]), int(row["total"] or 0)) for row in cur.fetchall()]
+
+    @staticmethod
+    def _user_scope_sql(user_id: str | None) -> tuple[str, tuple[str, ...]]:
+        if not user_id:
+            return "", ()
+        return "AND user_id = ?", (user_id,)
 
     @staticmethod
     def _empty_context_row(event_date: str, hour: int) -> dict[str, Any]:
@@ -569,6 +646,7 @@ class SQLiteUsageAuditStore:
         self,
         *,
         account_id: str,
+        user_id: str | None = None,
         request_id: str | None = None,
         statuses: list[str] | None = None,
         api_types: list[str] | None = None,
@@ -579,6 +657,7 @@ class SQLiteUsageAuditStore:
             return await asyncio.to_thread(
                 self._query_audit_logs_sync,
                 account_id,
+                user_id,
                 request_id,
                 statuses or [],
                 api_types or [],
@@ -589,6 +668,7 @@ class SQLiteUsageAuditStore:
     def _query_audit_logs_sync(
         self,
         account_id: str,
+        user_id: str | None,
         request_id: str | None,
         statuses: list[str],
         api_types: list[str],
@@ -598,6 +678,9 @@ class SQLiteUsageAuditStore:
         assert self._conn is not None
         where = ["account_id = ?"]
         params: list[Any] = [account_id]
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
         if request_id:
             where.append("request_id = ?")
             params.append(request_id)

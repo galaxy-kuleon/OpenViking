@@ -20,7 +20,7 @@ class EmbeddingMsgConverter:
     """Converter for Context objects to EmbeddingMsg."""
 
     @staticmethod
-    def from_context(context: Context) -> EmbeddingMsg:
+    def from_context(context: Context) -> EmbeddingMsg | None:
         """
         Convert a Context object to EmbeddingMsg.
         """
@@ -50,7 +50,7 @@ class EmbeddingMsgConverter:
 
         # Derive level field for hierarchical retrieval.
         uri = context_data.get("uri", "")
-        context_level = getattr(context, "level", None)
+        context_level = context.level
         if context_level is not None:
             resolved_level = context_level
         elif context_data.get("level") is not None:

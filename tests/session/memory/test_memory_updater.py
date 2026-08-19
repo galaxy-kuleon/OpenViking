@@ -4,16 +4,18 @@
 Tests for MemoryUpdater.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openviking.message import Message
 from openviking.message.part import TextPart
+from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.dataclass import (
     MemoryField,
     MemoryFile,
+    MemoryOperationSource,
     MemoryTypeSchema,
     ResolvedOperation,
     ResolvedOperations,
@@ -42,40 +44,6 @@ from openviking_cli.session.user_id import UserIdentifier
 class TestMemoryUpdateResult:
     """Tests for MemoryUpdateResult."""
 
-    def test_create_empty(self):
-        """Test creating an empty result."""
-        result = MemoryUpdateResult()
-
-        assert len(result.written_uris) == 0
-        assert len(result.edited_uris) == 0
-        assert len(result.deleted_uris) == 0
-        assert len(result.errors) == 0
-        assert result.has_changes() is False
-
-    def test_add_written(self):
-        """Test adding written URI."""
-        result = MemoryUpdateResult()
-        result.add_written("viking://user/test/memories/profile.md")
-
-        assert len(result.written_uris) == 1
-        assert result.has_changes() is True
-
-    def test_add_edited(self):
-        """Test adding edited URI."""
-        result = MemoryUpdateResult()
-        result.add_edited("viking://user/test/memories/profile.md")
-
-        assert len(result.edited_uris) == 1
-        assert result.has_changes() is True
-
-    def test_add_deleted(self):
-        """Test adding deleted URI."""
-        result = MemoryUpdateResult()
-        result.add_deleted("viking://user/test/memories/to_delete.md")
-
-        assert len(result.deleted_uris) == 1
-        assert result.has_changes() is True
-
     def test_summary(self):
         """Test summary generation."""
         result = MemoryUpdateResult()
@@ -101,6 +69,18 @@ class TestMemoryUpdater:
         assert extract_context.page_id_map is not None
         page_id = extract_context.page_id_map.get_page_id("viking://user/a/memories/profile.md")
         assert page_id == 1
+
+    def test_extract_context_can_disable_long_text_message_split(self):
+        text = "第一句很长很长很长很长很长很长很长很长很长很长很长。" * 8
+        messages = [Message(id="1", role="user", parts=[TextPart(text=text)])]
+
+        split_context = ExtractContext(messages)
+        unsplit_context = ExtractContext(messages, split_long_text_messages=False)
+
+        assert len(split_context.messages) > 1
+        assert len(unsplit_context.messages) == 1
+        assert unsplit_context.messages[0] is messages[0]
+        assert unsplit_context.chunk_meta == {}
 
     def test_extract_context_resource_event_content_hides_add_resource_fields(self):
         resource_uri = "viking://resources/images/2026/06/12/yueqian_jpeg"
@@ -139,6 +119,28 @@ class TestMemoryUpdater:
         assert "Resource abstract" not in content
         assert "User reason" not in content
 
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.load_from_yaml(
+            str(PromptManager._get_bundled_templates_dir() / "memory" / "events.yaml")
+        )
+        rendered = MemoryFileUtils.write(
+            MemoryFile(
+                extra_fields={
+                    "event_name": "resource_saved",
+                    "goal": "save resource",
+                    "summary": (
+                        "2026-06-12，用户保存了粉丝创作的越前龙马动漫插画资源，"
+                        f"资源URI为{resource_uri}。"
+                    ),
+                    "ranges": "0",
+                }
+            ),
+            content_template=registry.get("events").content_template,
+            extract_context=extract_context,
+        )
+
+        assert rendered.startswith(content)
+
     def test_extract_context_event_content_falls_back_to_range_when_summary_empty(self):
         extract_context = ExtractContext(
             messages=[
@@ -170,15 +172,6 @@ class TestMemoryUpdater:
 
         assert updater._registry == registry
 
-    def test_set_registry(self):
-        """Test setting registry after creation."""
-        updater = MemoryUpdater()
-        registry = MemoryTypeRegistry()
-
-        updater.set_registry(registry)
-
-        assert updater._registry == registry
-
     @pytest.mark.asyncio
     async def test_generate_overview_deletes_empty_overview_via_rm(self):
         schema = MemoryTypeSchema(
@@ -199,7 +192,7 @@ class TestMemoryUpdater:
             async def ls(self, uri, show_all_hidden=False, ctx=None):
                 return [{"name": ".overview.md", "isDir": False}]
 
-            async def rm(self, uri, recursive=False, ctx=None, lock_handle=None):
+            async def rm(self, uri, recursive=False, ctx=None, **kwargs):
                 self.rm_calls.append((uri, recursive))
 
         viking_fs = FakeVikingFS()
@@ -214,7 +207,10 @@ class TestMemoryUpdater:
         )
 
         assert viking_fs.rm_calls == [
-            ("viking://user/alice/memories/entities/动漫角色/.overview.md", False),
+            (
+                "viking://user/alice/memories/entities/动漫角色/.overview.md",
+                False,
+            ),
             ("viking://user/alice/memories/entities/动漫角色", True),
         ]
 
@@ -238,7 +234,7 @@ class TestMemoryUpdater:
             async def ls(self, uri, show_all_hidden=False, ctx=None):
                 raise NotFoundError(uri, "directory")
 
-            async def rm(self, uri, recursive=False, ctx=None, lock_handle=None):
+            async def rm(self, uri, recursive=False, ctx=None):
                 self.rm_calls.append((uri, recursive))
 
         viking_fs = FakeVikingFS()
@@ -310,7 +306,7 @@ class TestMemoryUpdater:
             async def read_file(self, uri, ctx=None):
                 return self.store[uri]
 
-            async def write_file(self, uri, content, ctx=None):
+            async def write_file(self, uri, content, ctx=None, **kwargs):
                 self.store[uri] = content
 
         viking_fs = FakeVikingFS()
@@ -355,7 +351,7 @@ class TestMemoryUpdater:
             async def read_file(self, uri, ctx=None):
                 return self.store[uri]
 
-            async def write_file(self, uri, content, ctx=None):
+            async def write_file(self, uri, content, ctx=None, **kwargs):
                 self.store[uri] = content
 
         viking_fs = FakeVikingFS()
@@ -422,35 +418,109 @@ class TestMemoryUpdater:
         isolation_handler.calculate_memory_uris.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_apply_operations_requires_pre_resolved_uris(self):
+    async def test_apply_operations_isolates_unresolved_uris(self):
         registry = MagicMock()
         registry.get.return_value = MemoryTypeSchema(
-            memory_type="entities",
-            description="entity memory",
-            directory="viking://user/{{ user_space }}/memories/entities",
-            filename_template="{{ name }}.md",
+            memory_type="events",
+            description="event memory",
+            directory="viking://user/{{ user_space }}/memories/events",
+            filename_template="{{ event_name }}.md",
             fields=[],
         )
 
         updater = MemoryUpdater(registry=registry)
         updater._get_viking_fs = MagicMock(return_value=MagicMock())
+        updater._apply_upsert = AsyncMock(return_value=None)
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
 
+        resolved_uri = "viking://user/alice/memories/events/resolved.md"
         operations = ResolvedOperations(
             upsert_operations=[
                 ResolvedOperation(
-                    memory_fields={"name": "SharedFact", "content": "shared content"},
-                    memory_type="entities",
+                    memory_fields={"event_name": "resolved", "summary": "resolved event"},
+                    memory_type="events",
+                    uris=[resolved_uri],
+                    page_id=101,
+                ),
+                ResolvedOperation(
+                    memory_fields={"event_name": "unresolved", "summary": "unresolved event"},
+                    memory_type="events",
                     uris=[],
-                    page_id=100,
-                )
+                    page_id=102,
+                ),
             ],
             delete_file_contents=[],
             errors=[],
         )
         ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
 
-        with pytest.raises(ValueError, match="missing resolved URIs"):
-            await updater.apply_operations(operations=operations, ctx=ctx)
+        with patch("openviking.session.memory.memory_updater.tracer.error") as tracer_error:
+            result = await updater.apply_operations(operations=operations, ctx=ctx)
+
+        assert result.written_uris == [resolved_uri]
+        assert len(result.errors) == 1
+        error_target, error = result.errors[0]
+        assert error_target == "events(page_id=102)"
+        assert str(error) == "Missing resolved URI"
+        tracer_error.assert_called_once_with(
+            "Skipping unresolved memory operation: events(page_id=102): Missing resolved URI"
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_skips_deletes_when_replacement_uri_is_unresolved(self):
+        registry = MagicMock()
+        registry.get.return_value = MemoryTypeSchema(
+            memory_type="events",
+            description="event memory",
+            directory="viking://user/{{ user_space }}/memories/events",
+            filename_template="{{ event_name }}.md",
+            fields=[],
+        )
+
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=MagicMock())
+        updater._apply_upsert = AsyncMock(return_value=None)
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+
+        resolved_uri = "viking://user/alice/memories/events/resolved.md"
+        old_uri = "viking://user/alice/memories/events/old.md"
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    memory_fields={"event_name": "resolved", "summary": "resolved event"},
+                    memory_type="events",
+                    uris=[resolved_uri],
+                    page_id=101,
+                ),
+                ResolvedOperation(
+                    memory_fields={
+                        "event_name": "replacement",
+                        "summary": "replacement event",
+                    },
+                    memory_type="events",
+                    uris=[],
+                    page_id=102,
+                ),
+            ],
+            delete_file_contents=[MemoryFile(uri=old_uri, extra_fields={"memory_type": "events"})],
+            errors=[],
+        )
+        ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+        result = await updater.apply_operations(operations=operations, ctx=ctx)
+
+        assert result.written_uris == [resolved_uri]
+        assert result.deleted_uris == []
+        assert [(target, str(error)) for target, error in result.errors] == [
+            ("events(page_id=102)", "Missing resolved URI"),
+            (old_uri, "Skipped delete because batch contains unresolved upsert URIs"),
+        ]
+        updater._apply_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_apply_operations_matches_overview_directory_from_resolved_user_uri(self):
@@ -501,6 +571,7 @@ class TestMemoryUpdater:
             expected_directory,
             ctx,
             None,
+            lease_ref=None,
         )
 
     @pytest.mark.asyncio
@@ -554,10 +625,10 @@ class TestMemoryUpdater:
             ],
         )
 
-        async def mock_apply_upsert(resolved_op, ctx, extract_context=None):
+        async def mock_apply_upsert(resolved_op, ctx, extract_context=None, **kwargs):
             return None
 
-        async def mock_apply_delete(uri, ctx):
+        async def mock_apply_delete(uri, ctx, **kwargs):
             assert uri == deleted_uri
 
         updater._apply_upsert = AsyncMock(side_effect=mock_apply_upsert)
@@ -572,6 +643,167 @@ class TestMemoryUpdater:
         assert deleted_uri not in [
             call.args[0] for call in mock_viking_fs.read_file.await_args_list
         ]
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_skips_case_only_delete_conflicting_with_upsert(self):
+        written_uri = "viking://user/conv-26/memories/entities/person/melanie.md"
+        deleted_uri = "viking://user/conv-26/memories/entities/person/Melanie.md"
+
+        schema = MemoryTypeSchema(
+            memory_type="entities",
+            description="entity memory",
+            directory="viking://user/{{ user_space }}/memories/entities",
+            filename_template="{{ category }}/{{ name }}.md",
+            fields=[],
+            overview_template="overview",
+        )
+        registry = MagicMock()
+        registry.get.return_value = schema
+
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=MagicMock())
+        updater._apply_upsert = AsyncMock(return_value=None)
+        updater._apply_delete = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+
+        resolved = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    memory_fields={"category": "person", "name": "melanie"},
+                    memory_type="entities",
+                    uris=[written_uri],
+                )
+            ],
+            delete_file_contents=[
+                MemoryFile(uri=deleted_uri, extra_fields={"memory_type": "entities"})
+            ],
+            errors=[],
+        )
+        ctx = RequestContext(user=UserIdentifier("acme", "conv-26"), role=Role.USER)
+
+        result = await updater.apply_operations(operations=resolved, ctx=ctx)
+
+        assert result.written_uris == [written_uri]
+        assert result.deleted_uris == []
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_remaps_deleted_links_to_replacement(self):
+        deleted_uri = "viking://user/u/memories/preferences/Evan/hobby_preferences.md"
+        intermediate_uri = "viking://user/u/memories/preferences/Evan/hobbies.md"
+        replacement_uri = "viking://user/u/memories/preferences/Evan/interests.md"
+        profile_uri = "viking://user/u/memories/profile.md"
+
+        schema = MemoryTypeSchema(
+            memory_type="preferences",
+            description="preference memory",
+            directory="viking://user/{{ user_space }}/memories/preferences",
+            filename_template="{{ name }}.md",
+            fields=[],
+            overview_template="overview",
+        )
+        registry = MagicMock()
+        registry.get.return_value = schema
+
+        deleted_file = MemoryFile(
+            uri=deleted_uri,
+            content="old hobby preferences",
+            memory_type="preferences",
+            links=[
+                {
+                    "from_uri": deleted_uri,
+                    "to_uri": profile_uri,
+                    "link_type": "related_to",
+                    "weight": 0.8,
+                    "match_text": "hobby",
+                    "description": "old link",
+                }
+            ],
+        )
+        intermediate_file = MemoryFile(
+            uri=intermediate_uri,
+            content="new hobbies",
+            memory_type="preferences",
+        )
+        replacement_file = MemoryFile(
+            uri=replacement_uri,
+            content="new interests",
+            memory_type="preferences",
+        )
+        profile_file = MemoryFile(
+            uri=profile_uri,
+            content="profile",
+            memory_type="profile",
+            backlinks=[
+                {
+                    "from_uri": deleted_uri,
+                    "to_uri": profile_uri,
+                    "link_type": "related_to",
+                    "weight": 0.8,
+                    "match_text": "hobby",
+                    "description": "old link",
+                }
+            ],
+        )
+        files = {
+            deleted_uri: MemoryFileUtils.write(deleted_file),
+            intermediate_uri: MemoryFileUtils.write(intermediate_file),
+            replacement_uri: MemoryFileUtils.write(replacement_file),
+            profile_uri: MemoryFileUtils.write(profile_file),
+        }
+
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(side_effect=lambda uri, ctx=None: files[uri])
+
+        async def write_file(uri, content, ctx=None, **kwargs):
+            files[uri] = content
+
+        mock_viking_fs.write_file = AsyncMock(side_effect=write_file)
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        updater._apply_upsert = AsyncMock(return_value=None)
+        updater._apply_delete = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+
+        resolved = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    memory_fields={"name": "hobbies"},
+                    memory_type="preferences",
+                    uris=[replacement_uri],
+                )
+            ],
+            delete_file_contents=[deleted_file, intermediate_file],
+            errors=[],
+            resolved_links=[
+                StoredLink(
+                    from_uri=deleted_uri,
+                    to_uri=profile_uri,
+                    link_type="related_to",
+                    weight=0.9,
+                    match_text="hobby",
+                    description="in-flight link",
+                )
+            ],
+            delete_replacements={
+                deleted_uri: intermediate_uri,
+                intermediate_uri: replacement_uri,
+            },
+        )
+
+        ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+        result = await updater.apply_operations(operations=resolved, ctx=ctx)
+
+        assert result.written_uris == [replacement_uri]
+        assert result.deleted_uris == [deleted_uri, intermediate_uri]
+        assert resolved.resolved_links[0].from_uri == replacement_uri
+        profile = MemoryFileUtils.read(files[profile_uri], uri=profile_uri)
+        assert {(link["from_uri"], link["to_uri"]) for link in profile.backlinks} == {
+            (replacement_uri, profile_uri)
+        }
 
     @pytest.mark.asyncio
     async def test_apply_operations_routes_backlinks_to_matching_uri_only(self):
@@ -868,6 +1100,33 @@ class TestApplyEditWithSearchReplacePatch:
         return MemoryUpdater(registry=registry)
 
     @pytest.mark.asyncio
+    async def test_apply_upsert_persists_last_update_trace_id(self):
+        updater = self._make_updater_with_registry()
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(side_effect=FileNotFoundError("missing"))
+        written_content = None
+
+        async def mock_write_file(uri, content, **kwargs):
+            nonlocal written_content
+            written_content = content
+
+        mock_viking_fs.write_file = mock_write_file
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+
+        op = ResolvedOperation(
+            memory_fields={"content": "Line 1"},
+            memory_type="test",
+            uris=["viking://test/test.md"],
+            source=MemoryOperationSource(extraction_id="extract_1", trace_id="trace_1"),
+        )
+        await updater._apply_upsert(op, MagicMock())
+
+        assert written_content is not None
+        result = MemoryFileUtils.read(written_content)
+        assert result.extra_fields["source_extraction_id"] == "extract_1"
+        assert result.extra_fields["last_update_trace_id"] == "trace_1"
+
+    @pytest.mark.asyncio
     async def test_apply_edit_with_str_patch_instance(self):
         """Test _apply_edit with StrPatch instance."""
         updater = self._make_updater_with_registry()
@@ -1086,6 +1345,58 @@ class TestConsecutivePatchesSameURI:
         final_content = store[uri]
         parsed = parse_memory_file_with_fields(final_content)
         assert parsed["content"] == "Step B"
+        assert parsed["version"] == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_upsert_strips_user_id_and_sets_version(self):
+        memory_type = "notes"
+        uri = "viking://user/alice/memories/notes.md"
+        schema = MemoryTypeSchema(
+            memory_type=memory_type,
+            description="notes",
+            fields=[
+                MemoryField(
+                    name="content",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.PATCH,
+                ),
+            ],
+        )
+        registry = MemoryTypeRegistry()
+        registry.register(schema)
+
+        store: dict[str, str] = {}
+        mock_viking_fs = MagicMock()
+
+        async def mock_read_file(uri, **kwargs):
+            return store.get(uri)
+
+        async def mock_write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        mock_viking_fs.read_file = mock_read_file
+        mock_viking_fs.write_file = mock_write_file
+
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+
+        op = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={
+                "content": "Step A",
+                "user_id": "alice",
+                "user_ids": ["alice", "bob"],
+            },
+            memory_type=memory_type,
+            uris=[uri],
+        )
+        await updater._apply_upsert(op, MagicMock())
+
+        parsed = parse_memory_file_with_fields(store[uri])
+        assert parsed["content"] == "Step A"
+        assert parsed["version"] == 1
+        assert "user_id" not in parsed
+        assert "user_ids" not in parsed
 
     @pytest.mark.asyncio
     async def test_apply_upsert_skips_failed_field_and_keeps_other_fields(self, monkeypatch):
@@ -1119,9 +1430,9 @@ class TestConsecutivePatchesSameURI:
         updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
 
         patch_op = MagicMock()
-        patch_op.apply.side_effect = ValueError("patch failed")
+        patch_op.apply = AsyncMock(side_effect=ValueError("patch failed"))
         replace_op = MagicMock()
-        replace_op.apply.return_value = "Updated Title"
+        replace_op.apply = AsyncMock(return_value="Updated Title")
 
         def mock_from_field(field):
             if field.name == "content":

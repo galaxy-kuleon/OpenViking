@@ -36,6 +36,8 @@ type AddResourceOptions struct {
 	PreserveStructure   *bool
 	WatchInterval       float64
 	Args                map[string]any
+	Tags                []string
+	TagMode             string
 	Telemetry           any
 }
 
@@ -44,11 +46,33 @@ type AddSkillOptions struct {
 	Wait      bool
 	Timeout   *float64
 	Telemetry any
+	// TargetURI scopes the operation to a skills root such as
+	// "viking://agent/skills" (account-shared) or a per-user root. A nil
+	// value omits target_uri and lets the server use its default root.
+	TargetURI any
+}
+
+// AdminCreateAccountOptions controls AdminCreateAccountWithOptions.
+type AdminCreateAccountOptions struct {
+	UserConfig map[string]any
+	Seed       *string
+}
+
+// AdminRegisterUserOptions controls AdminRegisterUserWithOptions.
+type AdminRegisterUserOptions struct {
+	UserConfig map[string]any
+	Seed       *string
+}
+
+// AdminRegenerateKeyOptions controls AdminRegenerateKeyWithOptions.
+type AdminRegenerateKeyOptions struct {
+	Seed *string
 }
 
 // ListSkillsOptions controls ListSkills.
 type ListSkillsOptions struct {
 	NodeLimit int
+	TargetURI any
 }
 
 // FindSkillsOptions controls FindSkills.
@@ -57,6 +81,7 @@ type FindSkillsOptions struct {
 	ScoreThreshold *float64
 	Level          []int
 	Telemetry      any
+	TargetURI      any
 }
 
 // ValidateSkillOptions controls ValidateSkill.
@@ -64,6 +89,7 @@ type ValidateSkillOptions struct {
 	Strict       bool
 	SourcePath   string
 	SkillDirName string
+	TargetURI    any
 }
 
 // GetSkillOptions controls GetSkill.
@@ -72,6 +98,7 @@ type GetSkillOptions struct {
 	IncludeFiles   *bool
 	IncludeSource  bool
 	Level          *int
+	TargetURI      any
 }
 
 // UpdateSkillOptions controls UpdateSkill.
@@ -80,6 +107,12 @@ type UpdateSkillOptions struct {
 	Timeout        *float64
 	SourceMetadata map[string]any
 	Telemetry      any
+	TargetURI      any
+}
+
+// DeleteSkillOptions controls DeleteSkill.
+type DeleteSkillOptions struct {
+	TargetURI any
 }
 
 // WaitProcessedOptions controls WaitProcessed.
@@ -117,6 +150,8 @@ type ListOptions struct {
 	AbsLimit      int
 	ShowAllHidden bool
 	NodeLimit     int
+	SortBy        string
+	SortOrder     string
 }
 
 // TreeOptions controls Tree.
@@ -150,14 +185,20 @@ type SetTagsOptions struct {
 }
 
 // ReindexOptions controls Reindex.
+// Wait is used as-is when options are provided; set it explicitly to true
+// when adding optional fields such as Tags and synchronous behavior is desired.
 type ReindexOptions struct {
-	Mode string
-	Wait bool
+	Mode    string
+	Wait    bool
+	DryRun  bool
+	Tags    []string
+	TagMode string
 }
 
 // FindOptions controls Find.
 type FindOptions struct {
 	TargetURI      any
+	Image          string
 	Limit          int
 	NodeLimit      *int
 	ScoreThreshold *float64
@@ -168,18 +209,13 @@ type FindOptions struct {
 	Until          string
 	TimeField      string
 	Level          []int
-	// AgentID / AgentURI select the peer whose memories this call is
-	// scoped to (server FindRequest.agent_id / agent_uri). This is a
-	// per-call selector and is mutually exclusive with the client-global
-	// Config.ActorPeerID header: the server rejects a request that sets a
-	// different peer via both. Leave empty to use the client-global peer.
-	AgentID  string
-	AgentURI string
+	Tags           []string
 }
 
 // SearchOptions controls Search.
 type SearchOptions struct {
 	TargetURI      any
+	Image          string
 	SessionID      string
 	Limit          int
 	NodeLimit      *int
@@ -191,31 +227,42 @@ type SearchOptions struct {
 	Until          string
 	TimeField      string
 	Level          []int
-	// AgentID / AgentURI select the peer whose memories this call is
-	// scoped to (server SearchRequest.agent_id / agent_uri). Per-call
-	// selector, mutually exclusive with the client-global
-	// Config.ActorPeerID header. Leave empty to use the client-global peer.
-	AgentID  string
-	AgentURI string
+	Tags           []string
 }
 
 // GrepOptions controls Grep.
 type GrepOptions struct {
 	CaseInsensitive bool
 	NodeLimit       *int
+	LevelLimit      *int
 	ExcludeURI      string
+}
+
+// GlobOptions controls Glob.
+type GlobOptions struct {
+	NodeLimit *int
 }
 
 // CreateSessionOptions controls CreateSession.
 type CreateSessionOptions struct {
-	SessionID    string
-	MemoryPolicy map[string]any
-	Telemetry    any
+	SessionID              string
+	MemoryPolicy           map[string]any
+	AutoCommitPolicy       map[string]any
+	DisableAutoCommit      bool
+	MemoryExtractionConfig map[string]any
+	Telemetry              any
 }
 
 // GetSessionOptions controls GetSession.
 type GetSessionOptions struct {
 	AutoCreate bool
+}
+
+// UpdateSessionConfigOptions controls UpdateSessionConfig.
+type UpdateSessionConfigOptions struct {
+	MemoryExtractionConfig map[string]any
+	AutoCommitPolicy       *map[string]any
+	Telemetry              any
 }
 
 // AddMessageOptions controls AddMessage.
@@ -245,6 +292,7 @@ type BatchAddMessagesOptions struct {
 type CommitSessionOptions struct {
 	KeepRecentCount int
 	Telemetry       any
+	EventTags       []string
 }
 
 // ListTasksOptions controls ListTasks.

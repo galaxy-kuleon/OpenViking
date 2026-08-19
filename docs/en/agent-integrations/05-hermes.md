@@ -2,6 +2,17 @@
 
 [Hermes Agent](https://hermes-agent.nousresearch.com/) by Nous Research has a first-class OpenViking memory provider built in. No plugin to install — just point Hermes at your OpenViking server and it handles memory storage, recall, and extraction natively.
 
+## Keep the Python environments separate
+
+Hermes connects to OpenViking over HTTP, so OpenViking does not need to be
+installed in the Hermes Python environment. Run the OpenViking server in its
+own virtual environment or container. Do not use `--force-reinstall` to add or
+upgrade OpenViking in an existing Hermes environment: a Hermes release may pin
+dependency versions that differ from OpenViking's supported, security-patched
+versions. If you intentionally combine both applications in one environment,
+resolve them together and run `python -m pip check` before starting either
+service.
+
 ## Setup
 
 Run the Hermes memory setup wizard:
@@ -24,7 +35,7 @@ Configuration is saved to Hermes's `config.yaml` and `.env` files.
 hermes memory status
 ```
 
-Once configured, Hermes automatically uses OpenViking for long-term memory — `viking_remember`, `viking_recall`, and other memory tools become available to the agent.
+Once configured, Hermes uses the OpenViking memory provider to inject context, prefetch relevant memories, and sync and extract memories after sessions. Available tools include `viking_search`, `viking_read`, `viking_browse`, `viking_remember`, `viking_forget`, and `viking_add_resource`.
 
 ## See also
 

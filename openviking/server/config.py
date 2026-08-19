@@ -5,13 +5,14 @@
 import sys
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, ValidationError
-
-from openviking.server.identity import AuthMode
-from openviking_cli.utils import get_logger
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # Import auth plugin registry for config validation
+from openviking.server.auth.ldap_config import LDAPConfig
+from openviking.server.auth.oidc_config import OIDCConfig
 from openviking.server.auth.registry import get_registry
+from openviking.server.identity import AuthMode
+from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.config_loader import (
     load_json_config,
     resolve_config_path,
@@ -25,6 +26,89 @@ from openviking_cli.utils.config.consts import (
 )
 
 logger = get_logger(__name__)
+
+
+def _normalize_config_uri(value: Optional[str], field_name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    uri = value.strip().rstrip("/")
+    if not uri:
+        raise ValueError(f"{field_name} must not be empty")
+    return uri
+
+
+class AddTargetsConfig(BaseModel):
+    """Add targets for resource and skill writes."""
+
+    resource_uri: Optional[str] = None
+    skill_uri: Optional[str] = None
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("resource_uri")
+    @classmethod
+    def validate_resource_uri(cls, value: Optional[str]) -> Optional[str]:
+        uri = _normalize_config_uri(value, "resource_uri")
+        if uri is None:
+            return None
+        from openviking.core.namespace import classify_uri, uri_parts
+        from openviking.core.uri_validation import validate_viking_uri
+        from openviking_cli.utils.uri import VikingURI
+
+        validate_viking_uri(uri, field_name="resource_uri")
+        normalized = VikingURI.normalize(uri).rstrip("/")
+        parts = uri_parts(normalized)
+        classification = classify_uri(normalized)
+        if parts[:1] == ["resources"] or (
+            parts[:1] == ["user"]
+            and classification.context_type == "resource"
+            and classification.content_index is not None
+        ):
+            return normalized
+        raise ValueError("resource_uri must be a resource directory URI")
+
+    @field_validator("skill_uri")
+    @classmethod
+    def validate_skill_uri(cls, value: Optional[str]) -> Optional[str]:
+        uri = _normalize_config_uri(value, "skill_uri")
+        if uri is None:
+            return None
+        from openviking_cli.utils.uri import VikingURI
+
+        normalized = VikingURI.normalize(uri).rstrip("/")
+        if normalized in {"viking://user/skills", "viking://agent/skills"}:
+            return normalized
+        raise ValueError("skill_uri must be viking://user/skills or viking://agent/skills")
+
+
+class AgentEvolutionConfig(BaseModel):
+    """Default Agent Evolution setting for accounts without an override."""
+
+    enabled: bool = False
+
+    model_config = {"extra": "forbid"}
+
+
+class DeprecatedUserAgentEvolutionConfig(BaseModel):
+    """Parse-only compatibility for legacy per-user configuration files."""
+
+    enabled: Optional[bool] = None
+
+    model_config = {"extra": "forbid"}
+
+
+class UserConfig(BaseModel):
+    """User configuration values that can be defaulted or initialized."""
+
+    add_targets: AddTargetsConfig = Field(default_factory=AddTargetsConfig)
+    agent_evolution: DeprecatedUserAgentEvolutionConfig = Field(
+        default_factory=DeprecatedUserAgentEvolutionConfig,
+        exclude=True,
+    )
+
+    model_config = {"extra": "forbid"}
 
 
 class MetricsAccountDimensionConfig(BaseModel):
@@ -57,12 +141,15 @@ class OTelExporterConfig(BaseModel):
         model_config = {"extra": "forbid"}
 
     enabled: bool = False
-    protocol: str = "grpc"  # "grpc" or "http"
+    protocol: str = "grpc"  # "grpc", "http", or "local" for traces
     tls: TLSConfig = Field(default_factory=TLSConfig)
     endpoint: str = "localhost:4317"  # gRPC default: 4317; HTTP default: 4318
     service_name: str = "openviking-server"
     export_interval_ms: int = 10000
     headers: Dict[str, str] = Field(default_factory=dict)
+    local_path: str = "~/.openviking/logs/traces.jsonl"
+    local_rotation_mb: int = Field(default=40, gt=0)
+    local_backup_count: int = Field(default=2, ge=0)
 
     model_config = {"extra": "forbid"}
 
@@ -108,6 +195,26 @@ class UsageAuditConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class UsageReporterSinkConfig(BaseModel):
+    """Usage reporter sink configuration."""
+
+    type: Literal["custom", "file_log"] = "custom"
+    class_path: Optional[str] = None
+    config: Dict[str, object] = Field(default_factory=dict)
+
+    model_config = {"extra": "forbid"}
+
+
+class UsageReporterConfig(BaseModel):
+    """Usage event reporter configuration."""
+
+    enabled: bool = False
+    extractors: List[Literal["memory_usage"]] = Field(default_factory=lambda: ["memory_usage"])
+    sinks: List[UsageReporterSinkConfig] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
 class TraceDumpBodyConfig(BaseModel):
     """HTTP body dump configuration.
 
@@ -137,9 +244,9 @@ class ObservabilityConfig(BaseModel):
 class TempUploadConfig(BaseModel):
     """Temporary upload configuration."""
 
-    default_mode: str = "local"
+    default_mode: Literal["local", "shared"] = "local"
     shared_max_size_bytes: int = 512 * 1024 * 1024
-    shared_prefix: str = "viking://upload"
+    ttl_seconds: int = Field(12 * 60 * 60, ge=0)
 
     model_config = {"extra": "forbid"}
 
@@ -163,15 +270,33 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 1933
     workers: int = 1
+    # Seconds an idle HTTP keep-alive connection is kept open before the server
+    # closes it. Defaults to 5 to match uvicorn's built-in default and preserve
+    # the existing service behavior. Raise it above the idle-connection lifetime
+    # of any upstream client or load balancer that reuses connections (e.g. the
+    # serverless VKE forwarder keeps idle connections for up to 60s via
+    # WithMaxIdleConnDuration(1*time.Minute)); otherwise the server may close
+    # connections the client still believes are reusable, causing sporadic
+    # connection-reset / EOF errors.
+    timeout_keep_alive: int = 5
     auth_mode: Optional[str] = None  # If None, auto-detect based on root_api_key
     root_api_key: Optional[str] = None
+    # OIDC/LDAP authentication configuration
+    oidc: Optional[OIDCConfig] = None
+    ldap: Optional[LDAPConfig] = None
     profile_enabled: bool = False
     cors_origins: List[str] = Field(default_factory=lambda: ["*"])
     with_bot: bool = False  # Enable Bot API proxy to Vikingbot
     bot_api_url: str = "http://localhost:18790"  # Vikingbot OpenAPIChannel URL (default port)
     encryption_enabled: bool = False  # Whether file-level AES encryption is enabled
     api_key_hashing_enabled: bool = False  # Whether API key Argon2id hashing is enabled (default: false, rely on file encryption)
+    # When true, poll the shared key store and reload the in-memory index on change so
+    # read replicas pick up writer-side user add/rotate/remove. Default off (single writer).
+    api_key_watch_enabled: bool = False
+    # Poll interval; each check only stats registry files and reads fully on change.
+    api_key_watch_interval_seconds: float = 30.0
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    usage_reporter: UsageReporterConfig = Field(default_factory=UsageReporterConfig)
     # Public-facing base URL emitted in MCP-issued upload instructions. See
     # ``openviking.server.mcp_endpoint._resolve_public_base_url`` for the full
     # resolution chain: env var > this field > X-Forwarded-Host/Proto > Host header
@@ -180,6 +305,8 @@ class ServerConfig(BaseModel):
     public_base_url: Optional[str] = None
     upload_signed_ttl_seconds: int = 600
     temp_upload: TempUploadConfig = Field(default_factory=TempUploadConfig)
+    user_config_defaults: UserConfig = Field(default_factory=UserConfig)
+    agent_evolution: AgentEvolutionConfig = Field(default_factory=AgentEvolutionConfig)
     tool_output_externalization: ToolOutputExternalizationConfig = Field(
         default_factory=ToolOutputExternalizationConfig
     )
@@ -201,6 +328,30 @@ class ServerConfig(BaseModel):
         return AuthMode.DEV.value
 
 
+def map_bind_host_to_loopback(host: str) -> str:
+    """Map a server *bind* host to a client-connectable *loopback* host.
+
+    ``server.host`` configures the address the server binds/listens on. A
+    wildcard bind address such as ``0.0.0.0`` (or IPv6 ``::``) is valid to
+    listen on but is *not* a destination a client can connect to. Clients that
+    derive a connect URL from the configured host (the bot proxy, the bot's
+    own config loader, ``doctor``) must translate the wildcard to loopback:
+
+    - ``"0.0.0.0"``, ``""``, ``"*"``   -> ``"127.0.0.1"``
+    - ``"::"``, ``"::0"``, ``"[::]"``  -> ``"[::1]"``
+    - bare IPv6 literals (e.g. ``"::1"``) are bracketed for URL syntax
+    - everything else passes through unchanged
+    """
+    host = str(host or "").strip()
+    if host in ("0.0.0.0", "", "*"):
+        return "127.0.0.1"
+    if host in ("::", "::0", "[::]"):
+        return "[::1]"
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host
+
+
 def get_server_url_from_server_data(server_data: object) -> str:
     """Return the loopback URL clients use for the configured OpenViking server."""
     if isinstance(server_data, dict):
@@ -209,9 +360,7 @@ def get_server_url_from_server_data(server_data: object) -> str:
     else:
         host_value = getattr(server_data, "host", None)
         port_value = getattr(server_data, "port", None)
-    host = str(host_value or "127.0.0.1").strip()
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        host = f"[{host}]"
+    host = map_bind_host_to_loopback(str(host_value or "127.0.0.1"))
     port = str(port_value or "1933").strip()
     return f"http://{host}:{port}"
 
@@ -351,7 +500,8 @@ def validate_server_config(config: ServerConfig) -> None:
     # Ensure built-in plugins are registered before validation.
     # If a non-built-in plugin has already claimed a built-in mode name,
     # log a security warning and forcefully override it.
-    from openviking.server.auth.plugins import DevAuthPlugin, ApiKeyAuthPlugin, TrustedAuthPlugin
+    from openviking.server.auth.plugins import ApiKeyAuthPlugin, DevAuthPlugin, TrustedAuthPlugin
+
     registry = get_registry()
     _BUILTIN_PLUGINS = {
         "dev": DevAuthPlugin,
@@ -375,8 +525,7 @@ def validate_server_config(config: ServerConfig) -> None:
     plugin_cls = registry.get(effective_auth_mode)
     if plugin_cls is None:
         logger.error(
-            "Unknown auth_mode: %r. No auth plugin registered for this mode. "
-            "Registered modes: %s.",
+            "Unknown auth_mode: %r. No auth plugin registered for this mode. Registered modes: %s.",
             effective_auth_mode,
             ", ".join(registry.list_modes()),
         )

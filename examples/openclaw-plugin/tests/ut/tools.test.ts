@@ -455,7 +455,7 @@ describe("Tool: memory_store (behavioral)", () => {
     expect(store!.description).toContain("threshold/commit dependent");
   });
 
-  it("uses requesterSenderId to populate role_id for user writes", async () => {
+  it("uses requesterSenderId to populate peer_id for user writes", async () => {
     const openVikingTransport = vi.fn(async (url: string, init?: RequestInit) => {
       if (url.endsWith("/api/v1/system/status")) {
         return okResponse({ user: "default" });
@@ -473,7 +473,7 @@ describe("Tool: memory_store (behavioral)", () => {
       return okResponse({});
     });
 
-    const { factoryTools, api } = setupPlugin();
+    const { factoryTools, api } = setupPlugin(undefined, { peer_role: "person" });
     (api as any).openVikingTransport = openVikingTransport;
     contextEnginePlugin.register(api as any);
     const factory = factoryTools.get("memory_store");
@@ -494,7 +494,41 @@ describe("Tool: memory_store (behavioral)", () => {
     const [, init] = messageCall as [string, RequestInit];
     const body = JSON.parse(String(init.body));
     expect(body.role).toBe("user");
-    expect(body.role_id).toBe("wx_user-01_abc");
+    expect(body.peer_id).toBe("wx_user-01_abc");
+    expect(body).not.toHaveProperty("role_id");
+  });
+
+  it("shows commit trace_id in the memory_store success result", async () => {
+    const openVikingTransport = vi.fn(async (url: string) => {
+      if (url.endsWith("/api/v1/system/status")) {
+        return okResponse({ user: "default" });
+      }
+      if (url.includes("/messages")) {
+        return okResponse({ session_id: "sess-trace" });
+      }
+      if (url.endsWith("/commit")) {
+        return okResponse({
+          status: "completed",
+          archived: true,
+          memories_extracted: { core: 1 },
+          trace_id: "trace-memory-store",
+        });
+      }
+      return okResponse({});
+    });
+
+    const { factoryTools, api } = setupPlugin();
+    (api as any).openVikingTransport = openVikingTransport;
+    contextEnginePlugin.register(api as any);
+    const tool = factoryTools.get("memory_store")!({
+      sessionId: "runtime-session",
+      sessionKey: "agent:main:main",
+    });
+
+    const result = await tool.execute("tc-memory-store", { text: "remember this trace" });
+
+    expect(result.content[0].text).toContain("trace_id=trace-memory-store");
+    expect(result.details).toMatchObject({ traceId: "trace-memory-store" });
   });
 
   it("uses a temporary session by default instead of the current tool session", async () => {

@@ -3,8 +3,7 @@
 """MCP (Model Context Protocol) endpoint for OpenViking server.
 
 Exposes tools to Claude Code (or any MCP client) via streamable HTTP:
-  find, search, read, list, remember, add_resource, grep, glob,
-  code_outline, code_search, code_expand, forget, health
+  find, search, read, write, edit, list, tree, remember, add_resource, grep, glob, forget, health
 
 Mounted on the FastAPI app at /mcp. The MCP session manager lifecycle is
 tied to the FastAPI app lifespan (not a sub-app lifespan) so the task group
@@ -16,12 +15,11 @@ are extracted from HTTP request scope and propagated via contextvars.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
@@ -31,32 +29,34 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from openviking.parse.parsers.code.ast.code_tools import (
-    CODE_SEARCH_CONCURRENCY,
-    expand_symbol,
-    filter_code_uris,
-    outline_file,
-    search_symbols,
+from openviking.core.namespace import canonical_user_root, canonicalize_uri, uri_parts
+from openviking.parse.mode import ParseMode, normalize_parse_mode
+from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
+from openviking.retrieve.context_assembler import (
+    DEFAULT_MAX_TOKENS,
+    AssembleParams,
+    assemble_context,
 )
-from openviking.server.auth import normalize_actor_peer_header, resolve_identity
+from openviking.server.auth import _extract_api_key, normalize_actor_peer_header, resolve_identity
 from openviking.server.dependencies import get_server_config, get_service
 from openviking.server.identity import RequestContext
 from openviking.server.local_input_guard import (
     TEMP_FILE_ID_RE,
     is_remote_resource_source,
 )
+from openviking.server.resource_ingest import ingest_temp_upload
 from openviking.server.temp_upload_store import TempUploadStore
 from openviking.server.upload_token_store import upload_token_store
+from openviking.telemetry.span_models import update_root_span_identity
+from openviking.utils.search_filters import SearchContextTypeInput, merge_search_filter
 from openviking_cli.exceptions import (
     InvalidArgumentError,
+    NotFoundError,
     PermissionDeniedError,
     UnauthenticatedError,
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
-
-# Backwards-compatible alias for existing tests that import this private name.
-_filter_code_uris = filter_code_uris
 
 logger = get_logger(__name__)
 
@@ -82,6 +82,25 @@ def _get_ctx() -> RequestContext:
     if ctx is None:
         raise UnauthenticatedError("MCP request identity not set")
     return ctx
+
+
+def _resolve_mcp_workspace_uri(uri: str, ctx: RequestContext) -> str:
+    """Resolve ``viking://user/...`` as the current user's MCP workspace.
+
+    Generic namespace parsing must preserve canonical cross-user URIs, so it
+    cannot infer whether the first segment after ``user`` is a user id or a
+    file/directory name. MCP has a narrower contract: its filesystem tools act
+    on the authenticated user's workspace. An exact current-user id is already
+    canonical; every other suffix is relative to that user's root.
+    """
+    parts = uri_parts(uri)
+    if parts[:1] != ["user"]:
+        return uri
+    suffix = parts[1:]
+    if suffix[:1] == [ctx.user.user_id]:
+        return canonicalize_uri(uri, ctx)
+    root = canonical_user_root(ctx)
+    return root if not suffix else f"{root}/{'/'.join(suffix)}"
 
 
 def _scope_to_origin(scope: Scope) -> Optional[str]:
@@ -142,11 +161,13 @@ class _IdentityASGIMiddleware:
             return await self.app(scope, receive, send)
 
         request = Request(scope)
+        x_api_key = request.headers.get("x-api-key")
+        authorization = request.headers.get("authorization")
         try:
             identity = await resolve_identity(
                 request,
-                x_api_key=request.headers.get("x-api-key"),
-                authorization=request.headers.get("authorization"),
+                x_api_key=x_api_key,
+                authorization=authorization,
                 x_openviking_account=request.headers.get("x-openviking-account"),
                 x_openviking_user=request.headers.get("x-openviking-user"),
             )
@@ -177,14 +198,29 @@ class _IdentityASGIMiddleware:
             )
             return await resp(scope, receive, send)
 
+        # Mirror the identity fallback RequestContext applies below, so the
+        # observability stamp and the request context never disagree.
+        effective_account_id = identity.account_id or "default"
+        effective_user_id = identity.user_id or "default"
+        # Stamp the resolved identity onto the outer request's root
+        # observability context, mirroring what get_request_context does for
+        # REST routes. MCP authentication bypasses FastAPI's REST context
+        # dependency; request.state shares scope["state"] with the outer app,
+        # where the observability middleware attached root_span_attrs.
+        update_root_span_identity(
+            request_state=request.state,
+            account_id=effective_account_id,
+            user_id=effective_user_id,
+        )
         ctx = RequestContext(
             user=UserIdentifier(
-                identity.account_id or "default",
-                identity.user_id or "default",
+                effective_account_id,
+                effective_user_id,
             ),
             role=identity.role,
             actor_peer_id=actor_peer_id,
             from_oauth=identity.from_oauth,
+            api_key=_extract_api_key(x_api_key, authorization),
         )
         url_info = {
             "x_forwarded_proto": request.headers.get("x-forwarded-proto"),
@@ -207,10 +243,20 @@ class _IdentityASGIMiddleware:
 mcp = FastMCP(
     "openviking",
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    stateless_http=True,
 )
 
 
 # -- find / search ---------------------------------------------------------
+
+
+def _resolve_context_type_filter(
+    context_type: Optional[SearchContextTypeInput],
+) -> Optional[Dict[str, Any]]:
+    try:
+        return merge_search_filter(None, context_type=context_type)
+    except ValueError as exc:
+        raise InvalidArgumentError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -220,15 +266,20 @@ async def find(
     limit: int = 10,
     min_score: float = 0.35,
     level: Optional[List[int]] = None,
+    context_type: Optional[Union[str, List[str]]] = None,
 ) -> str:
     """Fast semantic retrieval without session context. Returns ranked memories, resources, and skills with URI, abstract, and score."""
     service = get_service()
+    ctx = _get_ctx()
+    if target_uri:
+        target_uri = _resolve_mcp_workspace_uri(target_uri, ctx)
     result = await service.search.find(
         query=query,
-        ctx=_get_ctx(),
+        ctx=ctx,
         target_uri=target_uri,
         limit=limit,
         score_threshold=min_score,
+        filter=_resolve_context_type_filter(context_type),
         level=level,
     )
     return _format_search_result(result)
@@ -240,14 +291,80 @@ async def search(
     target_uri: str = "",
     session_id: Optional[str] = None,
     limit: int = 10,
-    min_score: float = 0.35,
+    min_score: Optional[float] = None,
     level: Optional[List[int]] = None,
+    context_type: Optional[Union[str, List[str]]] = None,
+    mode: Literal["list", "context"] = "list",
+    query_expansion: Literal["off", "auto"] = "auto",
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    quotas: Optional[Dict[str, int]] = None,
+    purpose: Optional[Literal["chat", "coding"]] = None,
+    detail: Literal["auto", "abstract", "overview", "full"] = "auto",
+    detail_by_category: Optional[Dict[str, str]] = None,
+    dedup_turns: int = 0,
+    exclude_uris: Optional[List[str]] = None,
+    peer_scope: Literal["actor", "all"] = "all",
+    other_peer_penalty: Optional[float] = None,
+    other_peer_penalties: Optional[Dict[str, float]] = None,
+    rewrite: Literal["off", "auto"] = "off",
+    rewrite_max_bullets: int = 6,
 ) -> str:
-    """Deep semantic retrieval with optional session context and intent analysis. Returns ranked memories, resources, and skills with URI, abstract, and score."""
+    """Deep semantic retrieval with optional session context and intent analysis.
+
+    ``mode="list"`` returns ranked memories, resources, and skills with URI,
+    abstract, and score. ``mode="context"`` returns an injection-ready,
+    token-budgeted context block and supports category quotas, purpose presets,
+    detail tiers, cross-turn deduplication, peer scoping, and optional rewriting.
+    ``target_uri`` is only supported in list mode.
+    """
     service = get_service()
     ctx = _get_ctx()
+    context_filter = _resolve_context_type_filter(context_type)
+    if mode == "context":
+        if target_uri:
+            raise InvalidArgumentError("target_uri is not supported in mode='context'")
+        if detail != "auto" and detail_by_category:
+            raise InvalidArgumentError(
+                "detail cannot be combined with detail_by_category in mode='context'"
+            )
+        if other_peer_penalty is not None and other_peer_penalties:
+            raise InvalidArgumentError(
+                "other_peer_penalty cannot be combined with other_peer_penalties "
+                "in mode='context'"
+            )
+        result = await assemble_context(
+            service=service,
+            ctx=ctx,
+            params=AssembleParams(
+                query=query,
+                limit=limit,
+                score_threshold=min_score,
+                filter=context_filter,
+                session_id=session_id,
+                query_expansion=query_expansion,
+                max_tokens=max_tokens,
+                quotas=quotas,
+                purpose=purpose,
+                detail=detail_by_category or (None if detail == "auto" else detail),
+                dedup_turns=dedup_turns,
+                exclude_uris=exclude_uris or (),
+                peer_scope=peer_scope,
+                other_peer_penalty=other_peer_penalties or other_peer_penalty,
+                rewrite=rewrite == "auto",
+                rewrite_max_bullets=rewrite_max_bullets,
+            ),
+        )
+        if result.digest.strip():
+            return result.digest
+        if result.rendered.strip():
+            return result.rendered
+        return "No matching context found."
+
+    if target_uri:
+        target_uri = _resolve_mcp_workspace_uri(target_uri, ctx)
     session = None
-    if session_id:
+    # Intent off: skip session.load — SearchService will not scan session either.
+    if session_id and service.search.is_intent_enabled():
         session = service.sessions.session(ctx, session_id)
         await session.load()
     result = await service.search.search(
@@ -256,7 +373,8 @@ async def search(
         target_uri=target_uri,
         session=session,
         limit=limit,
-        score_threshold=min_score,
+        score_threshold=0.35 if min_score is None else min_score,
+        filter=context_filter,
         level=level,
     )
     return _format_search_result(result)
@@ -305,13 +423,8 @@ async def read(uris: str | list[str]) -> str:
 
     async def _read_one(uri: str) -> str:
         async with semaphore:
-            try:
-                body = await service.fs.read(uri, ctx=ctx)
-                if isinstance(body, str) and body.strip():
-                    return body
-            except Exception:
-                pass
-            return f"(nothing found at {uri})"
+            resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
+            return await service.fs.read_for_tool(resolved_uri, ctx=ctx, display_uri=uri)
 
     if len(uri_list) == 1:
         return await _read_one(uri_list[0])
@@ -331,8 +444,9 @@ async def ls(uri: str, recursive: bool = False) -> str:
     """List files and subdirectories under a viking:// directory URI. Use recursive=true for deep listing."""
     service = get_service()
     ctx = _get_ctx()
+    resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
 
-    entries = await service.fs.ls(uri, ctx=ctx, recursive=recursive, output="original")
+    entries = await service.fs.ls(resolved_uri, ctx=ctx, recursive=recursive, output="original")
     if not entries:
         return f"(no entries under {uri})"
 
@@ -345,6 +459,56 @@ async def ls(uri: str, recursive: bool = False) -> str:
             lines.append(f"[{'dir' if is_dir else 'file'}] {entry_uri}")
         else:
             lines.append(f"[{'dir' if is_dir else 'file'}] {name}")
+    return "\n".join(lines)
+
+
+# -- tree ------------------------------------------------------------------
+
+
+@mcp.tool()
+async def tree(
+    uri: str = "viking://",
+    level_limit: int = 3,
+    node_limit: int = 1000,
+    include_abstract: bool = False,
+) -> str:
+    """Show the recursive directory tree under a viking:// URI, indented by depth, so you can understand the whole layout at a glance. Use this when you need a full picture of the file tree; use list for a single directory level, glob for filename patterns, and grep for content. level_limit caps the depth (default 3); node_limit caps the total entries. Set include_abstract=true to also see each file's summary (slower, but useful for orientation in unfamiliar directories)."""
+    service = get_service()
+    ctx = _get_ctx()
+    resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
+    output = "agent" if include_abstract else "original"
+    try:
+        entries = await service.fs.tree(
+            resolved_uri,
+            ctx=ctx,
+            output=output,
+            node_limit=node_limit,
+            level_limit=level_limit,
+        )
+    except NotFoundError:
+        entries = []
+    if not entries:
+        return f"(nothing under {uri})"
+
+    lines = [
+        f"Tree of {uri} (depth <= {level_limit}, {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}):"
+    ]
+    for e in entries:
+        rel = (e.get("rel_path") or e.get("name") or "?").strip("/")
+        name = rel.rsplit("/", 1)[-1]
+        depth = len([part for part in rel.split("/") if part])
+        indent = "  " * max(0, depth - 1)
+        if e.get("isDir"):
+            lines.append(f"{indent}{name}/")
+            continue
+        lines.append(f"{indent}{name} ({e.get('size', 0)} B)")
+        abstract = (e.get("abstract") or "").strip().replace("\n", " ")
+        if include_abstract and abstract:
+            lines.append(f"{indent}  - {abstract}")
+    if len(entries) >= node_limit:
+        lines.append(
+            f"(truncated at node_limit={node_limit}; narrow the uri or raise node_limit to see more)"
+        )
     return "\n".join(lines)
 
 
@@ -369,12 +533,114 @@ async def remember(messages: list[StoreMessage]) -> str:
     session = await service.sessions.get(session_id, ctx, auto_create=True)
     for msg in messages:
         if msg.content:
-            session.add_message(
-                msg.role,
-                [TextPart(text=msg.content)],
-            )
+            add_async = getattr(session, "add_message_async", None)
+            if callable(add_async):
+                await add_async(msg.role, [TextPart(text=msg.content)])
+            else:
+                session.add_message(msg.role, [TextPart(text=msg.content)])
     await service.sessions.commit_async(session_id, ctx)
     return f"Stored {len(messages)} message(s) and committed for memory extraction."
+
+
+# -- write -----------------------------------------------------------------
+
+
+@mcp.tool()
+async def write(
+    uri: str,
+    content: str,
+    mode: Literal["replace", "append", "create"] = "replace",
+    wait: bool = False,
+    timeout: Optional[float] = None,
+) -> str:
+    """Write text to a viking:// file. Use this to save files (notes, profiles, knowledge, state) in OpenViking the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite.
+
+    - mode="replace" (default): overwrite the file; creates it and any missing parent directories if needed.
+    - mode="create": fail if the file already exists.
+    - Any new file (whether created by "replace" or "create") must end in one of: .md .txt .json .yaml .yml .toml .py .js .ts
+    - mode="append": append to the end of an existing file; fails if the file does not exist.
+
+    Writable scopes: viking://resources/, viking://user/ (all paths are relative to the authenticated user's root unless the URI already contains that exact user id), viking://agent/. The managed user subtrees skills/, peers/, privacy/ and sessions/ are read-only. After a write, semantic search indexes refresh in the background; pass wait=true to block until search reflects the change."""
+    service = get_service()
+    ctx = _get_ctx()
+    uri = _resolve_mcp_workspace_uri(uri, ctx)
+
+    try:
+        result = await service.fs.write(
+            uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, timeout=timeout
+        )
+    except NotFoundError:
+        if mode != "replace":
+            raise
+        # Replace doubles as create-or-overwrite so agents can save a new file
+        # without first checking whether it exists; strict creation stays
+        # available via mode="create".
+        result = await service.fs.write(
+            uri=uri, content=content, ctx=ctx, mode="create", wait=wait, timeout=timeout
+        )
+    written = result.get("written_bytes", 0)
+    message = (
+        f"Wrote {written} bytes to {result.get('uri', uri)} (mode={result.get('mode', mode)})."
+    )
+    return message + _indexing_hint(result)
+
+
+@mcp.tool()
+async def edit(
+    uri: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+    wait: bool = False,
+    timeout: Optional[float] = None,
+) -> str:
+    """Replace an exact string with new text in an existing viking:// file. Use this for targeted changes instead of rewriting the whole file with the write tool. old_string must match the file's current content exactly, including indentation and newlines; use the read tool first to see it. The edit fails and the file is left unchanged if old_string is not found, or if it matches more than once and replace_all is false (pass more surrounding context to make it unique, or set replace_all=true to replace every occurrence). Pass new_string="" to delete old_string.
+
+    Editing a memory file preserves its metadata; after an edit, search indexes refresh in the background (pass wait=true to block until search reflects the change)."""
+    service = get_service()
+    ctx = _get_ctx()
+    uri = _resolve_mcp_workspace_uri(uri, ctx)
+
+    if not old_string:
+        raise InvalidArgumentError("old_string must not be empty")
+    try:
+        current = await service.fs.read_visible(uri, ctx=ctx)
+    except (InvalidArgumentError, PermissionDeniedError, UnauthenticatedError):
+        raise
+    except Exception as exc:
+        raise NotFoundError(uri, "file") from exc
+    occurrences = current.count(old_string)
+    if occurrences == 0:
+        raise InvalidArgumentError(
+            f"old_string not found in {uri}. "
+            "Re-read the file with the read tool to get its current content."
+        )
+    if occurrences > 1 and not replace_all:
+        raise InvalidArgumentError(
+            f"old_string matches {occurrences} locations in {uri}. "
+            "Include more surrounding context to make it unique, or set replace_all=true."
+        )
+    updated = current.replace(old_string, new_string)
+    if updated == current:
+        return f"No changes: {uri} already matches the requested edit."
+    result = await service.fs.write(
+        uri=uri, content=updated, ctx=ctx, mode="replace", wait=wait, timeout=timeout
+    )
+    written = result.get("written_bytes", 0)
+    message = f"Edited {result.get('uri', uri)} ({written} bytes written)."
+    return message + _indexing_hint(result)
+
+
+def _indexing_hint(result: Dict[str, Any]) -> str:
+    semantic = result.get("semantic_status")
+    vector = result.get("vector_status")
+    parts = [f"semantic={semantic}", f"vector={vector}"]
+    if result.get("overview_status") is not None:
+        parts.append(f"overview={result['overview_status']}")
+    hint = f"\nIndexing: {', '.join(parts)}."
+    if "queued" in (semantic, vector):
+        hint += " Search indexes update in the background; pass wait=true if a follow-up search must see this change immediately."
+    return hint
 
 
 # -- add_resource ----------------------------------------------------------
@@ -433,59 +699,106 @@ def _resolve_public_base_url() -> tuple[str, str]:
             return f"http://{host_hdr}", "host"
 
     if config is not None:
-        return f"http://{config.host}:{config.port}", "listen"
+        from openviking.server.config import map_bind_host_to_loopback
+
+        host = map_bind_host_to_loopback(config.host)
+        return f"http://{host}:{config.port}", "listen"
     return "http://127.0.0.1:1933", "listen"
+
+
+async def _maybe_sitemap_hint(path: str) -> str:
+    """Best-effort sitemap/RSS suggestion for a single-page add (never crawls).
+
+    Policy: only suggest when the added URL is the site root / homepage (path is
+    empty or "/"). Adding a deep article URL implies intent for just that page, and
+    gating to the root also keeps the (bounded, non-recursive) probe from re-running
+    when many pages of the same site are added one-by-one.
+
+    Gated by config (``webfeed.suggest_feed``) and fully exception-safe so it can
+    never block or fail the add it is attached to.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        if urlparse(path).path not in ("", "/"):
+            return ""
+
+        from openviking.parse.accessors import discover_feed_hint
+        from openviking.utils.network_guard import ensure_public_remote_target
+        from openviking_cli.utils.config import get_openviking_config
+
+        webfeed = getattr(get_openviking_config(), "webfeed", None)
+        if webfeed is not None and not getattr(webfeed, "suggest_feed", True):
+            return ""
+        timeout = float(getattr(webfeed, "suggest_timeout", 2.5)) if webfeed else 2.5
+        hint = await discover_feed_hint(
+            path, timeout=timeout, request_validator=ensure_public_remote_target
+        )
+        return hint or ""
+    except Exception:
+        return ""
 
 
 @mcp.tool()
 async def add_resource(
     path: str = "",
     temp_file_id: str = "",
+    add_type: str = "",
     description: str = "",
     watch_interval: float = 0,
+    processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     to: str = "",
+    parent: str = "",
+    tags: Optional[list[str]] = None,
+    tag_mode: str = "replace",
     args: Optional[dict[str, Any]] = None,
 ) -> str:
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
 
-    Three ways to invoke:
+    Remote URL: pass ``path`` as an http(s)://, git@, ssh://, or git:// URL. A sitemap /
+    RSS / Atom URL ingests the WHOLE site as one resource tree; pass ``args={"site": true}``
+    to force whole-site ingestion from a bare domain.
 
-    1. Remote URL: pass ``path`` set to an http(s)://, git@, ssh://, or git:// URL.
-       Returns a success message immediately. Supports ``watch_interval`` for
-       auto-refresh subscriptions; pass ``to`` to choose the exact target URI, or
-       omit it to bind the watch to the URI created by this add.
-
-    2. Local file: pass ``path`` set to a local filesystem path (e.g. ``/tmp/foo.pdf``).
-       The response is NOT a success message — it's a multi-step upload instruction.
-       HTTP POST the file to the URL the response gives you, read ``temp_file_id`` from
-       the upload response body, then call this tool again with that ``temp_file_id``.
-
-    3. Re-call after upload: pass ``temp_file_id`` set to the value the signed upload
-       response returned. Omit ``path``. The server resolves the file via TempUploadStore
-       and ingests it.
+    Local file: pass ``path`` as a filesystem path (e.g. ``/tmp/foo.pdf``). The response is an
+    upload instruction — HTTP POST the file to the returned URL and the server ingests it
+    automatically; you do NOT need to call this tool again.
 
     Args:
-        path: Remote URL or local filesystem path.
-        temp_file_id: Server-minted upload id from a prior signed upload. Either
-            ``path`` or ``temp_file_id`` is required.
+        path: Remote URL or local filesystem path. Required unless ``temp_file_id`` is set.
+        temp_file_id: Server-minted upload id from a prior signed local-file upload.
+        add_type: Explicit Connector source type (e.g. "tos", "git"). When set, the
+            request routes through the Connector integration (must be enabled
+            server-side) and ``path`` is sent verbatim — never treated as a local
+            file. Requires an exact ``to`` target and cannot be combined with
+            ``temp_file_id`` or ``parent``. Leave empty for the default path-probing
+            behavior.
         description: Optional human-readable reason for adding the resource.
-        watch_interval: Auto-refresh cadence in minutes. 0 (default) = no watch.
-            >0 = periodically re-fetch the resource at that cadence (full re-ingest
-            each time). Prefer >=1440 (24h) unless the source genuinely changes
-            faster — every refresh re-embeds the entire resource. When ``to`` is
-            omitted, the watch binds to the URI created by this add.
+        watch_interval: Auto-refresh cadence in minutes. 0 = no watch. Prefer >=1440 (24h)
+            unless the source changes faster — every refresh re-embeds the whole resource.
             Only applies to remote-URL invocations.
-        to: Target URI under viking://resources/ (e.g.
-            "viking://resources/volcengine/OpenViking"). Leave empty to let the
-            system derive a URI from the source.
-        args: Parser-specific import options. For Feishu one-time user-token imports,
-            pass {"feishu_access_token": "..."}. For Feishu user-token watches,
-            pass {"feishu_access_token": "...", "feishu_refresh_token": "..."}.
+        processing_mode: "semantic_and_vectors" for normal semantic processing, or
+            "vectors_only" to skip semantic understanding and only build vector indexes.
+        to: Target URI under viking://resources/ (e.g. "viking://resources/volcengine/OpenViking").
+            Required when ``add_type`` is set; otherwise leave empty to derive a URI
+            from the source.
+        parent: Parent URI under viking://resources/ for remote imports. Mutually exclusive
+            with ``to`` and not supported when ``add_type`` is set.
+        tags: Optional explicit k=v retrieval tags to apply after ingestion.
+        tag_mode: Tag update mode, "replace" or "append". Defaults to "replace".
+        args: Parser-specific options, e.g. {"auth_config": {"token": "..."}}
+            for native HTTPS Git imports and watches, {"feishu_access_token": "..."}
+            for Feishu imports, {"site": true} for whole-site ingestion, or
+            {"parse_mode": "no_split"} to keep each parsed document body in one file.
     """
     from openviking.server.local_input_guard import require_remote_resource_source
 
     service = get_service()
     ctx = _get_ctx()
+
+    try:
+        mode = normalize_parse_mode((args or {}).get("parse_mode", ParseMode.DEFAULT))
+    except InvalidArgumentError as exc:
+        return f"Error: {exc}"
 
     if watch_interval < 0:
         return (
@@ -493,36 +806,50 @@ async def add_resource(
             "use a positive number of minutes (>=1440 recommended) to subscribe to auto-refresh."
         )
 
-    # Branch 1: ingest by temp_file_id (second leg of progressive upload, or REST-style)
+    add_type = add_type.strip()
+    if add_type and temp_file_id:
+        return "Error: add_type cannot be combined with temp_file_id."
+    if add_type and not path:
+        return "Error: add_type requires 'path'."
+    if add_type and parent:
+        return "Error: add_type cannot be combined with parent."
+    if add_type and not to:
+        return "Error: add_type requires an exact 'to' target."
+
+    # Branch 1: ingest by temp_file_id. Kept for backward compat / REST-style use — the
+    # signed upload now auto-ingests server-side, so agents no longer need this second leg.
     if temp_file_id:
         from openviking.server.config import ServerConfig
 
         server_config = get_server_config() or ServerConfig()
         store = TempUploadStore.build(server_config)
         try:
-            resolved = await store.resolve_for_consume(temp_file_id, ctx)
+            result = await ingest_temp_upload(
+                store,
+                temp_file_id,
+                ctx,
+                to=to,
+                reason=description,
+                args=args,
+                processing_mode=processing_mode,
+                tags=tags,
+                tag_mode=tag_mode,
+            )
         except (PermissionDeniedError, InvalidArgumentError) as exc:
             return f"Error: {exc}"
-        try:
-            try:
-                result = await service.resources.add_resource(
-                    path=resolved.local_path,
-                    ctx=ctx,
-                    to=to or None,
-                    reason=description,
-                    source_name=resolved.original_filename,
-                    wait=False,
-                    allow_local_path_resolution=True,
-                    enforce_public_remote_targets=True,
-                    args=args,
-                )
-            except Exception as exc:
-                await store.mark_failed(resolved, ctx)
-                return f"Error adding resource: {exc}"
-            await store.mark_consumed(resolved, ctx)
-        finally:
-            await resolved.cleanup()
-        root_uri = result.get("root_uri", "")
+        except Exception as exc:
+            return f"Error adding resource: {exc}"
+        # add_resource returns a business-error dict (no raise) for parse/finalize failures;
+        # surface it instead of reporting a false success.
+        if isinstance(result, dict) and result.get("status") == "error":
+            errors = result.get("errors")
+            detail = (
+                result.get("message")
+                or (errors[0] if isinstance(errors, list) and errors else None)
+                or "resource processing failed"
+            )
+            return f"Error adding resource: {detail}"
+        root_uri = result.get("root_uri", "") if isinstance(result, dict) else ""
         return (
             f"Resource added: {root_uri}"
             if root_uri
@@ -539,32 +866,53 @@ async def add_resource(
             f'Pass it as the temp_file_id kwarg: add_resource(temp_file_id="{path}")'
         )
 
-    # Branch 3: remote URL — same flow as before
-    if is_remote_resource_source(path):
+    # Branch 3: remote URL, or an explicitly declared Connector source type
+    # (declared requests are delegated or rejected server-side, never resolved
+    # as local paths)
+    if add_type or is_remote_resource_source(path):
         try:
-            path = require_remote_resource_source(path)
+            path = require_remote_resource_source(
+                path, declared_connector_add_type=add_type or None
+            )
             result = await service.resources.add_resource(
                 path=path,
                 ctx=ctx,
+                add_type=add_type or None,
                 to=to or None,
+                parent=parent or None,
                 reason=description,
                 wait=False,
                 watch_interval=watch_interval,
+                processing_mode=processing_mode,
                 enforce_public_remote_targets=True,
                 args=args,
+                tags=tags,
+                tag_mode=tag_mode,
             )
         except Exception as exc:
             return f"Error adding resource: {exc}"
         root_uri = result.get("root_uri", "")
+        task_id = result.get("task_id", "")
         if watch_interval > 0:
             watch_suffix = f" (watch enabled, refresh every {watch_interval:g} minute(s))"
         else:
             watch_suffix = ""
-        return (
-            f"Resource added: {root_uri}{watch_suffix}"
-            if root_uri
-            else f"Resource added (processing in background){watch_suffix}."
-        )
+        if root_uri:
+            message = f"Resource added: {root_uri}{watch_suffix}"
+        elif task_id:
+            message = (
+                f"Resource accepted (task_id: {task_id}; processing in background){watch_suffix}."
+            )
+        else:
+            message = f"Resource added (processing in background){watch_suffix}."
+        # Detect-and-suggest: if this single page belongs to a site that exposes a
+        # sitemap/RSS feed, hint at whole-site ingestion. Never auto-crawls; the
+        # add above is already done, so a slow/failed probe has no functional impact.
+        # Declared Connector imports ingest the whole source already — no hint.
+        hint = None if add_type else await _maybe_sitemap_hint(path)
+        if hint:
+            message += "\n" + hint
+        return message
 
     # Branch 4: local path — mint token, return upload instruction
     server_config = get_server_config()
@@ -578,24 +926,28 @@ async def add_resource(
         ctx.user.account_id,
         ctx.user.user_id,
         ttl_seconds=ttl_seconds,
+        to=to,
+        reason=description,
+        actor_peer_id=ctx.actor_peer_id or "",
+        processing_mode=processing_mode,
+        tags=tags,
+        tag_mode=tag_mode,
+        parse_mode=mode.value,
     )
     base_url, url_source = _resolve_public_base_url()
-    upload_url = f"{base_url}/api/v1/resources/temp_upload_signed?token={quote(token, safe='')}"
+    upload_url = f"{base_url}/api/v1/resources/temp_upload?token={quote(token, safe='')}"
     expires_iso = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(timespec="seconds")
     minutes = max(1, ttl_seconds // 60)
 
     prose = (
-        "Local file detected — upload required before this resource can be ingested.\n"
+        "Local file detected — upload it to ingest this resource.\n"
         "\n"
-        'Step 1. HTTP POST the file bytes (multipart/form-data, field name "file") to:\n'
+        'HTTP POST the file bytes (multipart/form-data, field name "file") to:\n'
         "\n"
         f"  {upload_url}\n"
         "\n"
-        '  The response will be JSON: {"temp_file_id": "<id>"}\n'
-        "\n"
-        "Step 2. Read `temp_file_id` from that response, then call this tool again:\n"
-        "\n"
-        '  add_resource(temp_file_id="<id from step 1>")\n'
+        "The URL's token authorizes the upload (no API key needed); the server ingests "
+        "the file automatically once received — you do NOT need to call add_resource again.\n"
         "\n"
         f"This upload URL expires in ~{minutes} minutes ({expires_iso})."
     )
@@ -605,7 +957,7 @@ async def add_resource(
             "\n\n"
             "Note for the user: this upload URL was auto-detected from the incoming "
             "request because OPENVIKING_PUBLIC_BASE_URL is not set on the server. "
-            "If Step 1 fails (connection refused, wrong host, TLS error), ask the "
+            "If the upload fails (connection refused, wrong host, TLS error), ask the "
             "server operator to set OPENVIKING_PUBLIC_BASE_URL to the agent-facing "
             "URL of the OpenViking server (e.g. via docker-compose `environment:` "
             "or systemd unit) and retry."
@@ -624,11 +976,7 @@ async def add_resource(
 
 @mcp.tool()
 async def list_watches() -> str:
-    """List watch tasks (auto-refresh subscriptions) visible to the current user.
-
-    Each line shows: target URI, refresh interval (minutes), active/paused status,
-    and the next scheduled execution time. Returns "No watch tasks." when empty.
-    """
+    """List watch tasks (auto-refresh subscriptions) visible to the current user."""
     service = get_service()
     ctx = _get_ctx()
     scheduler = getattr(service, "watch_scheduler", None)
@@ -660,11 +1008,7 @@ async def list_watches() -> str:
 
 @mcp.tool()
 async def cancel_watch(to_uri: str) -> str:
-    """Cancel (delete) a watch task by its target URI.
-
-    The URI must match the watch task's `to` value (e.g. "viking://resources/volcengine/OpenViking").
-    To change the cadence or pause temporarily, cancel and re-add with a new watch_interval.
-    """
+    """Cancel a watch task by its target URI (e.g. "viking://resources/volcengine/OpenViking")."""
     from openviking.resource import watch_manager as _wm_mod
 
     service = get_service()
@@ -713,6 +1057,7 @@ async def grep(
 
     service = get_service()
     ctx = _get_ctx()
+    resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
     patterns = [pattern] if isinstance(pattern, str) else pattern
     semaphore = asyncio.Semaphore(10)
 
@@ -720,7 +1065,7 @@ async def grep(
         async with semaphore:
             try:
                 result = await service.fs.grep(
-                    uri,
+                    resolved_uri,
                     p,
                     ctx=ctx,
                     case_insensitive=case_insensitive,
@@ -760,9 +1105,10 @@ async def glob(pattern: str, uri: str = "viking://", node_limit: int = 100) -> s
     """Find viking:// files matching a glob pattern (e.g. **/*.md, *.py). Use this for filename matching; use the search tool for content-based retrieval."""
     service = get_service()
     ctx = _get_ctx()
+    resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
 
     try:
-        result = await service.fs.glob(pattern, ctx=ctx, uri=uri, node_limit=node_limit)
+        result = await service.fs.glob(pattern, ctx=ctx, uri=resolved_uri, node_limit=node_limit)
     except Exception as e:
         return f"Error: {e}"
 
@@ -782,133 +1128,12 @@ async def glob(pattern: str, uri: str = "viking://", node_limit: int = 100) -> s
 
 @mcp.tool()
 async def forget(uri: str, recursive: bool = False) -> str:
-    """Permanently delete a viking:// URI from OpenViking. This is irreversible. Only use when the user explicitly asks to forget or delete something. Always confirm with the user before calling this tool. Use the search tool first to find the exact URI, then pass it here. Set recursive=true only when the user explicitly asks to delete a directory tree."""
+    """Permanently delete a viking:// URI from OpenViking. Irreversible — confirm with user before calling."""
     service = get_service()
     ctx = _get_ctx()
-    await service.fs.rm(uri, ctx=ctx, recursive=recursive)
-    return f"Deleted: {uri}"
-
-
-# -- code navigation -------------------------------------------------------
-
-def _require_viking_uri(uri: str) -> Optional[str]:
-    """Return error message if uri is not a viking:// URI, else None."""
-    if not isinstance(uri, str) or not uri.startswith("viking://"):
-        return (
-            "Error: only viking:// URIs are supported; "
-            "use add_resource to ingest local code as a viking:// resource first."
-        )
-    return None
-
-
-@mcp.tool()
-async def code_outline(uri: str) -> str:
-    """Show a confirmed viking:// source file's symbol structure: classes, functions,
-    methods, and line ranges. Returns a structural map without reading implementation bodies.
-
-    Use only for source files inside an ingested code repository, after you know the exact
-    viking:// file URI. Do not use on directories, documentation-only files, plain text notes,
-    chat/session history, or files that are not supported source code.
-
-    Use read instead when you need the full file content.
-    Typical workflow: code_search → code_outline → code_expand.
-
-    uri must be a viking:// file URI (not a directory)."""
-    err = _require_viking_uri(uri)
-    if err:
-        return err
-    service = get_service()
-    ctx = _get_ctx()
-    try:
-        content = await service.fs.read(uri, ctx=ctx)
-    except Exception as exc:
-        return f"Error: failed to read {uri}: {exc}"
-    if not isinstance(content, str):
-        return f"Error: {uri} is not text"
-    return outline_file(content, uri)
-
-
-@mcp.tool()
-async def code_search(query: str, uri: str) -> str:
-    """Search AST-supported symbol names (class / function / method) by substring across a
-    confirmed viking:// code repository or source subtree. Returns structured results:
-    symbol type, class context, file URI, line range.
-
-    Use only after you have evidence that the uri contains supported source files. If you have
-    not confirmed that this is an ingested code repository, first use ls/glob/read or
-    add_resource output to verify it.
-
-    Do not use for general memory search, documentation-only resources, plain text notes,
-    chat/session history, or local filesystem paths. Skip if you already know the exact file;
-    use code_outline or read directly.
-
-    Scans up to 200 source files. Narrow uri to a subdirectory for deeper coverage.
-    uri is required to avoid accidentally walking the entire VikingFS."""
-    err = _require_viking_uri(uri)
-    if err:
-        return err
-    if not query:
-        return "Error: empty query"
-
-    service = get_service()
-    ctx = _get_ctx()
-    try:
-        entries = await service.fs.ls(uri, ctx=ctx, recursive=True, output="original")
-    except Exception as exc:
-        return f"Error: failed to list {uri}: {exc}"
-
-    code_uris, capped = filter_code_uris(entries or [])
-    if not code_uris:
-        return f"No supported source files found under {uri}"
-
-    semaphore = asyncio.Semaphore(CODE_SEARCH_CONCURRENCY)
-
-    async def _read(u: str) -> Optional[tuple[str, str]]:
-        async with semaphore:
-            try:
-                body = await service.fs.read(u, ctx=ctx)
-            except Exception as exc:
-                logger.warning("code_search: read failed for %s: %s", u, exc)
-                return None
-            if isinstance(body, str):
-                return body, u
-            return None
-
-    fetched = await asyncio.gather(*[_read(u) for u in code_uris])
-    files = [pair for pair in fetched if pair is not None]
-    result = search_symbols(query, files)
-    if capped:
-        result += "\n\n(scanning stopped at 200-file cap; narrow uri to search more)"
-    return result
-
-
-@mcp.tool()
-async def code_expand(uri: str, symbol: str) -> str:
-    """Return the full source of a single named symbol from a confirmed viking:// source file.
-    Reads only that symbol's body, avoiding the overhead of reading an entire file.
-
-    Use only after code_outline or other evidence shows the symbol exists in that file.
-    Do not use for broad exploration, non-code files, documentation, chat/session history,
-    or unverified viking:// resources. For reading multiple symbols from the same file,
-    read is often more efficient.
-
-    `symbol` accepts 'bar' (top-level) or 'Foo.bar' (method).
-    uri must be a viking:// file URI."""
-    err = _require_viking_uri(uri)
-    if err:
-        return err
-    if not symbol:
-        return "Error: empty symbol"
-
-    service = get_service()
-    ctx = _get_ctx()
-    try:
-        content = await service.fs.read(uri, ctx=ctx)
-    except Exception as exc:
-        return f"Error: failed to read {uri}: {exc}"
-    if not isinstance(content, str):
-        return f"Error: {uri} is not text"
-    return expand_symbol(content, uri, symbol)
+    resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
+    await service.fs.rm(resolved_uri, ctx=ctx, recursive=recursive)
+    return f"Deleted: {resolved_uri}"
 
 
 # -- health ----------------------------------------------------------------
@@ -925,6 +1150,94 @@ async def health() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Portable tool schemas
+# ---------------------------------------------------------------------------
+#
+# FastMCP derives tool input schemas from Python type hints, so Optional/Union
+# parameters become `anyOf` nodes with no top-level `type`, and nested models
+# become `$ref`/`$defs`. That is valid JSON Schema, but several LLM function
+# calling APIs (notably Gemini's OpenAPI 3.0 subset) require an explicit
+# `type` on every schema node and reject `anyOf`/`$ref`, so MCP clients that
+# forward our schemas verbatim get the whole request rejected. Rewrite the
+# advertised schemas into a plain-typed form: drop null branches, collapse
+# unions to their most general branch, and inline $refs. Runtime argument
+# validation still uses the original function signatures, so union parameters
+# keep accepting every branch (e.g. `read` still takes a bare URI string even
+# though the schema advertises an array).
+
+_PORTABLE_TYPE_PREFERENCE = ("array", "object", "string", "number", "integer", "boolean")
+
+
+def _portable_schema(schema: Any, defs: Optional[Dict[str, Any]] = None) -> Any:
+    if not isinstance(schema, dict):
+        return schema
+    if defs is None:
+        defs = schema.get("$defs") or {}
+    node = {k: v for k, v in schema.items() if k != "$defs"}
+
+    ref = node.pop("$ref", None)
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        target = defs.get(ref.rsplit("/", 1)[-1])
+        if isinstance(target, dict):
+            return _portable_schema({**target, **node}, defs)
+
+    any_of = node.pop("anyOf", None)
+    if isinstance(any_of, list):
+        branches = [
+            b
+            for b in (_portable_schema(b, defs) for b in any_of)
+            if isinstance(b, dict) and b.get("type") != "null"
+        ]
+        if branches:
+
+            def _rank(branch: Dict[str, Any]) -> int:
+                branch_type = branch.get("type")
+                if branch_type in _PORTABLE_TYPE_PREFERENCE:
+                    return _PORTABLE_TYPE_PREFERENCE.index(branch_type)
+                return len(_PORTABLE_TYPE_PREFERENCE)
+
+            node = {**min(branches, key=_rank), **node}
+        # A null default contradicts the collapsed non-null type; omission
+        # already means "not provided", so drop it.
+        if node.get("default", "") is None:
+            node.pop("default")
+
+    if isinstance(node.get("properties"), dict):
+        node["properties"] = {
+            key: _portable_schema(value, defs) for key, value in node["properties"].items()
+        }
+    for key in ("items", "additionalProperties"):
+        if isinstance(node.get(key), dict):
+            node[key] = _portable_schema(node[key], defs)
+
+    if "type" not in node:
+        if "properties" in node:
+            node["type"] = "object"
+        elif "items" in node:
+            node["type"] = "array"
+        else:
+            enum_values = node.get("enum") or ([node["const"]] if "const" in node else [])
+            sample = enum_values[0] if enum_values else ""
+            if isinstance(sample, bool):
+                node["type"] = "boolean"
+            elif isinstance(sample, int):
+                node["type"] = "integer"
+            elif isinstance(sample, float):
+                node["type"] = "number"
+            else:
+                node["type"] = "string"
+    return node
+
+
+def _apply_portable_schemas() -> None:
+    for tool in mcp._tool_manager.list_tools():
+        tool.parameters = _portable_schema(tool.parameters)
+
+
+_apply_portable_schemas()
+
+
+# ---------------------------------------------------------------------------
 # App factory + lifespan
 # ---------------------------------------------------------------------------
 
@@ -934,7 +1247,8 @@ async def mcp_lifespan():
     """Run the MCP session manager. Call this inside the FastAPI lifespan."""
     async with mcp.session_manager.run():
         logger.info(
-            "MCP endpoint ready (13 tools: find, search, read, list, remember, add_resource, grep, glob, code_outline, code_search, code_expand, forget, health)"
+            "MCP endpoint ready (15 tools: find, search, read, write, edit, list, "
+            "tree, remember, add_resource, list_watches, cancel_watch, grep, glob, forget, health)"
         )
         yield
 

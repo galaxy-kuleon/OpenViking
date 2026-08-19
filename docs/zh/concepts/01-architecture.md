@@ -57,7 +57,7 @@ OpenViking 是为 AI Agent 设计的上下文数据库，将所有上下文（Me
 | **Retrieve** | 上下文检索 | 意图分析（IntentAnalyzer）、层级检索（HierarchicalRetriever）、Rerank 精排 |
 | **Session** | 会话管理 | 消息记录、使用追踪、会话压缩、记忆提交 |
 | **Parse** | 上下文提取 | 文档解析（PDF/MD/HTML）、树构建（TreeBuilder）、异步语义生成 |
-| **Compressor** | 记忆压缩 | 8 种记忆分类提取、LLM 去重决策 |
+| **Compressor** | 记忆压缩 | Schema 驱动的记忆提取、LLM 去重决策 |
 | **Storage** | 存储层 | VikingFS 虚拟文件系统、向量索引、AGFS 集成 |
 
 ## Service 层
@@ -116,22 +116,10 @@ OpenViking 采用双层存储架构，实现内容与索引分离（详见 [存�
 1. **消息**：累积对话消息和使用记录
 2. **压缩**：保留最近 N 轮，旧消息归档
 3. **归档**：生成历史片段的 L0/L1
-4. **记忆提取**：从消息中提取 8 种分类记忆
+4. **记忆提取**：根据记忆策略和 MemoryType Schema 从消息中提取记忆
 5. **存储**：写入 AGFS + 向量库
 
 ## 部署模式
-
-### 嵌入式模式
-
-用于本地开发和单进程应用：
-
-```python
-client = OpenViking(path="./data")
-```
-
-- 自动启动 AGFS 子进程
-- 使用本地向量索引
-- 单例模式
 
 ### HTTP 模式
 

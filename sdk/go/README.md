@@ -56,8 +56,7 @@ derives account and user identity from the key. Set `Account` and `User` only
 for trusted deployments or gateways where the upstream explicitly forwards
 tenant identity through OpenViking headers.
 
-This SDK is HTTP-only. It does not implement Python embedded mode or legacy
-`agent_id` compatibility.
+This SDK does not implement legacy `agent_id` compatibility.
 
 ## Common Operations
 
@@ -85,18 +84,50 @@ for _, item := range results.Resources {
 	fmt.Println(item.URI, item.Score)
 }
 
+// Search by image. Image accepts a local path, viking:// URI, HTTP URL, or data:image URI.
+imageResults, err := client.Find(ctx, "", &openviking.FindOptions{
+	TargetURI: "viking://resources/images",
+	Image:     "./query.png",
+	Limit:     5,
+})
+similarPosters, err := client.Search(ctx, "similar poster", &openviking.SearchOptions{
+	TargetURI: "viking://resources/images",
+	Image:     "viking://resources/images/poster.png",
+	Limit:     5,
+})
+
 // Work with sessions.
 session, err := client.CreateSession(ctx, &openviking.CreateSessionOptions{
 	SessionID: "demo-session",
+	MemoryExtractionConfig: map[string]any{
+		"events": map[string]any{
+			"tags": []string{"team=search", "channel=web"},
+		},
+	},
+})
+_, err = client.CreateSession(ctx, &openviking.CreateSessionOptions{
+	SessionID:         "manual-session",
+	DisableAutoCommit: true,
+})
+_, err = client.UpdateSessionConfig(ctx, "demo-session", &openviking.UpdateSessionConfigOptions{
+	AutoCommitPolicy: openviking.Map(map[string]any{"message_count_threshold": 25}),
+	MemoryExtractionConfig: map[string]any{
+		"events": map[string]any{"tags": []string{"team=search", "channel=app"}},
+	},
+})
+_, err = client.UpdateSessionConfig(ctx, "demo-session", &openviking.UpdateSessionConfigOptions{
+	AutoCommitPolicy: openviking.Map(nil), // explicit JSON null disables auto-commit
 })
 _, err = client.AddMessage(ctx, "demo-session", "user", openviking.AddMessageOptions{
 	Content: openviking.String("remember this deployment decision"),
 })
 commit, err := client.CommitSession(ctx, "demo-session", &openviking.CommitSessionOptions{
 	KeepRecentCount: 2,
+	EventTags:       []string{"team=search", "channel=web"},
 })
 
-_, _, _ = resource, updated, session
+_, _, _, _ = resource, updated, imageResults, similarPosters
+_ = session
 _ = commit
 ```
 
@@ -111,22 +142,51 @@ Implemented:
 | Resource and skill import | `AddResource`, `AddSkill`, `WaitProcessed` |
 | Skill management | `ListSkills`, `FindSkills`, `ValidateSkill`, `GetSkill`, `UpdateSkill`, `DeleteSkill` |
 | Watch management | `ListWatches`, `GetWatch`, `UpdateWatch`, `DeleteWatch`, `TriggerWatch` |
-| Filesystem and content | `List`, `Tree`, `Stat`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
+| Filesystem and content | `List`, `Tree`, `Stat`, `Attrs`, `Mkdir`, `Remove`, `Move`, `Read`, `Abstract`, `Overview`, `Write`, `SetTags`, `Reindex` |
 | Retrieval | `Find`, `Search`, `Grep`, `Glob` |
-| Sessions and tasks | `CreateSession`, `ListSessions`, `GetSession`, `SessionExists`, `GetSessionContext`, `GetSessionArchive`, `DeleteSession`, `AddMessage`, `BatchAddMessages`, `CommitSession`, `GetTask`, `ListTasks` |
+| Relations | `Relations`, `Link`, `Unlink` |
+| Sessions and tasks | `CreateSession`, `ListSessions`, `GetSession`, `UpdateSessionConfig`, `SessionExists`, `GetSessionContext`, `GetSessionArchive`, `DeleteSession`, `AddMessage`, `BatchAddMessages`, `CommitSession`, `GetTask`, `ListTasks` |
 | Packs | `ExportOVPack`, `BackupOVPack`, `ImportOVPack`, `RestoreOVPack` |
 | System and observer | `Health`, `CheckConsistency`, `GetStatus`, `IsHealthy`, `QueueStatus`, `VikingDBStatus`, `ModelsStatus` |
-| Admin | `AdminCreateAccount`, `AdminListAccounts`, `AdminDeleteAccount`, `AdminRegisterUser`, `AdminListUsers`, `AdminRemoveUser`, `AdminSetRole`, `AdminRegenerateKey`, `AdminMigrate` |
+| Admin | `AdminCreateAccount`, `AdminCreateAccountWithOptions`, `AdminListAccounts`, `AdminDeleteAccount`, `AdminRegisterUser`, `AdminRegisterUserWithOptions`, `AdminListUsers`, `AdminRemoveUser`, `AdminSetRole`, `AdminRegenerateKey`, `AdminRegenerateKeyWithOptions`, `AdminMigrate` |
 
 Not implemented in Go SDK v1:
 
 | Area | Reason |
 |------|--------|
-| Python embedded mode | Go SDK is HTTP-only. |
 | Legacy `agent_id` compatibility | New SDKs use `ActorPeerID` only. |
 | Privacy config routes | Server-only management surface today; not in Python HTTP client. |
 | Metrics endpoint | Prometheus text scrape endpoint, not a JSON SDK API. |
 | Console/debug/backend-sync/session tool-result endpoints | Operational or server-only endpoints outside Python HTTP client parity. |
+
+## Admin User Config
+
+Use the options variants when creating users with initial server-side user
+config. Ordinary add calls do not need SDK defaults; omit `To` / `TargetURI`
+and let the server resolve user and deployment defaults.
+
+```go
+seed := "alice-seed"
+_, err := client.AdminRegisterUserWithOptions(ctx, "acme", "alice", "user", &openviking.AdminRegisterUserOptions{
+    Seed: &seed,
+    UserConfig: map[string]any{
+		"add_targets": map[string]any{
+			"resource_uri": "viking://user/resources/project-a",
+			"skill_uri":    "viking://user/skills",
+		},
+	},
+})
+
+newSeed := "alice-new-seed"
+_, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "alice", &openviking.AdminRegenerateKeyOptions{
+    Seed: &newSeed,
+})
+```
+
+When `Seed` is set, the returned API key is derived from
+`sha256(user_id + "\0" + seed)`; omit it for random key generation.
+Use `nil` to omit `Seed`; set `Seed` to a string pointer to send it, including
+an empty string that the server rejects.
 
 ## Files, Directories, and Packs
 

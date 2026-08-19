@@ -23,7 +23,7 @@ Admin API 用于多租户环境下的账户和用户管理。包括工作区（a
 | 注册/移除用户 | Y | Y（本 account） | N |
 | 列出 agents（已废弃，返回空列表） | Y | Y（本 account） | N |
 | 重新生成 User Key | Y | Y（本 account） | N |
-| 修改用户角色 | Y | N | N |
+| 将用户提升为 ADMIN | Y | Y（本 account） | N |
 
 ## CLI `--sudo` 选项
 
@@ -57,6 +57,66 @@ Admin API 用于多租户环境下的账户和用户管理。包括工作区（a
 
 ## API 参考
 
+### get_agent_evolution_status
+
+返回调用方所属 account 的 Agent 进化实时状态。ROOT 操作已配置的默认
+account，ADMIN 仅操作自己所属的 account。
+
+**HTTP API**
+
+```
+GET /api/v1/admin/agent-evolution
+```
+
+```bash
+curl http://localhost:1933/api/v1/admin/agent-evolution \
+  -H "X-API-Key: <root-key>"
+```
+
+**响应示例**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "enabled": false,
+    "account_id": "default"
+  },
+  "time": 0.1
+}
+```
+
+`enabled` 优先读取
+`/local/{account_id}/_system/setting.json` 中的 account 级覆盖值；未配置时使用
+`server.agent_evolution.enabled`。Session commit 会实时读取生效值，无需重启。
+
+现有更新接口名保持不变：
+
+```http
+PUT /api/v1/admin/agent-evolution
+Content-Type: application/json
+
+{"enabled": true}
+```
+
+### account_settings
+
+ROOT 可管理任意 account，ADMIN 仅可管理自己所属的 account。通用配置接口仅允许
+显式列入白名单的字段；当前只允许修改 `agent_evolution.enabled`。
+
+```http
+GET /api/v1/admin/accounts/{account_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/settings
+Content-Type: application/json
+
+{"agent_evolution": {"enabled": true}}
+```
+
+覆盖已有配置前，内核会先备份到
+`/local/{account_id}/_system/setting.backup.json`。
+
+---
+
 ### create_account
 
 #### 1. API 实现介绍
@@ -68,7 +128,8 @@ Admin API 用于多租户环境下的账户和用户管理。包括工作区（a
 2. 使用 API Key Manager 创建账户和初始管理员用户
 3. 初始化账户级目录结构
 4. 初始化管理员用户的个人目录
-5. 返回账户信息和用户密钥（非 trusted 模式下）
+5. 写入可选的初始管理员用户配置
+6. 返回账户信息和用户密钥（非 trusted 模式下）
 
 **代码入口：**
 - `openviking/server/routers/admin.py:create_account` - HTTP 路由
@@ -83,10 +144,15 @@ Admin API 用于多租户环境下的账户和用户管理。包括工作区（a
 |------|------|------|--------|------|
 | account_id | str | 是 | - | 工作区 ID |
 | admin_user_id | str | 是 | - | 首个管理员用户 ID |
+| seed | str | 否 | `null` | 可选的确定性 API Key seed。传入后，key secret 为 `sha256(user_id + "\0" + seed)` |
+| user_config | object | 否 | `null` | 首个管理员用户的初始配置。当前支持 `add_targets.resource_uri` 和 `add_targets.skill_uri` |
 
 **说明：**
 - 在 `trusted` 模式下，响应中不会包含 `user_key` 字段
+- 省略 `seed` 时使用默认随机 API Key。seed 应视为密钥材料；过短的 seed 会让 key 更容易被猜测。
 - 不再支持 account 级 namespace 隔离配置。用户记忆使用 user-scoped namespace，一对多外部参与者通过 `peer_id` 表达。
+- `user_config.add_targets.resource_uri` 必须是可写资源目录 URI：`viking://resources` 或 `viking://resources/...`、`viking://user/resources` 或 `viking://user/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。
+- `user_config.add_targets.skill_uri` 只能是 `viking://user/skills` 或 `viking://agent/skills`。v1 不支持显式写成 `viking://user/{user_id}/skills`。
 
 #### 3. 使用示例
 
@@ -102,7 +168,8 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
   -H "X-API-Key: <root-key>" \
   -d '{
     "account_id": "acme",
-    "admin_user_id": "alice"
+    "admin_user_id": "alice",
+    "seed": "alice-seed"
   }'
 ```
 
@@ -118,13 +185,7 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
     "admin_user_id": "gateway-admin"
   }'
 
-# 然后提升为 root，以便执行跨 account 的管理操作
-curl -X PUT http://localhost:1933/api/v1/admin/accounts/platform/users/gateway-admin/role \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
-  -d '{"role": "root"}'
-
-# 然后在 trusted 模式下使用
+# 然后在 trusted 模式下使用；管理权限来自 root_api_key
 curl -X POST http://localhost:1933/api/v1/admin/accounts \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
@@ -156,10 +217,27 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-key>")
 client.initialize()
 
-result = client.admin_create_account("acme", "alice")
+result = client.admin_create_account("acme", "alice", seed="alice-seed")
 print(f"Account created: {result['account_id']}")
 print(f"Admin user: {result['admin_user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
+
+result = client.admin_create_account(
+    "acme-private",
+    "alice",
+    user_config={
+        "add_targets": {
+            "resource_uri": "viking://user/resources",
+            "skill_uri": "viking://user/skills",
+        }
+    },
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminCreateAccount("account-id", "admin-user-id"));
 ```
 
 **Go SDK**
@@ -170,6 +248,17 @@ if err != nil {
     return err
 }
 fmt.Println(result["account_id"])
+
+seed := "alice-seed"
+result, err = client.AdminCreateAccountWithOptions(ctx, "acme-private", "alice", &openviking.AdminCreateAccountOptions{
+    Seed: &seed,
+    UserConfig: map[string]any{
+        "add_targets": map[string]any{
+            "resource_uri": "viking://user/resources",
+            "skill_uri":    "viking://user/skills",
+        },
+    },
+})
 ```
 
 **CLI**
@@ -177,6 +266,10 @@ fmt.Println(result["account_id"])
 ```bash
 # 需要 ROOT 权限，使用 --sudo
 ov --sudo admin create-account acme --admin alice
+ov --sudo admin create-account acme --admin alice --seed alice-seed
+
+ov --sudo admin create-account acme-private --admin alice \
+  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources","skill_uri":"viking://user/skills"}}'
 ```
 
 **响应示例**
@@ -239,6 +332,12 @@ client.initialize()
 accounts = client.admin_list_accounts()
 for account in accounts:
     print(f"Account: {account['account_id']}, created: {account['created_at']}, users: {account['user_count']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminListAccounts());
 ```
 
 **Go SDK**
@@ -327,6 +426,12 @@ result = client.admin_delete_account("acme")
 print(f"Account deleted: {result['deleted']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.adminDeleteAccount("account-id");
+```
+
 **Go SDK**
 
 ```go
@@ -368,7 +473,8 @@ ov --sudo admin delete-account acme
 1. 验证请求者具有 ROOT 权限，或为本账户的 ADMIN
 2. 调用 API Key Manager 注册新用户
 3. 初始化新用户的个人目录
-4. 返回用户信息和用户密钥（非 trusted 模式下）
+4. 写入可选的初始用户配置
+5. 返回用户信息和用户密钥（非 trusted 模式下）
 
 **代码入口：**
 - `openviking/server/routers/admin.py:register_user` - HTTP 路由
@@ -383,12 +489,17 @@ ov --sudo admin delete-account acme
 |------|------|------|--------|------|
 | account_id | str | 是 | - | 工作区 ID |
 | user_id | str | 是 | - | 用户 ID |
-| role | str | 否 | "user" | 要分配的角色。`ROOT` 和同 account 的 `ADMIN` 可直接注册 `"user"` 或 `"admin"`。`"root"` 必须通过专门的改角色接口分配。 |
+| role | str | 否 | "user" | 要分配的角色。`ROOT` 和同 account 的 `ADMIN` 可直接注册 `"user"` 或 `"admin"`。ROOT 身份只来自 `server.root_api_key`。 |
+| seed | str | 否 | `null` | 可选的确定性 API Key seed。传入后，key secret 为 `sha256(user_id + "\0" + seed)` |
+| user_config | object | 否 | `null` | 新用户的初始配置。当前支持 `add_targets.resource_uri` 和 `add_targets.skill_uri` |
 
 **说明：**
 - 在 `trusted` 模式下，响应中不会包含 `user_key` 字段
+- 省略 `seed` 时使用默认随机 API Key。seed 应视为密钥材料；过短的 seed 会让 key 更容易被猜测。
 - ADMIN 只能在自己所属的 account 中注册用户
 - 无法通过用户注册接口直接创建 `"root"` 角色
+- `user_config.add_targets.resource_uri` 必须是可写资源目录 URI：`viking://resources` 或 `viking://resources/...`、`viking://user/resources` 或 `viking://user/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。
+- `user_config.add_targets.skill_uri` 只能是 `viking://user/skills` 或 `viking://agent/skills`。v1 不支持显式写成 `viking://user/{user_id}/skills`。
 
 #### 3. 使用示例
 
@@ -404,7 +515,8 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <root-or-admin-key>" \
   -d '{
     "user_id": "bob",
-    "role": "user"
+    "role": "user",
+    "seed": "bob-seed"
   }'
 ```
 
@@ -416,9 +528,22 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_register_user("acme", "bob", role="user")
+result = client.admin_register_user("acme", "bob", role="user", seed="bob-seed")
 print(f"User registered: {result['user_id']}")
 print(f"User key: {result.get('user_key', '(not exposed in trusted mode)')}")
+
+result = client.admin_register_user(
+    "acme",
+    "bob-private",
+    role="user",
+    user_config={"add_targets": {"resource_uri": "viking://user/resources/project-a"}},
+)
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminRegisterUser("account-id", "user-id", "user"));
 ```
 
 **Go SDK**
@@ -429,6 +554,14 @@ if err != nil {
     return err
 }
 fmt.Println(result["user_id"])
+
+seed := "bob-seed"
+result, err = client.AdminRegisterUserWithOptions(ctx, "acme", "bob-private", "user", &openviking.AdminRegisterUserOptions{
+    Seed: &seed,
+    UserConfig: map[string]any{
+        "add_targets": map[string]any{"resource_uri": "viking://user/resources/project-a"},
+    },
+})
 ```
 
 **CLI**
@@ -437,8 +570,12 @@ fmt.Println(result["user_id"])
 # ROOT 或本账户的 ADMIN 都可以执行
 # 如果使用普通用户的 api_key 但该用户是 acme 的 ADMIN：
 ov admin register-user acme bob --role user
+ov admin register-user acme bob --role user --seed bob-seed
 # 如果使用 root_api_key（--sudo）：
 ov --sudo admin register-user acme bob --role user
+
+ov admin register-user acme bob-private --role user \
+  --user-config-json '{"add_targets":{"resource_uri":"viking://user/resources/project-a"}}'
 ```
 
 **响应示例**
@@ -518,6 +655,12 @@ client.initialize()
 users = client.admin_list_users("acme")
 for user in users:
     print(f"User: {user['user_id']}, role: {user['role']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminListUsers("account-id"));
 ```
 
 **Go SDK**
@@ -609,6 +752,12 @@ result = client.admin_remove_user("acme", "bob")
 print(f"User deleted: {result['deleted']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.adminRemoveUser("account-id", "user-id");
+```
+
 **Go SDK**
 
 ```go
@@ -647,10 +796,10 @@ ov --sudo admin remove-user acme bob
 
 #### 1. API 实现介绍
 
-修改用户角色（仅 ROOT）。
+将账户用户提升为 ADMIN。ROOT 可以操作任意账户；ADMIN 只能操作自己的账户。
 
 **处理流程：**
-1. 验证请求者具有 ROOT 权限
+1. 验证请求者具有 ROOT 或 ADMIN 权限，并限制 ADMIN 只能操作自己的账户
 2. 调用 API Key Manager 更新用户角色
 3. 返回更新后的用户信息
 
@@ -667,11 +816,11 @@ ov --sudo admin remove-user acme bob
 |------|------|------|--------|------|
 | account_id | str | 是 | - | 工作区 ID |
 | user_id | str | 是 | - | 用户 ID |
-| role | str | 是 | - | 新角色："admin" 或 "user" 或 "root" |
+| role | str | 是 | - | 固定为 "admin" |
 
 **说明：**
-- 只有 ROOT 可以修改用户角色
-- 角色可以设置为 "admin"、"user" 或 "root"
+- ROOT 和 ADMIN 可以将用户提升为 ADMIN；ADMIN 只能操作自己的账户
+- 该接口不支持设置 "user" 或 "root"；ROOT 身份只来自 `server.root_api_key`
 
 #### 3. 使用示例
 
@@ -698,6 +847,12 @@ client.initialize()
 
 result = client.admin_set_role("acme", "bob", "admin")
 print(f"User: {result['user_id']}, new role: {result['role']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.adminSetRole("account-id", "user-id", "admin");
 ```
 
 **Go SDK**
@@ -758,10 +913,12 @@ ov --sudo admin set-role acme bob admin
 |------|------|------|--------|------|
 | account_id | str | 是 | - | 工作区 ID |
 | user_id | str | 是 | - | 用户 ID |
+| seed | str | 否 | `null` | JSON request body 中可选的确定性 API Key seed。传入后，key secret 为 `sha256(user_id + "\0" + seed)` |
 
 **说明：**
 - ADMIN 只能为自己所属的 account 中的用户重新生成密钥
 - 旧密钥会立即失效，需要更新使用该密钥的客户端
+- 省略 `seed` 时使用默认随机重新生成逻辑。
 
 #### 3. 使用示例
 
@@ -774,7 +931,8 @@ POST /api/v1/admin/accounts/{account_id}/users/{user_id}/key
 ```bash
 curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users/bob/key \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-or-admin-key>"
+  -H "X-API-Key: <root-or-admin-key>" \
+  -d '{"seed": "bob-new-seed"}'
 ```
 
 **Python SDK**
@@ -785,8 +943,14 @@ import openviking as ov
 client = ov.SyncHTTPClient(api_key="<root-or-admin-key>")
 client.initialize()
 
-result = client.admin_regenerate_key("acme", "bob")
+result = client.admin_regenerate_key("acme", "bob", seed="bob-new-seed")
 print(f"New user key: {result['user_key']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminRegenerateKey("account-id", "user-id"));
 ```
 
 **Go SDK**
@@ -797,6 +961,11 @@ if err != nil {
     return err
 }
 fmt.Println(result["user_key"])
+
+seed := "bob-new-seed"
+result, err = client.AdminRegenerateKeyWithOptions(ctx, "acme", "bob", &openviking.AdminRegenerateKeyOptions{
+    Seed: &seed,
+})
 ```
 
 **CLI**
@@ -805,6 +974,7 @@ fmt.Println(result["user_key"])
 # ROOT 或本账户的 ADMIN 都可以执行
 # 如果使用普通用户的 api_key 但该用户是 acme 的 ADMIN：
 ov admin regenerate-key acme bob
+ov admin regenerate-key acme bob --seed bob-new-seed
 # 如果使用 root_api_key（--sudo）：
 ov --sudo admin regenerate-key acme bob
 ```
@@ -876,22 +1046,32 @@ POST /api/v1/admin/migrate
 
 #### 3. 使用示例
 
-**执行迁移**
+**HTTP API**
 
 ```bash
+# 执行迁移
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "migrate"}'
-```
 
-**清理旧 namespace**
-
-```bash
+# 清理旧 namespace
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "cleanup"}'
+```
+
+**Python SDK**
+
+```python
+print(client.admin_migrate(cleanup=False))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminMigrate(false));
 ```
 
 **Go SDK**
@@ -922,6 +1102,8 @@ ov --sudo admin migrate --cleanup --output json
 ```
 
 ---
+
+<a id="用户添加位置设置"></a>
 
 ## 完整示例
 
@@ -973,10 +1155,10 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users \
 curl -X GET http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <alice-key>"
 
-# 步骤 4：修改角色（需要 ROOT key）
+# 步骤 4：将用户提升为 admin
 curl -X PUT http://localhost:1933/api/v1/admin/accounts/acme/users/bob/role \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
+  -H "X-API-Key: <alice-key>" \
   -d '{"role": "admin"}'
 
 # 步骤 5：重新生成 key

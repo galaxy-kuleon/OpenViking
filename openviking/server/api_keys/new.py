@@ -13,11 +13,20 @@ from typing import Optional, Tuple
 
 from openviking.server.api_keys.legacy import (
     LegacyAPIKeyManager,
+    derive_seeded_api_key_secret,
 )
-from openviking.server.api_keys.models import AccountInfo, UserKeyEntry
+from openviking.server.api_keys.models import (
+    AccountInfo,
+    UserKeyEntry,
+    validate_account_user_role,
+)
 from openviking.server.identity import ResolvedIdentity, Role
 from openviking.storage.viking_fs import VikingFS
-from openviking_cli.exceptions import InvalidArgumentError, UnauthenticatedError
+from openviking_cli.exceptions import (
+    FailedPreconditionError,
+    InvalidArgumentError,
+    UnauthenticatedError,
+)
 from openviking_cli.session.user_id import validate_account_id, validate_user_id
 from openviking_cli.utils import get_logger
 
@@ -58,12 +67,15 @@ def parse_api_key(api_key: str) -> Tuple[str, str, str]:
     return account_id, user_id, secret
 
 
-def generate_api_key(account_id: str, user_id: str) -> str:
+def generate_api_key(account_id: str, user_id: str, seed: Optional[str] = None) -> str:
     """Generate a new format API key."""
     account_segment = _encode_segment(account_id)
     user_segment = _encode_segment(user_id)
-    # Generate a 32-byte random secret and encode it
-    secret = secrets.token_hex(32)
+    secret = (
+        derive_seeded_api_key_secret(user_id, seed)
+        if seed is not None
+        else secrets.token_hex(32)
+    )
     secret_segment = _encode_segment(secret)
     return f"{account_segment}.{user_segment}.{secret_segment}"
 
@@ -104,6 +116,14 @@ class NewAPIKeyManager:
             len(self._legacy.get_accounts()),
             sum(len(info.users) for info in self._legacy._accounts.values()),
         )
+
+    async def reload(self) -> None:
+        """Read-only refresh of in-memory key state; delegates to the legacy manager."""
+        await self._legacy.reload()
+
+    async def compute_store_signature(self) -> tuple:
+        """Return a cheap change signature for the on-disk key store."""
+        return await self._legacy.compute_store_signature()
 
     def resolve(self, api_key: str) -> ResolvedIdentity:
         """Resolve an API key to identity.
@@ -161,6 +181,7 @@ class NewAPIKeyManager:
         self,
         account_id: str,
         admin_user_id: str,
+        seed: Optional[str] = None,
     ) -> str:
         """Create a new account (workspace) with its first admin user.
 
@@ -175,7 +196,7 @@ class NewAPIKeyManager:
             raise InvalidArgumentError(verr)
 
         # Generate new format key
-        key = generate_api_key(account_id, admin_user_id)
+        key = generate_api_key(account_id, admin_user_id, seed)
 
         # Use legacy to create account but with our new key
         # We temporarily replace the generate method, call, then restore
@@ -239,8 +260,15 @@ class NewAPIKeyManager:
         """Delete an account and remove all its user keys from the index."""
         await self._legacy.delete_account(account_id)
 
-    async def register_user(self, account_id: str, user_id: str, role: str = "user") -> str:
+    async def register_user(
+        self,
+        account_id: str,
+        user_id: str,
+        role: str = "user",
+        seed: Optional[str] = None,
+    ) -> str:
         """Register a new user in an account. Returns the user's API key in new format."""
+        resolved_role = validate_account_user_role(role)
         # Validate user_id format
         verr = validate_user_id(user_id)
         if verr:
@@ -258,7 +286,7 @@ class NewAPIKeyManager:
             raise AlreadyExistsError(user_id, "user")
 
         # Generate new format key
-        key = generate_api_key(account_id, user_id)
+        key = generate_api_key(account_id, user_id, seed)
 
         if self._legacy._api_key_hashing_enabled:
             stored_key = self._legacy._hash_api_key(key)
@@ -270,7 +298,7 @@ class NewAPIKeyManager:
             key_prefix = self._legacy._get_key_prefix(key)
 
         user_info = {
-            "role": role,
+            "role": resolved_role,
             "key": stored_key,
         }
         if self._legacy._api_key_hashing_enabled:
@@ -281,7 +309,7 @@ class NewAPIKeyManager:
         entry = UserKeyEntry(
             account_id=account_id,
             user_id=user_id,
-            role=Role(role),
+            role=resolved_role,
             key_or_hash=stored_key,
             is_hashed=is_hashed,
         )
@@ -294,11 +322,60 @@ class NewAPIKeyManager:
         await self._legacy._save_users_json(account_id)
         return key
 
-    async def remove_user(self, account_id: str, user_id: str) -> None:
-        """Remove a user from an account."""
-        await self._legacy.remove_user(account_id, user_id)
+    async def begin_user_deletion(
+        self,
+        account_id: str,
+        user_id: str,
+        *,
+        task_id: str,
+        owner_account_id: str,
+        owner_user_id: str,
+    ) -> tuple[dict, bool]:
+        return await self._legacy.begin_user_deletion(
+            account_id,
+            user_id,
+            task_id=task_id,
+            owner_account_id=owner_account_id,
+            owner_user_id=owner_user_id,
+        )
 
-    async def regenerate_key(self, account_id: str, user_id: str) -> str:
+    async def replace_user_deletion_task(
+        self,
+        account_id: str,
+        user_id: str,
+        *,
+        expected_task_id: str,
+        task_id: str,
+        owner_account_id: str,
+        owner_user_id: str,
+    ) -> dict:
+        return await self._legacy.replace_user_deletion_task(
+            account_id,
+            user_id,
+            expected_task_id=expected_task_id,
+            task_id=task_id,
+            owner_account_id=owner_account_id,
+            owner_user_id=owner_user_id,
+        )
+
+    async def finish_user_deletion(self, account_id: str, user_id: str, task_id: str) -> bool:
+        return await self._legacy.finish_user_deletion(account_id, user_id, task_id)
+
+    def get_user_deletion(self, account_id: str, user_id: str) -> Optional[dict]:
+        return self._legacy.get_user_deletion(account_id, user_id)
+
+    def iter_user_deletions(self) -> list[tuple[str, str, dict]]:
+        return self._legacy.iter_user_deletions()
+
+    def is_user_deleting(self, account_id: str, user_id: str) -> bool:
+        return self._legacy.is_user_deleting(account_id, user_id)
+
+    async def regenerate_key(
+        self,
+        account_id: str,
+        user_id: str,
+        seed: Optional[str] = None,
+    ) -> str:
         """Regenerate a user's API key. Old key is immediately invalidated.
 
         Generates new format key regardless of original format.
@@ -313,6 +390,8 @@ class NewAPIKeyManager:
             from openviking_cli.exceptions import NotFoundError
 
             raise NotFoundError(user_id, "user")
+        if account.users[user_id].get("deletion"):
+            raise FailedPreconditionError("User deletion is in progress")
 
         old_user_info = account.users[user_id]
         old_key_or_hash = old_user_info.get("key", "")
@@ -333,7 +412,7 @@ class NewAPIKeyManager:
                 del self._legacy._prefix_index[old_key_prefix]
 
         # Generate new key in new format
-        new_key = generate_api_key(account_id, user_id)
+        new_key = generate_api_key(account_id, user_id, seed)
 
         if self._legacy._api_key_hashing_enabled:
             new_stored_key = self._legacy._hash_api_key(new_key)

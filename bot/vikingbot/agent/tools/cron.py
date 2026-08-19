@@ -1,14 +1,21 @@
 """Cron tool for scheduling reminders and tasks."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from openviking.utils.time_utils import parse_iso_datetime
 from vikingbot.agent.tools.base import Tool
 from vikingbot.cron.service import CronService
 from vikingbot.cron.types import CronSchedule
 
+if TYPE_CHECKING:
+    from vikingbot.agent.tools.base import ToolContext
+    from vikingbot.config.schema import SessionKey
+
 
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
+
+    DELIVERY_METADATA_KEYS = ("reply_to", "chat_type", "chat_mode", "root_id", "sender_id")
 
     def __init__(self, cron_service: CronService):
         self._cron = cron_service
@@ -64,7 +71,13 @@ class CronTool(Tool):
     ) -> str:
         if action == "add":
             return self._add_job(
-                name, message, every_seconds, cron_expr, at, tool_context.session_key
+                name,
+                message,
+                every_seconds,
+                cron_expr,
+                at,
+                tool_context.session_key,
+                self._delivery_metadata(getattr(tool_context, "channel_metadata", None)),
             )
         elif action == "list":
             return self._list_jobs()
@@ -80,6 +93,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         at: str | None,
         session_key: "SessionKey",
+        channel_metadata: dict[str, Any] | None = None,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -91,24 +105,38 @@ class CronTool(Tool):
         elif cron_expr:
             schedule = CronSchedule(kind="cron", expr=cron_expr)
         elif at:
-            from datetime import datetime
-
-            dt = datetime.fromisoformat(at)
+            try:
+                dt = parse_iso_datetime(at)
+            except ValueError as e:
+                return f"Error: invalid at datetime: {e}"
             at_ms = int(dt.timestamp() * 1000)
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
-        job = self._cron.add_job(
-            name=name,
-            schedule=schedule,
-            message=message,
-            deliver=True,
-            session_key=session_key,
-            delete_after_run=delete_after,
-        )
+        try:
+            job = self._cron.add_job(
+                name=name,
+                schedule=schedule,
+                message=message,
+                deliver=True,
+                session_key=session_key,
+                channel_metadata=channel_metadata,
+                delete_after_run=delete_after,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
         return f"Created job '{job.name}' (id: {job.id})"
+
+    def _delivery_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
+        if not metadata:
+            return {}
+        return {
+            key: metadata[key]
+            for key in self.DELIVERY_METADATA_KEYS
+            if isinstance(metadata.get(key), str) and metadata[key]
+        }
 
     def _list_jobs(self) -> str:
         jobs = self._cron.list_jobs()

@@ -9,19 +9,57 @@ import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.fs_service import FSService
+from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 
 class _FakeVikingFS:
-    def __init__(self, *, rm_error=None):
+    def __init__(self, *, rm_error=None, events=None):
         self.rm_calls = []
+        self.mv_calls = []
         self.rm_error = rm_error
+        self.events = events
 
     async def rm(self, uri, recursive=False, ctx=None):
         self.rm_calls.append({"uri": uri, "recursive": recursive, "ctx": ctx})
         if self.rm_error:
             raise self.rm_error
         return {"estimated_deleted_count": 3}
+
+    async def mv(self, from_uri, to_uri, ctx=None):
+        self.mv_calls.append({"from_uri": from_uri, "to_uri": to_uri, "ctx": ctx})
+        if self.events is not None:
+            self.events.append(("mv", from_uri, to_uri))
+
+
+class _FakeWatchManager:
+    def __init__(self, *, events=None):
+        self.validate_calls = []
+        self.rewrite_calls = []
+        self.deactivate_calls = []
+        self.validate_error = None
+        self.events = events
+
+    async def validate_target_prefix_rewrite_internal(self, from_uri, to_uri, account_id):
+        self.validate_calls.append(
+            {"from_uri": from_uri, "to_uri": to_uri, "account_id": account_id}
+        )
+        if self.events is not None:
+            self.events.append(("validate", from_uri, to_uri))
+        if self.validate_error:
+            raise self.validate_error
+
+    async def rewrite_target_prefix_internal(self, from_uri, to_uri, account_id):
+        self.rewrite_calls.append(
+            {"from_uri": from_uri, "to_uri": to_uri, "account_id": account_id}
+        )
+        if self.events is not None:
+            self.events.append(("rewrite", from_uri, to_uri))
+        return [SimpleNamespace(task_id="watch-1")]
+
+    async def deactivate_tasks_under_uri_internal(self, uri, account_id):
+        self.deactivate_calls.append({"uri": uri, "account_id": account_id})
+        return [SimpleNamespace(task_id="watch-1")]
 
 
 class _FakeResourceMemoryLinkService:
@@ -34,6 +72,11 @@ class _FakeResourceMemoryLinkService:
         return self.result
 
 
+class _FakeWatchScheduler:
+    def __init__(self, watch_manager):
+        self.watch_manager = watch_manager
+
+
 class _FakeWaitTracker:
     def __init__(self):
         self.registered_requests = []
@@ -44,11 +87,11 @@ class _FakeWaitTracker:
     def register_request(self, telemetry_id):
         self.registered_requests.append(telemetry_id)
 
-    def register_semantic_root(self, telemetry_id, semantic_msg_id):
+    def register_semantic_root(self, telemetry_id, root_id):
         self.registered_roots.append(
             {
                 "telemetry_id": telemetry_id,
-                "semantic_msg_id": semantic_msg_id,
+                "root_id": root_id,
                 "request_was_registered": telemetry_id in self.registered_requests,
             }
         )
@@ -62,7 +105,7 @@ class _FakeWaitTracker:
             "Embedding": {"processed": 0, "error_count": 0, "errors": []},
         }
 
-    def mark_semantic_failed(self, telemetry_id, semantic_msg_id, message):
+    def mark_semantic_failed(self, telemetry_id, root_id, message):
         pass
 
     def cleanup(self, telemetry_id):
@@ -90,6 +133,120 @@ def request_context():
         user=UserIdentifier("default", "ryoma"),
         role=Role.USER,
     )
+
+
+@pytest.mark.asyncio
+async def test_read_visible_strips_memory_metadata_before_slicing(request_context):
+    raw = 'line one\nline two\n\n<!-- MEMORY_FIELDS\n{"secret":"hidden"}\n-->'
+    viking_fs = SimpleNamespace(read_file=AsyncMock(return_value=raw))
+    service = FSService(viking_fs=viking_fs)
+    uri = "viking://user/ryoma/memories/notes/private.md"
+
+    assert await service.read_visible(uri, ctx=request_context, offset=3, limit=1) == ""
+    viking_fs.read_file.assert_awaited_once_with(uri, ctx=request_context)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'visible\n<!-- MEMORY_FIELDS\n{"secret":"hidden"}\n-->',
+        'visible\n\n<!-- MEMORY_FIELDS {"secret":"hidden"} -->',
+        'visible <!-- MEMORY_FIELDS {"secret":"hidden"} -->',
+    ],
+)
+@pytest.mark.asyncio
+async def test_read_visible_strips_supported_memory_metadata_trailers(
+    request_context,
+    raw,
+):
+    uri = "viking://user/ryoma/memories/notes/private.md"
+    service = FSService(
+        viking_fs=SimpleNamespace(read_file=AsyncMock(return_value=raw)),
+    )
+
+    assert await service.read_visible(uri, ctx=request_context) == "visible"
+
+
+@pytest.mark.asyncio
+async def test_read_visible_preserves_non_memory_content(request_context):
+    raw = 'visible\n<!-- MEMORY_FIELDS {"example":true} -->'
+    viking_fs = SimpleNamespace(read_file=AsyncMock(return_value=raw))
+    service = FSService(viking_fs=viking_fs)
+
+    assert (
+        await service.read_visible(
+            "viking://resources/example.md",
+            ctx=request_context,
+            offset=1,
+            limit=1,
+        )
+        == '<!-- MEMORY_FIELDS {"example":true} -->'
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_for_tool_returns_not_found_message(request_context):
+    uri = "viking://resources/missing.md"
+    viking_fs = SimpleNamespace(stat=AsyncMock(side_effect=NotFoundError(uri)))
+    service = FSService(viking_fs=viking_fs)
+
+    result = await service.read_for_tool(uri, ctx=request_context, display_uri="viking://alias.md")
+
+    assert result == "(not found at viking://alias.md)"
+
+
+@pytest.mark.asyncio
+async def test_read_for_tool_returns_directory_hint(request_context):
+    viking_fs = SimpleNamespace(
+        stat=AsyncMock(return_value={"isDir": True}),
+        read_file=AsyncMock(),
+    )
+    service = FSService(viking_fs=viking_fs)
+
+    result = await service.read_for_tool("viking://resources/docs", ctx=request_context)
+
+    assert "Directory URI is not readable as a file" in result
+    assert "Use the list tool" in result
+    viking_fs.read_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_read_for_tool_returns_empty_file_message(request_context):
+    uri = "viking://resources/empty.md"
+    viking_fs = SimpleNamespace(
+        stat=AsyncMock(return_value={"isDir": False}),
+        read_file=AsyncMock(return_value=""),
+    )
+    service = FSService(viking_fs=viking_fs)
+
+    result = await service.read_for_tool(uri, ctx=request_context)
+
+    assert result == f"(empty file at {uri})"
+
+
+@pytest.mark.asyncio
+async def test_grep_projects_memory_content_but_keeps_resource_fast_path(request_context):
+    viking_fs = SimpleNamespace(grep=AsyncMock(return_value={"matches": []}))
+    service = FSService(viking_fs=viking_fs)
+
+    await service.grep(
+        "viking://user/ryoma/memories",
+        "secret",
+        ctx=request_context,
+    )
+    memory_kwargs = viking_fs.grep.await_args.kwargs
+    transform = memory_kwargs["content_transform"]
+    assert (
+        transform(
+            'visible\n<!-- MEMORY_FIELDS {"secret":"hidden"} -->',
+            "viking://user/ryoma/memories/private.md",
+        )
+        == "visible"
+    )
+
+    viking_fs.grep.reset_mock()
+    await service.grep("viking://resources", "secret", ctx=request_context)
+    assert "content_transform" not in viking_fs.grep.await_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -164,6 +321,131 @@ async def test_resource_rm_without_wait_only_queues_refresh(request_context):
 
 
 @pytest.mark.asyncio
+async def test_resource_scope_rm_does_not_refresh_global_root(request_context):
+    service = FSService(viking_fs=_FakeVikingFS())
+    service._enqueue_delete_refresh = AsyncMock()
+    service._wait_for_refresh = AsyncMock()
+
+    result = await service.rm(
+        "viking://resources",
+        ctx=request_context,
+        recursive=True,
+        wait=True,
+    )
+
+    service._enqueue_delete_refresh.assert_not_awaited()
+    service._wait_for_refresh.assert_not_awaited()
+    assert "semantic_root_uri" not in result
+
+
+@pytest.mark.asyncio
+async def test_resource_rm_deactivates_watch_tasks(request_context):
+    viking_fs = _FakeVikingFS()
+    watch_manager = _FakeWatchManager()
+    service = FSService(
+        viking_fs=viking_fs,
+        watch_scheduler=_FakeWatchScheduler(watch_manager),
+    )
+    service._enqueue_delete_refresh = AsyncMock()
+
+    await service.rm("viking://resources/codeask/wiki", ctx=request_context, recursive=True)
+
+    assert watch_manager.deactivate_calls == [
+        {"uri": "viking://resources/codeask/wiki", "account_id": "default"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resource_rm_does_not_deactivate_watch_task_control_uri(request_context):
+    viking_fs = _FakeVikingFS()
+    watch_manager = _FakeWatchManager()
+    service = FSService(
+        viking_fs=viking_fs,
+        watch_scheduler=_FakeWatchScheduler(watch_manager),
+    )
+
+    await service.rm("viking://resources/.watch_tasks.json", ctx=request_context)
+
+    assert watch_manager.deactivate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resource_mv_validates_then_moves_then_rewrites_watch_tasks(request_context):
+    events = []
+    viking_fs = _FakeVikingFS(events=events)
+    watch_manager = _FakeWatchManager(events=events)
+    service = FSService(
+        viking_fs=viking_fs,
+        watch_scheduler=_FakeWatchScheduler(watch_manager),
+    )
+
+    await service.mv(
+        "viking://resources/codeask/wiki",
+        "viking://resources/codeask/wiki-renamed",
+        ctx=request_context,
+    )
+
+    expected_watch_call = [
+        {
+            "from_uri": "viking://resources/codeask/wiki",
+            "to_uri": "viking://resources/codeask/wiki-renamed",
+            "account_id": "default",
+        }
+    ]
+    assert watch_manager.validate_calls == expected_watch_call
+    assert watch_manager.rewrite_calls == expected_watch_call
+    assert viking_fs.mv_calls == [
+        {
+            "from_uri": "viking://resources/codeask/wiki",
+            "to_uri": "viking://resources/codeask/wiki-renamed",
+            "ctx": request_context,
+        }
+    ]
+    assert [event[0] for event in events] == ["validate", "mv", "rewrite"]
+
+
+@pytest.mark.asyncio
+async def test_resource_mv_conflict_fails_before_resource_move(request_context):
+    viking_fs = _FakeVikingFS()
+    watch_manager = _FakeWatchManager()
+    watch_manager.validate_error = RuntimeError("watch conflict")
+    service = FSService(
+        viking_fs=viking_fs,
+        watch_scheduler=_FakeWatchScheduler(watch_manager),
+    )
+
+    with pytest.raises(RuntimeError, match="watch conflict"):
+        await service.mv(
+            "viking://resources/codeask/wiki",
+            "viking://resources/codeask/wiki-renamed",
+            ctx=request_context,
+        )
+
+    assert viking_fs.mv_calls == []
+    assert watch_manager.rewrite_calls == []
+
+
+@pytest.mark.asyncio
+async def test_resource_mv_without_watch_scheduler_moves_resource_directly(request_context):
+    viking_fs = _FakeVikingFS()
+    service = FSService(viking_fs=viking_fs)
+
+    await service.mv(
+        "viking://resources/codeask/wiki",
+        "viking://resources/codeask/wiki-renamed",
+        ctx=request_context,
+    )
+
+    assert viking_fs.mv_calls == [
+        {
+            "from_uri": "viking://resources/codeask/wiki",
+            "to_uri": "viking://resources/codeask/wiki-renamed",
+            "ctx": request_context,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resource_rm_wait_registers_request_before_semantic_root(
     request_context,
     monkeypatch,
@@ -197,6 +479,7 @@ async def test_resource_rm_wait_registers_request_before_semantic_root(
     assert tracker.registered_requests == ["tm-fs-rm"]
     assert tracker.registered_roots
     assert tracker.registered_roots[0]["request_was_registered"] is True
+    assert queue_manager.messages[0].recursive is False
     assert tracker.wait_calls == [("tm-fs-rm", 3)]
     assert tracker.cleaned == ["tm-fs-rm"]
     assert result["semantic_status"] == "complete"

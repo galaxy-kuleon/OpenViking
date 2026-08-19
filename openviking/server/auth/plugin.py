@@ -5,13 +5,11 @@
 from __future__ import annotations
 
 import abc
-import sys
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from fastapi import Request
 
 from openviking.server.identity import ResolvedIdentity
-from openviking_cli.exceptions import UnauthenticatedError
 
 if TYPE_CHECKING:
     from openviking.server.config import ServerConfig
@@ -114,6 +112,10 @@ class AuthPlugin(abc.ABC):
             True if ``api_key_manager`` must be present for admin routes.
         """
         return True
+
+    async def shutdown(self) -> None:
+        """Release resources acquired during ``initialize`` (default no-op; override to cancel)."""
+        pass
 
     def can_skip_api_key_for_bot_proxy(self) -> bool:
         """Whether the bot proxy may skip API key validation.

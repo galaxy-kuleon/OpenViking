@@ -404,14 +404,14 @@ export function extractNewTurnMessages(
           : undefined);
       if (output) {
         result.push({
-          role: "user",
+          role: "assistant",
           parts: [{
             type: "tool",
             toolCallId: toolCallId || undefined,
             toolName,
             toolInput,
             toolOutput: output,
-            toolStatus: "completed",
+            toolStatus: msg.isError === true ? "error" : "completed",
           }],
         });
       }

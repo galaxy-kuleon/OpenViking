@@ -15,13 +15,15 @@ from openviking.storage.vectordb.collection.volcengine_collection import (
     get_or_create_volcengine_collection,
 )
 
-from .base import CollectionAdapter
+from .base import VIKINGDB_TEXT_FIELD_BYTE_LIMIT, CollectionAdapter
 
 
 class VolcengineCollectionAdapter(CollectionAdapter):
     """Adapter for Volcengine-hosted VikingDB."""
 
     _DATA_BATCH_SIZE = 100
+    _TEXT_FIELD_BYTE_LIMIT = VIKINGDB_TEXT_FIELD_BYTE_LIMIT
+    USE_CONTENT_FIELD = True
 
     def __init__(
         self,
