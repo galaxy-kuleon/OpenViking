@@ -89,6 +89,12 @@ def test_profile_memory_template_keeps_profile_minimal_and_migrates_preferences(
     assert "Do not keep concrete preference examples" in text
     assert "patch" in text
     assert "rewrite the whole profile" in text
+    assert "signed-in account holder" in text
+    assert "pasted or uploaded source material" in text
+    assert "explicit first-person self-disclosure" in text
+    assert "do not create or edit profile.md" in text
+    assert "client, counterparty, case party" in text
+    assert "Keep the existing heading" in text
 
 
 def test_preferences_memory_template_limits_topics_and_splits_when_too_large():
