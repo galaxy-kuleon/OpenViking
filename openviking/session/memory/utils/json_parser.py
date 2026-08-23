@@ -428,8 +428,19 @@ def parse_json_with_stability(
     if not isinstance(parsed_data, dict):
         return None, f"Expected dict after parsing, got {parsed_data}"
 
-    # Filter to only expected fields if provided
+    # Filter to only expected fields if provided.  A non-empty object with no
+    # contract fields is not an empty result: small models sometimes echo the
+    # JSON Schema itself (``$defs``, ``properties``, ``title``, ``type``).
+    # Silently filtering that echo to {} turns an extraction failure into a
+    # false successful "zero memories" result.
     if expected_fields:
+        matching_fields = set(parsed_data).intersection(expected_fields)
+        if parsed_data and not matching_fields:
+            unexpected_fields = sorted(str(key) for key in parsed_data)[:8]
+            return None, (
+                "Parsed JSON contains none of the expected fields; "
+                f"unexpected top-level fields={unexpected_fields}"
+            )
         filtered_data = {}
         for k, v in parsed_data.items():
             if k in expected_fields:

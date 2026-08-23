@@ -4,6 +4,7 @@
 Tests for memory ExtractLoop orchestrator.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -159,6 +160,18 @@ class TestAllowedDirectoriesList:
 
 
 class TestExtractLoopFinalJsonRetry:
+    @pytest.fixture(autouse=True)
+    def _memory_config(self, monkeypatch):
+        config = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
+        monkeypatch.setattr(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            lambda: config,
+        )
+        monkeypatch.setattr(
+            "openviking_cli.utils.config.get_openviking_config",
+            lambda: config,
+        )
+
     @pytest.mark.asyncio
     async def test_structured_parser_preserves_delete_ids(self):
         class FakeContextProvider:
@@ -339,9 +352,8 @@ class TestExtractLoopFinalJsonRetry:
             max_iterations=1,
         )
 
-        result, _ = await extract_loop.run()
-        assert result.errors
-        assert "Final response could not be parsed" in result.errors[0]
+        with pytest.raises(RuntimeError, match="could not be parsed as JSON memory operations"):
+            await extract_loop.run()
 
         final_prompts = [
             message["content"]
@@ -353,3 +365,68 @@ class TestExtractLoopFinalJsonRetry:
         assert final_prompts
         assert '"delete_ids": []' in final_prompts[-1]
         assert '"preferences": []' in final_prompts[-1]
+
+    @pytest.mark.asyncio
+    async def test_schema_echo_is_retried_and_cannot_become_empty_success(self):
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def get_completion_async(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return '{"$defs": {}, "properties": {}, "title": "StructuredMemoryOperations", "type": "object"}'
+                return '{"preferences": [], "delete_ids": []}'
+
+        class FakeContextProvider:
+            read_file_contents = {}
+
+            def get_memory_schemas(self, ctx):
+                return [
+                    MemoryTypeSchema(
+                        memory_type="preferences",
+                        description="Preferences",
+                        directory="viking://user/{user_space}/memories/preferences",
+                        filename_template="{topic}.md",
+                        fields=[],
+                    )
+                ]
+
+            def get_tools(self):
+                return []
+
+            def get_extract_context(self):
+                return MagicMock()
+
+            def get_output_language(self):
+                return "en"
+
+            def instruction(self):
+                return "Extract memory operations."
+
+            async def prefetch(self):
+                return []
+
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=FakeContextProvider(),
+            max_iterations=1,
+        )
+        resolved = ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[],
+            errors=[],
+        )
+        extract_loop.resolve_operations = AsyncMock(return_value=(resolved, []))
+        extract_loop._check_unread_existing_files = AsyncMock(return_value={})
+        extract_loop._validate_patch_operations = AsyncMock(return_value=[])
+        extract_loop.finalize_operations = AsyncMock()
+
+        result, _ = await extract_loop.run()
+
+        assert result == resolved
+        assert vlm.calls == 2

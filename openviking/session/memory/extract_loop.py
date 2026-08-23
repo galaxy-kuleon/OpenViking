@@ -200,6 +200,10 @@ class ExtractLoop:
 
         # Build initial messages from provider
         schema_str = json.dumps(json_schema, ensure_ascii=False)
+        instance_skeleton = json.dumps(
+            {field: [] for field in self._expected_fields},
+            ensure_ascii=False,
+        )
         messages = []
         page_id_rules = """
 ## Page ID Rules
@@ -229,7 +233,13 @@ class ExtractLoop:
 - Read content is returned in Claude Code format: each visible line is prefixed with `line_number<TAB>`.
 - When you copy text from read results into SEARCH/REPLACE operations, copy the exact text after the line-number prefix. Never include the line-number prefix itself in `search` or `replace`.
 ## Output Format
-The final output of the model must strictly follow the JSON Schema format shown below:
+Return a JSON INSTANCE that validates against the contract below.
+- The top-level keys in your answer are memory operation fields only.
+- NEVER copy the schema definition itself into your answer.
+- Schema-definition keys such as `$defs`, `properties`, `title`, and `type` are forbidden at the top level.
+- If there are no changes, return this empty instance shape: `{instance_skeleton}`
+
+Contract definition (read it; do not copy it):
 ```json
 {schema_str}
 ```
@@ -328,24 +338,20 @@ The final output of the model must strictly follow the JSON Schema format shown 
                 tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
                 self._add_format_error_message(messages)
 
-            # If it's the last iteration, treat unparseable response as
-            # "no memory operations" rather than failing hard.
+            # An unparseable response is not evidence that there are no memory
+            # operations. Fail so the session commit remains retryable instead
+            # of permanently marking the archived messages as extracted.
             if iteration >= max_iterations:
-                tracer.info(
+                tracer.error(
                     "Memory extraction final response could not be parsed as JSON operations "
-                    f"after {max_iterations} iterations — treating as no operations "
+                    f"after {max_iterations} iterations — failing extraction "
                     f"failure_kind={failure_kind} response_preview={failure_preview!r}"
                 )
-                final_operations = ResolvedOperations(
-                    upsert_operations=[],
-                    delete_file_contents=[],
-                    errors=[
-                        "Final response could not be parsed as JSON operations "
-                        f"after {max_iterations} iterations "
-                        f"(failure_kind={failure_kind})"
-                    ],
+                raise RuntimeError(
+                    "Final response could not be parsed as JSON memory operations "
+                    f"after {max_iterations} iterations "
+                    f"(failure_kind={failure_kind}, response_preview={failure_preview!r})"
                 )
-                break
 
             self._disable_tools_for_iteration = True
             continue
