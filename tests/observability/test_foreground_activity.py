@@ -2,8 +2,11 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 
+from openviking.server.routers.system import health_check
 from openviking.storage.observers.queue_observer import QueueObserver
+from openviking.service.debug_service import ObserverService
 from openviking.utils.foreground_activity import activity_snapshot, foreground_is_active
 
 
@@ -72,3 +75,100 @@ async def test_queue_snapshot_names_current_and_pending_stages(tmp_path, monkeyp
     assert snapshot["totals"]["pending"] == 3
     assert snapshot["totals"]["in_progress"] == 2
     assert snapshot["foreground_activity"]["background_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_observer_service_workload_snapshot_keeps_structured_observers(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KG_USER_ACTIVITY_DIR", str(tmp_path))
+
+    class QueueManager:
+        SEMANTIC = "Semantic"
+        _queues = {}
+
+        async def check_status(self):
+            return {}
+
+    monkeypatch.setattr(
+        "openviking.service.debug_service.get_queue_manager",
+        lambda: QueueManager(),
+    )
+
+    snapshot = await ObserverService().workload_snapshot()
+
+    assert snapshot["queue"]["totals"]["pending"] == 0
+    assert snapshot["queue"]["foreground_activity"]["active"] is False
+    assert snapshot["models"] == {"vlm": [], "embedding": [], "rerank": []}
+    assert "total_queries" in snapshot["retrieval"]
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_reports_structured_workload(monkeypatch):
+    workload = {
+        "queue": {
+            "totals": {"pending": 0, "in_progress": 0},
+            "foreground_activity": {"active": False},
+        },
+        "models": {},
+        "retrieval": {},
+    }
+
+    class Observer:
+        async def workload_snapshot(self):
+            return workload
+
+    service = SimpleNamespace(
+        _initialized=True,
+        debug=SimpleNamespace(observer=Observer()),
+    )
+    monkeypatch.setattr(
+        "openviking.server.routers.system.get_service", lambda: service
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/health",
+            "headers": [],
+            "app": SimpleNamespace(state=SimpleNamespace(config=None)),
+        }
+    )
+
+    body = await health_check(request)
+
+    assert body["workload"] == workload
+    assert body["idle"] is True
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_exposes_workload_observer_failure(monkeypatch):
+    class Observer:
+        async def workload_snapshot(self):
+            raise RuntimeError("queue telemetry unavailable")
+
+    service = SimpleNamespace(
+        _initialized=True,
+        debug=SimpleNamespace(observer=Observer()),
+    )
+    monkeypatch.setattr(
+        "openviking.server.routers.system.get_service", lambda: service
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/health",
+            "headers": [],
+            "app": SimpleNamespace(state=SimpleNamespace(config=None)),
+        }
+    )
+
+    body = await health_check(request)
+
+    assert body["workload"] == {
+        "status": "error",
+        "error_type": "RuntimeError",
+        "error": "queue telemetry unavailable",
+    }
+    assert "idle" not in body

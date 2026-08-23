@@ -109,6 +109,44 @@ class ObserverService:
             status=observer.get_status_table(),
         )
 
+    async def workload_snapshot(self) -> dict:
+        """Return structured workload telemetry without losing observer types.
+
+        The human-readable ``queue``, ``models``, and ``retrieval`` properties
+        intentionally return ``ComponentStatus``. Health telemetry needs the
+        underlying observers instead, otherwise their structured snapshot
+        methods are unavailable.
+        """
+        queue = QueueObserver(get_queue_manager())
+        models = self._models_observer()
+        retrieval = RetrievalObserver()
+        return {
+            "queue": await queue.snapshot_async(),
+            "models": models.usage_snapshot(),
+            "retrieval": retrieval.snapshot(),
+        }
+
+    def _models_observer(self) -> ModelsObserver:
+        """Build the configured model observer shared by status and telemetry."""
+        if self._config is None:
+            return ModelsObserver()
+
+        vlm_instance = self._config.vlm.get_vlm_instance()
+        embedding_instance = None
+        rerank_instance = None
+        if self._config.embedding:
+            embedding_instance = self._config.embedding.get_embedder()
+        if self._config.rerank and self._config.rerank.is_available():
+            from openviking.models.rerank import RerankClient
+
+            rerank_instance = RerankClient.from_config(self._config.rerank)
+
+        return ModelsObserver(
+            vlm_instance=vlm_instance,
+            embedding_instance=embedding_instance,
+            rerank_instance=rerank_instance,
+        )
+
     def vikingdb(self, ctx: Optional[RequestContext] = None) -> ComponentStatus:
         """Get VikingDB status."""
         if self._vikingdb is None:
@@ -137,25 +175,7 @@ class ObserverService:
                 status="Not initialized",
             )
 
-        vlm_instance = self._config.vlm.get_vlm_instance()
-        embedding_instance = None
-        rerank_instance = None
-
-        # Get embedding instance if available
-        if self._config.embedding:
-            embedding_instance = self._config.embedding.get_embedder()
-
-        # Get rerank instance if available
-        if self._config.rerank and self._config.rerank.is_available():
-            from openviking.models.rerank import RerankClient
-
-            rerank_instance = RerankClient.from_config(self._config.rerank)
-
-        observer = ModelsObserver(
-            vlm_instance=vlm_instance,
-            embedding_instance=embedding_instance,
-            rerank_instance=rerank_instance,
-        )
+        observer = self._models_observer()
         return ComponentStatus(
             name="models",
             is_healthy=observer.is_healthy(),

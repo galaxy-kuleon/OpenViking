@@ -84,12 +84,7 @@ async def health_check(request: Request):
         try:
             service = get_service()
             if getattr(service, "_initialized", False):
-                queue = service.debug.observer.queue
-                result["workload"] = {
-                    "queue": await queue.snapshot_async(),
-                    "models": service.debug.observer.models.usage_snapshot(),
-                    "retrieval": service.debug.observer.retrieval.snapshot(),
-                }
+                result["workload"] = await service.debug.observer.workload_snapshot()
                 queue_snapshot = result["workload"]["queue"]
                 totals = queue_snapshot["totals"]
                 foreground_active = queue_snapshot["foreground_activity"]["active"]
@@ -100,7 +95,12 @@ async def health_check(request: Request):
                 )
         except Exception as e:
             # Workload observability is additive. A diagnostic failure must not
-            # suppress auth identity or turn the liveness endpoint into a lie.
+            # suppress auth identity or liveness, but it must remain visible.
+            result["workload"] = {
+                "status": "error",
+                "error_type": type(e).__name__,
+                "error": str(e),
+            }
             logger.error(f"Failed to get workload health: {e}")
 
         # Resolve identity when API key is provided
