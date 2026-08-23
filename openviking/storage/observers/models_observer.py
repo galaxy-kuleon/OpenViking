@@ -48,6 +48,21 @@ class ModelsObserver(BaseObserver):
         """
         return self._format_status_as_table()
 
+    def usage_snapshot(self) -> dict:
+        """Return structured model call/token counters for health payloads."""
+        result = {}
+        for name, getter in (
+            ("vlm", self._get_vlm_usage),
+            ("embedding", self._get_embedding_usage),
+            ("rerank", self._get_rerank_usage),
+        ):
+            try:
+                rows = getter()
+            except Exception:
+                rows = None
+            result[name] = rows or []
+        return result
+
     def _format_status_as_table(self) -> str:
         """
         Format token usage status as a table using tabulate.

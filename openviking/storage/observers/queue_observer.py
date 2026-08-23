@@ -32,6 +32,45 @@ class QueueObserver(BaseObserver):
         dag_stats = self._get_semantic_dag_stats()
         return self._format_status_as_table(statuses, dag_stats)
 
+    async def snapshot_async(self) -> dict:
+        """Return structured queue counters plus foreground eligibility."""
+        statuses = await self._queue_manager.check_status()
+        queues = {
+            name: {
+                "pending": status.pending,
+                "in_progress": status.in_progress,
+                "processed": status.processed,
+                "requeued": status.requeue_count,
+                "errors": status.error_count,
+            }
+            for name, status in statuses.items()
+        }
+        dag = self._get_semantic_dag_stats()
+        queues["semantic_nodes"] = {
+            "pending": getattr(dag, "pending_nodes", 0) if dag else 0,
+            "in_progress": getattr(dag, "in_progress_nodes", 0) if dag else 0,
+            "processed": getattr(dag, "done_nodes", 0) if dag else 0,
+            "requeued": 0,
+            "errors": 0,
+        }
+        totals = {
+            key: sum(int(row.get(key, 0)) for row in queues.values())
+            for key in ("pending", "in_progress", "processed", "requeued", "errors")
+        }
+        from openviking.utils.foreground_activity import activity_snapshot
+
+        return {
+            "queues": queues,
+            "totals": totals,
+            "active_stages": [
+                name for name, row in queues.items() if row["in_progress"] > 0
+            ],
+            "pending_stages": [
+                name for name, row in queues.items() if row["pending"] > 0
+            ],
+            "foreground_activity": activity_snapshot(),
+        }
+
     def get_status_table(self) -> str:
         return run_async(self.get_status_table_async())
 

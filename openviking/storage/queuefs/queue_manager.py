@@ -230,8 +230,19 @@ class QueueManager:
             else:
                 while not stop_event.is_set():
                     try:
+                        from openviking.utils.foreground_activity import (
+                            foreground_is_active,
+                        )
+
+                        if foreground_is_active():
+                            stop_event.wait(poll_interval)
+                            continue
                         queue_size = loop.run_until_complete(queue.size())
-                        if queue.has_dequeue_handler() and queue_size > 0:
+                        if (
+                            queue.has_dequeue_handler()
+                            and queue_size > 0
+                            and not foreground_is_active()
+                        ):
                             data = loop.run_until_complete(queue.dequeue())
                             if data is not None:
                                 logger.debug("[QueueManager] Dequeued message from %s", queue.name)
@@ -278,8 +289,18 @@ class QueueManager:
             # Prune completed tasks
             active_tasks = {t for t in active_tasks if not t.done()}
 
+            from openviking.utils.foreground_activity import foreground_is_active
+
+            if foreground_is_active():
+                await asyncio.sleep(poll_interval)
+                continue
+
             # While capacity remains, keep draining the queue
             while len(active_tasks) < max_concurrent:
+                # Re-check for each item: a user request may start after the
+                # outer-loop check while this worker is filling capacity.
+                if foreground_is_active():
+                    break
                 try:
                     queue_size = await queue.size()
                 except Exception:

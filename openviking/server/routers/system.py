@@ -81,6 +81,28 @@ async def health_check(request: Request):
             effective_auth_mode = config.get_effective_auth_mode()
         result["auth_mode"] = effective_auth_mode
 
+        try:
+            service = get_service()
+            if getattr(service, "_initialized", False):
+                queue = service.debug.observer.queue
+                result["workload"] = {
+                    "queue": await queue.snapshot_async(),
+                    "models": service.debug.observer.models.usage_snapshot(),
+                    "retrieval": service.debug.observer.retrieval.snapshot(),
+                }
+                queue_snapshot = result["workload"]["queue"]
+                totals = queue_snapshot["totals"]
+                foreground_active = queue_snapshot["foreground_activity"]["active"]
+                result["idle"] = not (
+                    foreground_active
+                    or totals.get("pending", 0)
+                    or totals.get("in_progress", 0)
+                )
+        except Exception as e:
+            # Workload observability is additive. A diagnostic failure must not
+            # suppress auth identity or turn the liveness endpoint into a lie.
+            logger.error(f"Failed to get workload health: {e}")
+
         # Resolve identity when API key is provided
         x_api_key = request.headers.get("X-API-Key")
         authorization = request.headers.get("Authorization")
