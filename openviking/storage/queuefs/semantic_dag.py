@@ -16,6 +16,7 @@ from openviking.service.task_work_index import bind_task_context, get_task_conte
 from openviking.storage.queuefs.semantic_sidecar import write_semantic_sidecars
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import bind_telemetry, get_current_telemetry
+from openviking.utils.foreground_activity import wait_for_background_eligibility
 from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.logger import get_logger
@@ -107,6 +108,11 @@ class SemanticNodeScheduler:
                     return
                 continue
 
+            # A semantic message may contain many independently schedulable
+            # nodes.  The outer queue lease check alone cannot stop an already
+            # dequeued DAG from repeatedly taking the single local model lane.
+            # Finish the current node, then yield before starting the next one.
+            await wait_for_background_eligibility()
             item.executor._start_scheduled_work()
             try:
                 if not item.executor.closed:

@@ -319,6 +319,31 @@ async def test_task_work_rejection_does_not_stop_shared_semantic_worker():
 
 
 @pytest.mark.asyncio
+async def test_semantic_node_waits_for_foreground_lease_between_units(monkeypatch):
+    release = asyncio.Event()
+    ran = asyncio.Event()
+
+    async def wait_for_background_eligibility():
+        await release.wait()
+
+    async def work():
+        ran.set()
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.wait_for_background_eligibility",
+        wait_for_background_eligibility,
+    )
+    scheduler = SemanticNodeScheduler(max_workers=1)
+    scheduler.submit(_ScheduledExecutor(work), DagWork(kind="file", dir_uri="a"))
+
+    await asyncio.sleep(0.02)
+    assert not ran.is_set()
+    release.set()
+    await asyncio.wait_for(ran.wait(), timeout=0.5)
+    await asyncio.wait_for(scheduler._queue.join(), timeout=0.5)
+
+
+@pytest.mark.asyncio
 async def test_semantic_dag_skip_vectorization_does_not_schedule_tasks(monkeypatch):
     root_uri = "viking://resources/root"
     tree = {
