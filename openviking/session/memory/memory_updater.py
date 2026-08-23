@@ -49,6 +49,25 @@ from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
 
+_SEMANTIC_NOOP_IGNORED_FIELDS = frozenset(
+    {"version", "last_update_trace_id", "source_extraction_id"}
+)
+
+
+def _semantic_memory_state(memory_file: MemoryFile) -> dict:
+    """Return user-meaningful state, excluding write bookkeeping."""
+    return {
+        "content": memory_file.plain_content(),
+        "links": memory_file.links,
+        "backlinks": memory_file.backlinks,
+        "memory_type": memory_file.memory_type,
+        "fields": {
+            key: value
+            for key, value in memory_file.extra_fields.items()
+            if key not in _SEMANTIC_NOOP_IGNORED_FIELDS
+        },
+    }
+
 _MEMORY_ABSTRACT_MAX_BYTES = 50_000
 _EXTRACTION_CHUNK_MIN_CHARS = 100
 _EXTRACTION_CHUNK_BOUNDARY_RE = re.compile(r"(\n+|[。！？；!?;]+|(?<!\d)\.(?!\d))")
@@ -888,18 +907,26 @@ class MemoryUpdater:
         # Apply unified operations - _apply_edit returns True if edited, False if written
         for resolved_op in applicable_upserts:
             try:
-                await self._apply_upsert(
+                changed_uris = await self._apply_upsert(
                     resolved_op,
                     ctx,
                     extract_context=extract_context,
                     lease_ref=self._transaction_handle,
                 )
+                # None preserves compatibility with injected/legacy upsert
+                # implementations; the native implementation returns the
+                # exact set whose semantic bytes changed.
+                effective_uris = (
+                    resolved_op.uris
+                    if changed_uris is None or isinstance(changed_uris, bool)
+                    else changed_uris
+                )
                 # Add all uris to result (uris is List[str])
                 if resolved_op.is_edit():
-                    for uri in resolved_op.uris:
+                    for uri in effective_uris:
                         result.add_edited(uri)
                 else:
-                    for uri in resolved_op.uris:
+                    for uri in effective_uris:
                         result.add_written(uri)
             except Exception as e:
                 tracer.error(
@@ -989,10 +1016,9 @@ class MemoryUpdater:
         # Collect directories that need overview generation
         # uri is now a string, so extract directory using os.path
         dirs = {}
-        for operation in operations.upsert_operations:
-            for uri_str in operation.uris:
-                dir_path = "/".join(uri_str.split("/")[:-1])
-                dirs[dir_path] = operation.memory_type
+        for uri_str in result.written_uris + result.edited_uris:
+            dir_path = "/".join(uri_str.split("/")[:-1])
+            dirs[dir_path] = uri_memory_type_map.get(uri_str, "unknown")
         for file_content in operations.delete_file_contents:
             dir_path = "/".join(file_content.uri.split("/")[:-1])
             dirs[dir_path] = (
@@ -1057,6 +1083,7 @@ class MemoryUpdater:
 
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
+        changed_uris: set[str] = set()
         # Process each URI independently
         for uri in resolved_op.uris:
             # Always read from disk first to get the latest content,
@@ -1118,6 +1145,7 @@ class MemoryUpdater:
                     if key not in schema_field_names and key not in metadata and val is not None:
                         metadata[key] = val
 
+            metadata["memory_type"] = memory_type
             metadata["version"] = next_memory_version(old_content)
 
             # Handle links/backlinks fields: merge with existing
@@ -1157,6 +1185,13 @@ class MemoryUpdater:
                     metadata["backlinks"] = existing_backlinks
 
             mf = MemoryFile.from_parsed(uri=uri, parsed=metadata)
+            if old_content is not None and _semantic_memory_state(
+                old_content
+            ) == _semantic_memory_state(mf):
+                tracer.info(
+                    f"[memory_updater] semantic no-op skipped before write/vectorize: uri={uri}"
+                )
+                continue
             new_full_content = MemoryFileUtils.write(
                 mf,
                 content_template=schema.content_template,
@@ -1168,6 +1203,8 @@ class MemoryUpdater:
                 ctx=ctx,
                 lease_ref=lease_ref,
             )
+            changed_uris.add(uri)
+        return changed_uris
 
     def _distribute_links_to_operations(self, operations: ResolvedOperations) -> None:
         """Distribute resolved_links to corresponding upsert operations by URI.

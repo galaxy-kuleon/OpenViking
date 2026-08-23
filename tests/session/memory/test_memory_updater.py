@@ -1095,8 +1095,8 @@ class TestApplyEditWithSearchReplacePatch:
             description="test",
             fields=[content_field],
         )
-        registry = MemoryTypeRegistry()
-        registry.register(schema)
+        registry = MagicMock()
+        registry.get.return_value = schema
         return MemoryUpdater(registry=registry)
 
     @pytest.mark.asyncio
@@ -1125,6 +1125,42 @@ class TestApplyEditWithSearchReplacePatch:
         result = MemoryFileUtils.read(written_content)
         assert result.extra_fields["source_extraction_id"] == "extract_1"
         assert result.extra_fields["last_update_trace_id"] == "trace_1"
+
+    @pytest.mark.asyncio
+    async def test_semantic_noop_skips_write_version_bump_and_vector_work(self):
+        updater = self._make_updater_with_registry()
+        uri = "viking://user/alice/memories/test.md"
+        existing = MemoryFile(
+            uri=uri,
+            content="unchanged",
+            memory_type="test",
+            extra_fields={"version": 7, "last_update_trace_id": "old-trace"},
+        )
+        mock_viking_fs = MagicMock()
+        mock_viking_fs.read_file = AsyncMock(
+            return_value=MemoryFileUtils.write(existing)
+        )
+        mock_viking_fs.write_file = AsyncMock()
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+
+        op = ResolvedOperation(
+            old_memory_file_content=existing,
+            memory_fields={
+                "content": StrPatch(
+                    blocks=[SearchReplaceBlock(search="unchanged", replace="unchanged")]
+                )
+            },
+            memory_type="test",
+            uris=[uri],
+            source=MemoryOperationSource(
+                extraction_id="new-extraction", trace_id="new-trace"
+            ),
+        )
+
+        changed = await updater._apply_upsert(op, MagicMock())
+
+        assert changed == set()
+        mock_viking_fs.write_file.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_apply_edit_with_str_patch_instance(self):
