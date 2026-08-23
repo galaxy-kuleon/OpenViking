@@ -736,9 +736,10 @@ class ContentWriteCoordinator:
                 get_request_wait_tracker().register_request(telemetry_id)
             await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
             content_written = True
-            if context_type == "signal":
-                # Raw feedback is an append-only operational signal, not model
-                # memory. Persist it, but never summarize, embed, or recall it.
+            if context_type in {"signal", "control"}:
+                # Raw signals and mutable coordination state are not model
+                # memory. Persist them, but never summarize, embed, or recall
+                # them. Signals remain append-only; control state may replace.
                 await self._viking_fs._async_agfs.pathlock_release(lease)
                 lock_released = True
                 post_process_started = True
@@ -1336,9 +1337,10 @@ class ContentWriteCoordinator:
                 else:
                     root_uri = VikingURI.build("resources", parts[1])
         elif parts[0] == "user":
-            if len(parts) >= 5 and parts[2] == "signals":
+            if len(parts) >= 5 and parts[2] in {"signals", "control"}:
                 # One directory per signal kind; each child file is one
-                # immutable event. Nothing under this root enters RAG.
+                # immutable event. Control uses the same non-RAG root shape but
+                # permits replacement for leases and current-state ledgers.
                 root_uri = VikingURI.build(*parts[:4])
             elif "resources" in parts:
                 resources_idx = parts.index("resources")

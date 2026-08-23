@@ -153,6 +153,46 @@ async def test_feedback_signal_is_append_only_and_never_vectorized(service, monk
 
 
 @pytest.mark.asyncio
+async def test_control_state_is_replaceable_and_never_vectorized(service, monkeypatch):
+    ctx = RequestContext(user=service.user, role=Role.USER)
+    control_uri = (
+        f"viking://user/{ctx.user.user_space_name()}/control/hermes/"
+        "dreaming-runs/2026-08-24.lock.json"
+    )
+
+    async def fail_if_semantic_refresh_runs(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("control state entered semantic refresh")
+
+    monkeypatch.setattr(
+        ContentWriteCoordinator,
+        "_enqueue_semantic_refresh",
+        fail_if_semantic_refresh_runs,
+    )
+
+    created = await service.fs.write(
+        control_uri,
+        content='{"lease_until":1}',
+        ctx=ctx,
+        mode="create",
+        wait=True,
+    )
+    replaced = await service.fs.write(
+        control_uri,
+        content='{"lease_until":2}',
+        ctx=ctx,
+        mode="replace",
+        wait=True,
+    )
+
+    assert created["context_type"] == "control"
+    assert replaced["context_type"] == "control"
+    assert replaced["semantic_status"] == "skipped"
+    assert replaced["vector_status"] == "skipped"
+    assert await service.viking_fs.read_file(control_uri, ctx=ctx) == '{"lease_until":2}'
+
+
+@pytest.mark.asyncio
 async def test_memory_append_preserves_metadata(service):
     ctx = RequestContext(user=service.user, role=Role.USER)
     memory_uri = f"viking://user/{ctx.user.user_space_name()}/memories/preferences/theme.md"
