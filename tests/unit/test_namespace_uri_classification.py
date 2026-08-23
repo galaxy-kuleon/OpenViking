@@ -40,6 +40,8 @@ def test_context_type_for_uri_uses_path_segments():
     assert context_type_for_uri("viking://agent/code-agent/skills/demo") == "skill"
     assert context_type_for_uri("viking://agent/skills") == "skill"
     assert context_type_for_uri("viking://agent/skills/demo") == "skill"
+    assert context_type_for_uri("viking://user/alice/signals/feedback/e1.json") == "signal"
+    assert context_type_for_uri("viking://user/alice/control/hermes/lease.json") == "control"
     assert context_type_for_uri("viking://resources/memories-report.md") == "resource"
     assert context_type_for_uri("viking://user/alice/resources/skills-report.md") == "resource"
 
