@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """OpenAI Embedder Implementation"""
 
+import os
 from typing import Any, Dict, List, Literal, Optional
 
 import openai
@@ -135,6 +136,13 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
         self._provider = provider.lower()
         self.provider = (configured_provider or provider).lower()
         self._client_kwargs: Dict[str, Any] = {"api_key": self.api_key or "no-key"}
+        # A local FIFO may queue embeddings behind a long generation request.
+        # Leave the SDK default unchanged unless the operator opts in.
+        if value := os.environ.get("OPENVIKING_EMBEDDING_TIMEOUT_SECONDS"):
+            timeout = float(value)
+            if timeout <= 0:
+                raise ValueError("OPENVIKING_EMBEDDING_TIMEOUT_SECONDS must be positive")
+            self._client_kwargs["timeout"] = timeout
 
         # Allow missing api_key when api_base is set (e.g. local OpenAI-compatible servers)
         if not self.api_key and not self.api_base:
