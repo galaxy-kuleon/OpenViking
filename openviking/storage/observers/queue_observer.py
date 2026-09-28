@@ -97,7 +97,7 @@ class QueueObserver(BaseObserver):
             }
             for name, status in statuses.items()
         }
-        dag = self._get_semantic_dag_stats()
+        dag = self._get_semantic_tree_stats()
         queues["semantic_nodes"] = {
             "pending": getattr(dag, "pending_nodes", 0) if dag else 0,
             "in_progress": getattr(dag, "in_progress_nodes", 0) if dag else 0,
