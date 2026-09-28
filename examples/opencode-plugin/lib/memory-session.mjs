@@ -3,6 +3,7 @@ import path from "path"
 import {
   extractPartsFromPayload,
   extractTextFromPayload,
+  isCaptureEnabled,
   shouldCaptureText,
 } from "./shared/capture-utils.mjs"
 import {
@@ -30,6 +31,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
   const statePath = path.join(pluginRoot, "openviking-session-state.json")
   const oldSessionMapPath = path.join(pluginRoot, "openviking-session-map.json")
   let saveTimer = null
+  let initBackground = Promise.resolve()
   // Serialize saves: concurrent saveState() calls (a debounced save racing
   // with flushAll / flushSession / session deletion) all share the same
   // `${statePath}.tmp` temp file, so one rename can fail with ENOENT after
@@ -45,16 +47,24 @@ export function createMemorySessionManager({ config, pluginRoot }) {
     return run
   }
 
-  async function init() {
-    if (config.autoCapture) await migrateLegacySessionMap()
+  async function init({ deferNetwork = false } = {}) {
     await loadState()
-    const health = await fetchJSON(config, "/health", {}, { timeoutMs: 5000 })
-    if (health.ok) {
+    initBackground = Promise.resolve().then(async () => {
+      if (isCaptureEnabled(config)) await migrateLegacySessionMap()
+      const health = await fetchJSON(config, "/health", {}, { timeoutMs: 5000 })
+      if (!health.ok) return
       await replayPending(
         (endpoint, init = {}, options = {}) => fetchJSON(config, endpoint, init, options),
         (stage, data) => log("DEBUG", "pending", stage, data),
       )
-    }
+    }).catch((error) => {
+      log("WARN", "pending", "Pending replay failed during initialization", { error: error?.message })
+    })
+    if (!deferNetwork) await initBackground
+  }
+
+  async function waitForBackground() {
+    await initBackground
   }
 
   async function loadState() {
@@ -116,7 +126,9 @@ export function createMemorySessionManager({ config, pluginRoot }) {
         {
           role: message.role,
           captured: message.captured,
-          parts: Array.from(message.parts.entries()),
+          // Captured messages are never read by flushPendingMessages again; retain
+          // only their metadata so completed payloads cannot grow the state file.
+          parts: message.captured ? [] : Array.from(message.parts.entries()),
         },
       ])),
     }
@@ -157,9 +169,9 @@ export function createMemorySessionManager({ config, pluginRoot }) {
       await handleSessionCompacted(event)
     } else if (event.type === "session.idle") {
       await handleSessionIdle(event)
-    } else if (event.type === "message.updated" && config.autoCapture) {
+    } else if (event.type === "message.updated" && isCaptureEnabled(config)) {
       await handleMessageUpdated(event)
-    } else if (event.type === "message.part.updated" && config.autoCapture) {
+    } else if (event.type === "message.part.updated" && isCaptureEnabled(config)) {
       await handleMessagePartUpdated(event)
     }
   }
@@ -264,8 +276,18 @@ export function createMemorySessionManager({ config, pluginRoot }) {
       clearTimeout(saveTimer)
       saveTimer = null
     }
+    // Do not abort the whole dispose flush when one session fails (e.g. server
+    // already GC'd a stale session). Continue so later sessions still commit.
+    // See https://github.com/volcengine/OpenViking/issues/4490
     for (const sessionId of sessions.keys()) {
-      await flushSession(sessionId, { commit, reason: "flushAll" })
+      try {
+        await flushSession(sessionId, { commit, reason: "flushAll" })
+      } catch (err) {
+        console.warn(
+          `[opencode-plugin] flushAll skipped session ${sessionId}:`,
+          err?.message || err,
+        )
+      }
     }
     await enqueueSave()
   }
@@ -276,7 +298,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
     if (!state) return false
 
     const added = await flushPendingMessages(opencodeSessionId, state)
-    if (commit && config.autoCapture) {
+    if (commit && isCaptureEnabled(config)) {
       await commitOvSession(state.ovSessionId, { force: true, reason })
     } else if (added > 0) {
       await maybeCommitByThreshold(state)
@@ -295,6 +317,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
 
   return {
     init,
+    waitForBackground,
     handleEvent,
     getMappedSessionId,
     commitSession,
@@ -378,7 +401,7 @@ export function createMemorySessionManager({ config, pluginRoot }) {
   }
 
   async function flushPendingMessages(opencodeSessionId, state) {
-    if (!config.autoCapture) return 0
+    if (!isCaptureEnabled(config)) return 0
     const toSend = []
     for (const [messageId, message] of state.messages.entries()) {
       if (message.captured) continue

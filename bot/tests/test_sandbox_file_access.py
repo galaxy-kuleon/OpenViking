@@ -5,6 +5,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from vikingbot.sandbox.backends.aiosandbox import AioSandboxBackend
@@ -35,26 +36,21 @@ async def test_local_workspace_listing_and_reads_are_bounded(tmp_path: Path):
     with pytest.raises(ValueError, match="inventory exceeds 2 entries"):
         await backend.list_files(max_entries=2)
 
+    assert backend.local_file_path("nested/artifact.bin") == tmp_path / "nested/artifact.bin"
+    exported = tmp_path / "exported.bin"
+    assert await backend.export_file("nested/artifact.bin", exported) == 8
+    assert exported.read_bytes() == b"artifact"
+    oversized = tmp_path / "oversized.bin"
+    with pytest.raises(ValueError, match="7-byte export limit"):
+        await backend.export_file("nested/artifact.bin", oversized, max_bytes=7)
+    assert not oversized.exists()
+
 
 class _AioFileClient:
     def __init__(self, *, truncated=False):
-        self.list_calls = []
         self.glob_calls = []
         self.download_calls = []
         self.truncated = truncated
-        self.entries = {
-            "/home/gem": [
-                SimpleNamespace(name="artifact.bin", is_directory=False, size=6),
-                SimpleNamespace(name="nested", is_directory=True, size=0),
-            ],
-            "/home/gem/nested": [
-                SimpleNamespace(name="page.md", is_directory=False, size=4),
-            ],
-        }
-
-    async def list_path(self, **kwargs):
-        self.list_calls.append(kwargs)
-        return SimpleNamespace(data=SimpleNamespace(files=self.entries[kwargs["path"]]))
 
     async def glob_files(self, **kwargs):
         self.glob_calls.append(kwargs)
@@ -125,7 +121,16 @@ async def test_aiosandbox_lists_and_streams_from_remote_workspace(tmp_path: Path
     assert await backend.read_file_bytes("artifact.bin", max_bytes=6) == b"abcdef"
     with pytest.raises(ValueError, match="5-byte read limit"):
         await backend.read_file_bytes("artifact.bin", max_bytes=5)
-    assert files.download_calls == ["/home/gem/artifact.bin", "/home/gem/artifact.bin"]
+
+    destination = tmp_path / "download" / "artifact.bin"
+    assert backend.local_file_path("artifact.bin") is None
+    assert await backend.export_file("artifact.bin", destination) == 6
+    assert destination.read_bytes() == b"abcdef"
+    assert files.download_calls == [
+        "/home/gem/artifact.bin",
+        "/home/gem/artifact.bin",
+        "/home/gem/artifact.bin",
+    ]
 
 
 @pytest.mark.asyncio
@@ -202,6 +207,16 @@ async def test_opensandbox_vke_uses_bounded_remote_inventory_and_range_reads(tmp
         ("/workspace/artifact.bin", "bytes=0-5"),
     ]
 
+    destination = tmp_path / "download" / "artifact.bin"
+    assert backend.local_file_path("artifact.bin") is None
+    assert await backend.export_file("artifact.bin", destination) == 6
+    assert destination.read_bytes() == b"abcdef"
+    assert files.read_calls == [
+        ("/workspace/artifact.bin", "bytes=0-6"),
+        ("/workspace/artifact.bin", "bytes=0-5"),
+        ("/workspace/artifact.bin", None),
+    ]
+
 
 @pytest.mark.asyncio
 async def test_opensandbox_vke_inventory_stops_at_the_remote_limit(tmp_path: Path):
@@ -211,3 +226,46 @@ async def test_opensandbox_vke_inventory_stops_at_the_remote_limit(tmp_path: Pat
     with pytest.raises(ValueError, match="inventory exceeds 1 entries"):
         await backend.list_files(max_entries=1)
     assert "limit = 1" in commands.calls[0][0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count,chunk_size", [(0, 10000), (500, 20000), (500, 257)])
+async def test_opensandbox_directory_json_is_never_display_truncated(tmp_path, count, chunk_size):
+    expected = [(f"document-{index:04d}.txt", False) for index in range(count)]
+    payload = json.dumps(expected)
+    if count == 500:
+        assert len(payload) == 15000
+    execution = SimpleNamespace(
+        error=None,
+        logs=SimpleNamespace(
+            stdout=[
+                SimpleNamespace(text=payload[offset : offset + chunk_size])
+                for offset in range(0, len(payload), chunk_size)
+            ],
+            stderr=[SimpleNamespace(text="unrelated diagnostic")],
+        ),
+    )
+    commands = SimpleNamespace(run=AsyncMock(return_value=execution))
+    backend = _opensandbox_vke_backend(tmp_path, _OpenSandboxFiles(), commands)
+    assert await backend.list_dir(".") == expected
+
+
+@pytest.mark.asyncio
+async def test_opensandbox_directory_command_error_is_reported_before_json_parsing(tmp_path):
+    execution = SimpleNamespace(error=SimpleNamespace(value="Permission denied"))
+    commands = SimpleNamespace(run=AsyncMock(return_value=execution))
+    backend = _opensandbox_vke_backend(tmp_path, _OpenSandboxFiles(), commands)
+    with pytest.raises(IOError, match="directory listing failed: Permission denied"):
+        await backend.list_dir("private")
+
+
+@pytest.mark.asyncio
+async def test_opensandbox_exec_retains_display_output_limit(tmp_path):
+    execution = SimpleNamespace(
+        error=None,
+        logs=SimpleNamespace(stdout=[SimpleNamespace(text="x" * 15000)], stderr=[]),
+    )
+    commands = SimpleNamespace(run=AsyncMock(return_value=execution))
+    backend = _opensandbox_vke_backend(tmp_path, _OpenSandboxFiles(), commands)
+    output = await backend.execute("generate-long-output")
+    assert output == "x" * 10000 + "\n... (truncated, 5000 more chars)"

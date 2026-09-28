@@ -80,6 +80,7 @@ class Context:
         account_id: Optional[str] = None,
         owner_user_id: Optional[str] = None,
         owner_space: Optional[str] = None,
+        md5: Optional[str] = None,
         id: Optional[str] = None,
     ):
         """
@@ -105,25 +106,17 @@ class Context:
         self.session_id = session_id
         self.user = user
         self.account_id = account_id or (user.account_id if user else "default")
-        owner_fields = owner_fields_for_uri(
-            uri,
-            user=user,
-            account_id=self.account_id,
-        )
+        owner_fields = owner_fields_for_uri(uri)
         self.owner_user_id = (
             owner_user_id if owner_user_id is not None else owner_fields["owner_user_id"]
         )
-        self.owner_space = owner_space or self._derive_owner_space(user)
+        self.owner_space = owner_space or owner_fields["owner_user_id"] or ""
+        # md5 of the final stored bytes for this URI; None/"" means unknown (old
+        # records or non-file records), and incremental diff falls back to reading
+        # bytes rather than assuming equality.
+        self.md5 = md5 or ""
         self.vector: Optional[List[float]] = None
         self.vectorize = Vectorize(abstract)
-
-    def _derive_owner_space(self, user: Optional[UserIdentifier]) -> str:
-        """Best-effort owner space derived from URI and user."""
-        if not user:
-            return ""
-        if self.uri.startswith("viking://user/") or self.uri.startswith("viking://session/"):
-            return user.user_id
-        return ""
 
     def _derive_category(self) -> str:
         """Derive category from URI using substring matching."""
@@ -183,6 +176,10 @@ class Context:
         }
         if self.level is not None:
             data["level"] = int(self.level)
+        # Only emit md5 when known so we never overwrite an existing fingerprint
+        # with an empty string via partial update.
+        if self.md5:
+            data["md5"] = self.md5
 
         if self.user:
             data["user"] = self.user.to_dict()
@@ -241,6 +238,7 @@ class Context:
             account_id=data.get("account_id"),
             owner_user_id=data.get("owner_user_id"),
             owner_space=data.get("owner_space"),
+            md5=data.get("md5"),
         )
         obj.id = data.get("id", obj.id)
         obj.vector = data.get("vector")

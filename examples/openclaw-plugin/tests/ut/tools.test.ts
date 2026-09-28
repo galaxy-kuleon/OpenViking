@@ -473,7 +473,7 @@ describe("Tool: memory_store (behavioral)", () => {
       return okResponse({});
     });
 
-    const { factoryTools, api } = setupPlugin(undefined, { peer_role: "person" });
+    const { factoryTools, api } = setupPlugin(undefined, { peer_role: "sender" });
     (api as any).openVikingTransport = openVikingTransport;
     contextEnginePlugin.register(api as any);
     const factory = factoryTools.get("memory_store");
@@ -909,7 +909,6 @@ describe("Tool: ov_search (behavioral)", () => {
                 score: 0.82,
                 category: "",
                 match_reason: "",
-                relations: [],
                 abstract: "OpenViking install guide",
                 overview: null,
               },
@@ -929,7 +928,6 @@ describe("Tool: ov_search (behavioral)", () => {
               score: 0.7,
               category: "",
               match_reason: "",
-              relations: [],
               abstract: "Install OpenViking memory integration",
               overview: null,
             },
@@ -960,7 +958,7 @@ describe("Tool: ov_search (behavioral)", () => {
       .filter((call) => String(call[0]).endsWith("/api/v1/search/find"))
       .map((call) => JSON.parse(String((call[1] as RequestInit).body)));
     expect(findBodies.some((body) => body.target_uri === "viking://resources")).toBe(true);
-    expect(findBodies.some((body) => String(body.target_uri).startsWith("viking://user/") && String(body.target_uri).endsWith("/skills"))).toBe(true);
+    expect(findBodies.some((body) => String(body.target_uri) === "viking://~/skills")).toBe(true);
   });
 
   it("returns partial results when one default scope search fails", async () => {
@@ -984,7 +982,6 @@ describe("Tool: ov_search (behavioral)", () => {
                 score: 0.82,
                 category: "",
                 match_reason: "",
-                relations: [],
                 abstract: "OpenViking install guide",
                 overview: null,
               },
@@ -1021,7 +1018,6 @@ describe("Tool: ov_search (behavioral)", () => {
               score: 0.91,
               category: "preferences",
               match_reason: "",
-              relations: [],
               abstract: "User prefers dark theme",
               overview: null,
             },
@@ -1204,7 +1200,6 @@ describe("Tool: ov_search (behavioral)", () => {
                 score: 0.92,
                 category: "",
                 match_reason: "",
-                relations: [],
                 abstract: "OpenCompass evaluation details",
                 overview: null,
               },
@@ -1245,7 +1240,6 @@ describe("Tool: ov_search (behavioral)", () => {
               score: 0.88,
               category: "",
               match_reason: "",
-              relations: [],
               abstract: "Runtime default search result",
               overview: null,
             },
@@ -2104,7 +2098,7 @@ describe("Plugin registration", () => {
       return okResponse({});
     });
 
-    const { commands, api } = setupPlugin();
+    const { commands, api } = setupPlugin(undefined, { peer_role: "assistant" });
     (api as any).openVikingTransport = openVikingTransport;
     contextEnginePlugin.register(api as any);
 
@@ -2121,7 +2115,7 @@ describe("Plugin registration", () => {
     expect(headers.get("X-OpenViking-Actor-Peer")).toBe("worker");
   });
 
-  it("search command propagates configured tenant headers", async () => {
+  it("search command omits actor peer identity with the default memory scope", async () => {
     const openVikingTransport = vi.fn(async (url: string) => {
       if (url.endsWith("/api/v1/search/find")) {
         return okResponse({ memories: [], resources: [], skills: [], total: 0 });
@@ -2130,6 +2124,31 @@ describe("Plugin registration", () => {
     });
 
     const { commands, api } = setupPlugin();
+    (api as any).openVikingTransport = openVikingTransport;
+    contextEnginePlugin.register(api as any);
+
+    await commands.get("ov-search")!.handler({
+      args: "test query --uri viking://resources",
+      commandBody: "/ov-search",
+      agentId: "worker",
+      sessionId: "session-1",
+      sessionKey: "agent:worker:session-1",
+    });
+
+    const [, init] = openVikingTransport.mock.calls.find((call) => String(call[0]).endsWith("/api/v1/search/find")) as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get("X-OpenViking-Actor-Peer")).toBeNull();
+  });
+
+  it("search command propagates configured tenant headers", async () => {
+    const openVikingTransport = vi.fn(async (url: string) => {
+      if (url.endsWith("/api/v1/search/find")) {
+        return okResponse({ memories: [], resources: [], skills: [], total: 0 });
+      }
+      return okResponse({});
+    });
+
+    const { commands, api } = setupPlugin(undefined, { peer_role: "assistant" });
     (api as any).openVikingTransport = openVikingTransport;
     api.pluginConfig = {
       ...api.pluginConfig,

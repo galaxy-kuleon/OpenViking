@@ -48,20 +48,39 @@ class ModelsObserver(BaseObserver):
         """
         return self._format_status_as_table()
 
-    def usage_snapshot(self) -> dict:
-        """Return structured model call/token counters for health payloads."""
-        result = {}
-        for name, getter in (
-            ("vlm", self._get_vlm_usage),
-            ("embedding", self._get_embedding_usage),
-            ("rerank", self._get_rerank_usage),
-        ):
+    def get_status_json(self) -> dict:
+        """Return model usage data as structured JSON."""
+        vlm = []
+        embedding = []
+        rerank = []
+
+        if self._vlm_instance:
             try:
-                rows = getter()
-            except Exception:
-                rows = None
-            result[name] = rows or []
-        return result
+                vlm = self._get_vlm_usage() or self._get_configured_vlm() or []
+            except Exception as e:
+                logger.warning(f"Error getting VLM usage: {e}")
+                vlm = self._get_configured_vlm() or []
+
+        if self._embedding_instance:
+            try:
+                embedding = self._get_embedding_usage() or []
+            except Exception as e:
+                logger.warning(f"Error getting Embedding usage: {e}")
+
+        if self._rerank_instance:
+            try:
+                rerank = self._get_rerank_usage() or []
+            except Exception as e:
+                logger.warning(f"Error getting Rerank usage: {e}")
+
+        return {
+            "vlm": vlm,
+            "embedding": embedding,
+            "rerank": rerank,
+        }
+
+    def usage_snapshot(self) -> dict:
+        return self.get_status_json()
 
     def _format_status_as_table(self) -> str:
         """

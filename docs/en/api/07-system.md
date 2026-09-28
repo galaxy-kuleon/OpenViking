@@ -10,6 +10,13 @@ The OpenViking System API provides health, readiness, consistency, and multi-wri
 
 Basic health check endpoint. No authentication required. Returns service version and health status. If authentication is provided, also returns auth mode and identity information.
 
+In trusted mode, a complete `X-OpenViking-Account` and `X-OpenViking-User` header pair
+requests identity resolution, including on localhost deployments with `root_api_key`
+omitted. Configured Root keys remain required for authenticated requests. The optional
+`root_api_key_required` boolean reports that trusted-server configuration requirement;
+the resolved `role` describes the caller's permissions. Older servers may omit this field.
+Anonymous health probes return basic liveness information.
+
 **Code Entry Points**:
 - `openviking/server/routers/system.py:health_check` - HTTP route
 - `openviking_cli/client/sync_http.py:SyncHTTPClient.health` - SDK entry
@@ -57,7 +64,7 @@ curl -G http://localhost:1933/health \
 **Python SDK**
 
 ```python
-import openviking as ov
+import openviking_sdk as ov
 
 client = ov.SyncHTTPClient(url="http://localhost:1933")
 client.initialize()
@@ -279,7 +286,7 @@ curl -X POST http://localhost:1933/api/v1/system/consistency \
 **Python SDK**
 
 ```python
-report = client.check_consistency("viking://resources/my-project")
+report = client.check_consistency(uri="viking://resources/my-project")
 print(report["ok"])
 print(report["missing_records"])
 ```
@@ -370,7 +377,7 @@ curl -X POST http://localhost:1933/api/v1/system/wait \
 
 ```python
 # Add resources
-client.add_resource("./docs/")
+client.add_resource(path="./docs/")
 
 # Wait for all processing to complete
 status = client.wait_processed(timeout=60.0)

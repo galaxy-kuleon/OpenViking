@@ -16,13 +16,16 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 if TYPE_CHECKING:
     from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 
+from openviking.core.context import ContextLevel
 from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
     MemoryFile,
+    MemoryOperationSkipCode,
     ResolvedOperation,
     ResolvedOperations,
+    SkippedMemoryOperation,
     StoredLink,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
@@ -39,10 +42,12 @@ from openviking.session.memory.utils.resource_refs import (
 )
 from openviking.session.memory.utils.template_utils import TemplateUtils
 from openviking.session.memory.utils.uri import render_template
+from openviking.storage.abstract_overview import freshness_metadata, render_abstract_overview
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.tracer import get_trace_id
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.utils import VikingURI, get_logger
@@ -637,7 +642,9 @@ class MessageRange:
             if not current_messages:
                 return
             content = self._format_merged_content(current_messages)
-            formatted.append(f"**{self._speaker_for(current_messages[0])}**: {content}")
+            # Tool-only messages have no chat text, but must keep their range indices.
+            if content.strip():
+                formatted.append(f"**{self._speaker_for(current_messages[0])}**: {content}")
             current_messages = []
 
         for msg in msg_group:
@@ -728,6 +735,7 @@ class MemoryUpdateResult:
         self.written_uris: List[str] = []
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
+        self.skipped_operations: List[SkippedMemoryOperation] = []
         self.errors: List[Tuple[str, Exception]] = []
 
     def add_written(self, uri: str) -> None:
@@ -741,6 +749,9 @@ class MemoryUpdateResult:
 
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
+
+    def add_skipped(self, operation: SkippedMemoryOperation) -> None:
+        self.skipped_operations.append(operation)
 
     def summary(self) -> str:
         return (
@@ -796,16 +807,16 @@ class MemoryUpdater:
         directory_uri: str,
         ctx: RequestContext,
         strict: bool = False,
-    ) -> None:
+    ) -> bool:
         memory_type = cls.memory_type_from_uri(directory_uri)
         if not memory_type:
-            return
+            return False
         try:
-            from openviking.session.memory.memory_type_registry import create_default_registry
+            from openviking.session.memory.memory_type_registry import get_default_registry
 
-            updater = cls(registry=create_default_registry())
+            updater = cls(registry=get_default_registry())
             updater._viking_fs = viking_fs
-            await updater.generate_overview(memory_type, directory_uri, ctx)
+            return await updater.generate_overview(memory_type, directory_uri, ctx)
         except Exception:
             logger.warning(
                 "Failed to refresh memory overview for %s",
@@ -814,6 +825,7 @@ class MemoryUpdater:
             )
             if strict:
                 raise
+            return False
 
     @classmethod
     async def refresh_file_embedding(
@@ -825,20 +837,22 @@ class MemoryUpdater:
         memory_type: Optional[str],
         ctx: RequestContext,
         strict: bool = False,
+        ingest_options=None,
     ) -> bool:
         if not vikingdb or not bool(getattr(vikingdb, "has_queue_manager", False)):
             return False
         try:
-            from openviking.session.memory.memory_type_registry import create_default_registry
+            from openviking.session.memory.memory_type_registry import get_default_registry
 
             result = MemoryUpdateResult()
             result.add_written(uri)
-            updater = cls(registry=create_default_registry(), vikingdb=vikingdb)
+            updater = cls(registry=get_default_registry(), vikingdb=vikingdb)
             updater._viking_fs = viking_fs
             attempted = await updater._vectorize_memories(
                 result,
                 ctx,
                 uri_memory_type_map={uri: memory_type} if memory_type else {},
+                ingest_options=ingest_options,
             )
             return attempted > 0
         except Exception:
@@ -895,6 +909,33 @@ class MemoryUpdater:
                 continue
             has_unresolved_upserts = True
             error_target = f"{resolved_op.memory_type}(page_id={resolved_op.page_id})"
+            resolution_skip = getattr(resolved_op, "resolution_skip", None)
+            if resolution_skip is not None:
+                # Reporting-only: the operation remains unresolved, preserving
+                # the legacy delete-suppression behavior for direct mixed batches.
+                skipped = SkippedMemoryOperation(
+                    memory_type=resolved_op.memory_type,
+                    page_id=resolved_op.page_id,
+                    reason_code=resolution_skip.reason_code,
+                    reason=resolution_skip.reason,
+                    source=resolved_op.source,
+                )
+                result.add_skipped(skipped)
+                message = (
+                    "Skipping memory operation by resolution policy: "
+                    f"memory_type={resolved_op.memory_type} "
+                    f"page_id={resolved_op.page_id} "
+                    f"reason_code={resolution_skip.reason_code.value}"
+                )
+                if resolution_skip.reason_code in {
+                    MemoryOperationSkipCode.INVALID_PEER_ID,
+                    MemoryOperationSkipCode.INVALID_RANGES,
+                    MemoryOperationSkipCode.PAGE_ID_TYPE_MISMATCH,
+                }:
+                    logger.warning(message)
+                else:
+                    tracer.info(message)
+                continue
             resolution_error = ValueError("Missing resolved URI")
             result.add_error(error_target, resolution_error)
             tracer.error(
@@ -990,9 +1031,7 @@ class MemoryUpdater:
                 uri_memory_type_map[uri] = op.memory_type
         # Merge caller-supplied transient tags with per-operation search_tags
         # (e.g. event-memory custom scalars) so both reach vectorization.
-        effective_search_tags_by_uri = _collect_search_tags_by_uri(
-            operations, search_tags_by_uri
-        )
+        effective_search_tags_by_uri = _collect_search_tags_by_uri(operations, search_tags_by_uri)
         await self._vectorize_memories(
             result,
             ctx,
@@ -1195,6 +1234,9 @@ class MemoryUpdater:
             new_full_content = MemoryFileUtils.write(
                 mf,
                 content_template=schema.content_template,
+                account_content_template_type=(
+                    schema.memory_type if schema._account_content_template else None
+                ),
                 extract_context=extract_context,
             )
             await viking_fs.write_file(
@@ -1287,8 +1329,10 @@ class MemoryUpdater:
             try:
                 content = await viking_fs.read_file(deleted_uri, ctx=ctx)
             except Exception as e:
-                tracer.error(
-                    f"Failed to read deleted memory links for replacement {deleted_uri}: {e}"
+                # Benign: the replacement/deleted file may already be gone in the
+                # same batch. Link inheritance is best-effort, so warn and skip.
+                logger.warning(
+                    f"Skipping link inheritance; could not read deleted memory {deleted_uri}: {e}"
                 )
                 continue
             if not content:
@@ -1364,6 +1408,10 @@ class MemoryUpdater:
                     lease_ref=lease_ref,
                 )
                 result.add_edited(uri)
+            except (NotFoundError, FileNotFoundError) as e:
+                # Benign: a linked neighbor may have been deleted in the same
+                # batch. Link inheritance is best-effort, so warn and skip.
+                logger.warning(f"Skipping link inheritance; could not read memory {uri}: {e}")
             except Exception as e:
                 tracer.error(f"Failed to inherit deleted memory links for {uri}: {e}")
 
@@ -1391,6 +1439,7 @@ class MemoryUpdater:
         extract_context: Any = None,
         uri_memory_type_map: Dict[str, str] = None,
         search_tags_by_uri: Dict[str, List[str]] = None,
+        ingest_options: Any = None,
     ) -> int:
         """Vectorize written and edited memory files.
 
@@ -1400,7 +1449,9 @@ class MemoryUpdater:
             extract_context: Extract context for embedding template rendering
             uri_memory_type_map: Mapping from URI to memory_type
             search_tags_by_uri: Transient search tags to attach while indexing each URI
+            ingest_options: Write options for a single-file content write.
         """
+        ingest_options = IngestOptions.from_value(ingest_options)
         if not self._vikingdb:
             logger.debug("VikingDB not available, skipping vectorization")
             return 0
@@ -1487,12 +1538,20 @@ class MemoryUpdater:
                 # Convert to embedding msg and enqueue
                 embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
                 if embedding_msg:
-                    transient_tags = search_tags_by_uri.get(uri)
-                    if transient_tags:
-                        embedding_msg.context_data["search_tags"] = list(transient_tags)
+                    if getattr(ingest_options, "search_tags", None) is not None:
+                        embedding_msg.context_data["search_tags"] = list(ingest_options.search_tags)
                         embedding_msg.context_data["_upsert_options"] = {
-                            "search_tag_mode": "append"
+                            "search_tag_mode": IngestOptions.vector_search_tag_mode(
+                                ingest_options.search_tag_mode
+                            )
                         }
+                    else:
+                        transient_tags = search_tags_by_uri.get(uri)
+                        if transient_tags:
+                            embedding_msg.context_data["search_tags"] = list(transient_tags)
+                            embedding_msg.context_data["_upsert_options"] = {
+                                "search_tag_mode": "append"
+                            }
                     if embedding_msg.telemetry_id:
                         request_wait_tracker.register_embedding_root(
                             embedding_msg.telemetry_id, embedding_msg.id
@@ -1535,7 +1594,7 @@ class MemoryUpdater:
         ctx: RequestContext,
         extract_context: Any = None,
         lease_ref: Any = None,
-    ) -> None:
+    ) -> bool:
         """
         Generate .overview.md file for a directory based on overview_template.
 
@@ -1552,7 +1611,7 @@ class MemoryUpdater:
 
         if not schema or not schema.overview_template:
             logger.debug(f"No overview_template for memory type: {memory_type}")
-            return
+            return False
 
         viking_fs = self._get_viking_fs()
 
@@ -1575,10 +1634,10 @@ class MemoryUpdater:
 
         except (NotFoundError, FileNotFoundError):
             logger.debug("Skip overview generation for deleted directory: %s", directory)
-            return
+            return False
         except Exception as e:
             tracer.error(f"Failed to list files in {directory}: {e}")
-            return
+            return False
 
         # If no memory files, delete the .overview.md and the directory if empty
         if not md_files:
@@ -1606,7 +1665,7 @@ class MemoryUpdater:
                     )
                 except Exception:
                     pass
-            return
+            return True
 
         # Parse each file and collect items
         items = []
@@ -1631,7 +1690,7 @@ class MemoryUpdater:
 
         if not items:
             logger.debug(f"No valid memory files parsed in {directory}")
-            return
+            return False
 
         overview_context = {
             "memory_type": memory_type,
@@ -1648,16 +1707,39 @@ class MemoryUpdater:
             )
         except Exception as e:
             tracer.error(f"Failed to render overview template for {memory_type}: {e}")
-            return
+            return False
 
         # Write .overview.md to the directory
         overview_path = f"{directory.rstrip('/')}/.overview.md"
         try:
             await viking_fs.write_file(
                 overview_path,
-                rendered,
+                render_abstract_overview(
+                    ContextLevel.OVERVIEW,
+                    directory,
+                    rendered,
+                    {
+                        "generated_by": {
+                            "component": "MemoryUpdater",
+                            "trigger": "memory_update",
+                        },
+                        "freshness": freshness_metadata(len(md_files), len(items)),
+                    },
+                ),
                 ctx=ctx,
                 lease_ref=lease_ref,
             )
+            from openviking.utils.embedding_utils import vectorize_directory_meta
+
+            await vectorize_directory_meta(
+                uri=directory,
+                abstract="",
+                overview=rendered,
+                context_type="memory",
+                ctx=ctx,
+                include_abstract=False,
+            )
+            return True
         except Exception as e:
             tracer.error(f"Failed to write overview {overview_path}: {e}")
+            return False

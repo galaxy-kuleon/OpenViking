@@ -7,7 +7,9 @@ import weakref
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, model_validator
+
+from openviking_cli.utils.config.runtime_field import RuntimeField
 
 
 def _load_codex_auth_module():
@@ -22,12 +24,43 @@ def _normalize_provider_name(name: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _reject_stream_config(data: Any, location: str) -> None:
+    if not isinstance(data, dict):
+        return
+    if "stream" in data:
+        raise ValueError(
+            f"{location}.stream is not supported; OpenViking VLM calls return complete responses"
+        )
+    extra_request_body = data.get("extra_request_body")
+    if isinstance(extra_request_body, dict) and "stream" in extra_request_body:
+        raise ValueError(
+            f"{location}.extra_request_body.stream is not supported; "
+            "OpenViking VLM calls return complete responses"
+        )
+
+
+def _bind_token_usage_tracker(instance: Any, tracker: Any) -> None:
+    """Bind one Account tracker to all concrete VLM instances in a wrapper."""
+    if instance is None:
+        return
+    if hasattr(instance, "_token_tracker"):
+        instance._token_tracker = tracker
+    if hasattr(instance, "_vlm_instances"):
+        for child in instance._vlm_instances:
+            _bind_token_usage_tracker(child, tracker)
+    else:
+        for name in ("primary", "backup"):
+            child = getattr(instance, name, None)
+            if child is not None:
+                _bind_token_usage_tracker(child, tracker)
+
+
 class VLMCredential(BaseModel):
     """Single VLM credential configuration for multi-credential failover."""
 
-    id: Optional[str] = Field(default=None, description="Unique identifier for this credential")
-    provider: Optional[str] = Field(default=None, description="Provider type")
-    model: Optional[str] = Field(
+    id: Optional[str] = RuntimeField(default=None, description="Unique identifier for this credential")
+    provider: Optional[str] = RuntimeField(default=None, description="Provider type")
+    model: Optional[str] = RuntimeField(
         default=None,
         description=(
             "Model name (or endpoint id) for this credential. "
@@ -35,18 +68,28 @@ class VLMCredential(BaseModel):
             "to point to a different deployment / endpoint."
         ),
     )
-    api_key: Optional[str] = Field(default=None, description="API key")
-    api_base: Optional[str] = Field(default=None, description="API base URL")
-    api_version: Optional[str] = Field(default=None, description="API version")
-    forward_api_key: Optional[bool] = Field(
+    api_key: Optional[str] = RuntimeField(default=None, description="API key")
+    api_base: Optional[str] = RuntimeField(default=None, description="API base URL")
+    api_version: Optional[str] = RuntimeField(default=None, description="API version")
+    forward_api_key: Optional[bool] = RuntimeField(
         default=None, description="Whether to pass api_key through to LiteLLM"
     )
-    extra_headers: Optional[Dict[str, str]] = Field(default=None, description="Extra HTTP headers")
-    extra_request_body: Optional[Dict[str, Any]] = Field(
+    extra_headers: Optional[Dict[str, str]] = RuntimeField(
+        default=None, description="Extra HTTP headers"
+    )
+    extra_request_body: Optional[Dict[str, Any]] = RuntimeField(
         default=None, description="Extra JSON body fields"
     )
-    stream: Optional[bool] = Field(default=None, description="Enable streaming mode")
-    max_tokens: Optional[int] = Field(
+    reasoning_effort: Optional[str] = RuntimeField(
+        default=None,
+        description="Reasoning effort for OpenAI-compatible reasoning models",
+    )
+    keepalive_expiry: Optional[float] = RuntimeField(
+        default=None,
+        ge=0.0,
+        description="Idle HTTP connection lifetime for OpenAI-compatible providers",
+    )
+    max_tokens: Optional[int] = RuntimeField(
         default=None,
         gt=0,
         description=(
@@ -55,7 +98,11 @@ class VLMCredential(BaseModel):
         ),
     )
 
-    model_config = {"extra": "forbid"}
+    @model_validator(mode="before")
+    @classmethod
+    def reject_stream_config(cls, data: Any) -> Any:
+        _reject_stream_config(data, "vlm.credentials[]")
+        return data
 
 
 class VLMMediaConfig(BaseModel):
@@ -84,11 +131,17 @@ class VLMMediaConfig(BaseModel):
         description="Video frame sampling rate for providers that support preprocessing",
     )
 
-    model_config = {"extra": "forbid"}
-
 
 class VLMConfig(BaseModel):
-    """VLM configuration, supports multiple provider backends and multi-credential failover."""
+    """VLM configuration with multi-provider and multi-credential failover.
+
+    Compatibility contract: top-level fields added here must describe common
+    runtime behavior that is safe for Account VLM configurations to inherit
+    from Cluster configuration. Fields that select a model service, credential,
+    endpoint, or provider-specific request identity must instead be represented
+    by ``AccountVLMConfig`` (normally ``model`` or ``VLMCredential``) and excluded by
+    ``AccountVLMConfig._ACCOUNT_OWNED_MODEL_SERVICE_FIELDS``.
+    """
 
     backup: Optional["VLMConfig"] = Field(
         default=None, description="Backup VLM configuration for failover (legacy)"
@@ -111,6 +164,14 @@ class VLMConfig(BaseModel):
             "Per-request HTTP timeout in seconds for VLM API calls. Applied to "
             "the underlying OpenAI/Azure/LiteLLM clients. Increase for slow or "
             "high-latency endpoints (e.g., DashScope, local inference servers)."
+        ),
+    )
+    keepalive_expiry: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Idle HTTP connection lifetime in seconds for OpenAI-compatible VLM clients. "
+            "Set to 0 to disable connection reuse; None uses the provider SDK default."
         ),
     )
 
@@ -161,8 +222,9 @@ class VLMConfig(BaseModel):
         ),
     )
 
-    stream: bool = Field(
-        default=False, description="Enable streaming mode for OpenAI-compatible providers"
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Reasoning effort for OpenAI-compatible reasoning models",
     )
 
     # New multi-credential configuration
@@ -179,18 +241,20 @@ class VLMConfig(BaseModel):
     )
 
     _vlm_instance: Optional[Any] = None
+    _token_usage_tracker: Any = PrivateAttr(default=None)
     _media_semaphores: weakref.WeakKeyDictionary[
         asyncio.AbstractEventLoop,
         weakref.ReferenceType[asyncio.Semaphore],
     ] = PrivateAttr(default_factory=weakref.WeakKeyDictionary)
     _media_semaphore_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
-    model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
+    model_config = {"arbitrary_types_allowed": True}
 
     @model_validator(mode="before")
     @classmethod
     def sync_provider_backend(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            _reject_stream_config(data, "vlm")
             provider = data.get("provider")
             backend = data.get("backend")
 
@@ -205,6 +269,7 @@ class VLMConfig(BaseModel):
                 provider_sources: Dict[str, str] = {}
                 for name, config in providers.items():
                     normalized_name = _normalize_provider_name(name) or str(name)
+                    _reject_stream_config(config, f"vlm.providers.{normalized_name}")
                     existing_name = provider_sources.get(normalized_name)
                     if existing_name is not None and existing_name != str(name):
                         raise ValueError(
@@ -217,13 +282,17 @@ class VLMConfig(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def validate_config(self):
+    def validate_config(self, info: ValidationInfo):
         """Validate configuration completeness and consistency"""
         # Validate recursive backup BEFORE normalizing credentials (which clears backup)
         self._validate_no_recursive_backup()
 
         self._migrate_legacy_config()
         self._normalize_credentials()
+
+        skip_codex_auth_availability = bool(
+            info.context and info.context.get("skip_codex_auth_availability")
+        )
 
         if self._has_any_config():
             if not self.model:
@@ -236,7 +305,11 @@ class VLMConfig(BaseModel):
                         has_codex_auth_available = (
                             _load_codex_auth_module().has_codex_auth_available
                         )
-                        if not cred.api_key and not has_codex_auth_available():
+                        if (
+                            not cred.api_key
+                            and not skip_codex_auth_availability
+                            and not has_codex_auth_available()
+                        ):
                             raise ValueError(
                                 f"Credential {i} ({cred.id or 'unnamed'}): requires Codex OAuth credentials in ~/.openviking/codex_auth.json"
                             )
@@ -251,7 +324,11 @@ class VLMConfig(BaseModel):
                 provider_name = self._resolve_provider_name()
                 if provider_name == "openai-codex":
                     has_codex_auth_available = _load_codex_auth_module().has_codex_auth_available
-                    if not self._get_effective_api_key() and not has_codex_auth_available():
+                    if (
+                        not self._get_effective_api_key()
+                        and not skip_codex_auth_availability
+                        and not has_codex_auth_available()
+                    ):
                         raise ValueError(
                             "VLM configuration requires Codex OAuth credentials in ~/.openviking/codex_auth.json or an importable Codex CLI auth file"
                         )
@@ -274,7 +351,8 @@ class VLMConfig(BaseModel):
             or self.api_base
             or self.extra_headers
             or self.extra_request_body
-            or self.stream
+            or self.reasoning_effort
+            or self.keepalive_expiry is not None
             or self.forward_api_key is not None
         ):
             if self.provider not in self.providers:
@@ -295,8 +373,13 @@ class VLMConfig(BaseModel):
                 and "extra_request_body" not in self.providers[self.provider]
             ):
                 self.providers[self.provider]["extra_request_body"] = self.extra_request_body
-            if self.stream and "stream" not in self.providers[self.provider]:
-                self.providers[self.provider]["stream"] = self.stream
+            if self.reasoning_effort and "reasoning_effort" not in self.providers[self.provider]:
+                self.providers[self.provider]["reasoning_effort"] = self.reasoning_effort
+            if (
+                self.keepalive_expiry is not None
+                and "keepalive_expiry" not in self.providers[self.provider]
+            ):
+                self.providers[self.provider]["keepalive_expiry"] = self.keepalive_expiry
 
     def _normalize_credentials(self):
         """Normalize credentials configuration:
@@ -330,10 +413,11 @@ class VLMConfig(BaseModel):
                 extra_request_body=(
                     primary_cfg.get("extra_request_body") or self.extra_request_body
                 ),
-                stream=(
-                    primary_cfg.get("stream")
-                    if primary_cfg.get("stream") is not None
-                    else self.stream
+                reasoning_effort=(primary_cfg.get("reasoning_effort") or self.reasoning_effort),
+                keepalive_expiry=(
+                    primary_cfg.get("keepalive_expiry")
+                    if primary_cfg.get("keepalive_expiry") is not None
+                    else self.keepalive_expiry
                 ),
                 max_tokens=self.max_tokens,
             )
@@ -359,10 +443,13 @@ class VLMConfig(BaseModel):
                 extra_request_body=(
                     backup_cfg.get("extra_request_body") or self.backup.extra_request_body
                 ),
-                stream=(
-                    backup_cfg.get("stream")
-                    if backup_cfg.get("stream") is not None
-                    else self.backup.stream
+                reasoning_effort=(
+                    backup_cfg.get("reasoning_effort") or self.backup.reasoning_effort
+                ),
+                keepalive_expiry=(
+                    backup_cfg.get("keepalive_expiry")
+                    if backup_cfg.get("keepalive_expiry") is not None
+                    else self.backup.keepalive_expiry
                 ),
                 max_tokens=self.backup.max_tokens,
             )
@@ -399,10 +486,13 @@ class VLMConfig(BaseModel):
                         extra_request_body=(
                             provider_cfg.get("extra_request_body") or self.extra_request_body
                         ),
-                        stream=(
-                            provider_cfg.get("stream")
-                            if provider_cfg.get("stream") is not None
-                            else self.stream
+                        reasoning_effort=(
+                            provider_cfg.get("reasoning_effort") or self.reasoning_effort
+                        ),
+                        keepalive_expiry=(
+                            provider_cfg.get("keepalive_expiry")
+                            if provider_cfg.get("keepalive_expiry") is not None
+                            else self.keepalive_expiry
                         ),
                     )
                 )
@@ -432,8 +522,10 @@ class VLMConfig(BaseModel):
                 cred.extra_headers = self.extra_headers
             if not cred.extra_request_body:
                 cred.extra_request_body = self.extra_request_body
-            if cred.stream is None:
-                cred.stream = self.stream
+            if not cred.reasoning_effort:
+                cred.reasoning_effort = self.reasoning_effort
+            if cred.keepalive_expiry is None:
+                cred.keepalive_expiry = self.keepalive_expiry
 
     def _has_legacy_provider_config(self) -> bool:
         """Check if there's legacy provider config (not credentials-based)."""
@@ -485,8 +577,10 @@ class VLMConfig(BaseModel):
             config["extra_headers"] = self.extra_headers
         if self.extra_request_body and "extra_request_body" not in config:
             config["extra_request_body"] = self.extra_request_body
-        if self.stream and "stream" not in config:
-            config["stream"] = self.stream
+        if self.reasoning_effort and "reasoning_effort" not in config:
+            config["reasoning_effort"] = self.reasoning_effort
+        if self.keepalive_expiry is not None and "keepalive_expiry" not in config:
+            config["keepalive_expiry"] = self.keepalive_expiry
         return config
 
     def _provider_has_usable_credentials(self, provider_name: str, config: Dict[str, Any]) -> bool:
@@ -500,6 +594,26 @@ class VLMConfig(BaseModel):
             return has_codex_auth_available()
         return False
 
+    def _get_provider_config_from_credential(self, cred: VLMCredential) -> Dict[str, Any]:
+        config: Dict[str, Any] = {}
+        if cred.api_key:
+            config["api_key"] = cred.api_key
+        if cred.api_base:
+            config["api_base"] = cred.api_base
+        if cred.api_version:
+            config["api_version"] = cred.api_version
+        if cred.forward_api_key is not None:
+            config["forward_api_key"] = cred.forward_api_key
+        if cred.extra_headers:
+            config["extra_headers"] = cred.extra_headers
+        if cred.extra_request_body:
+            config["extra_request_body"] = cred.extra_request_body
+        if cred.reasoning_effort:
+            config["reasoning_effort"] = cred.reasoning_effort
+        if cred.keepalive_expiry is not None:
+            config["keepalive_expiry"] = cred.keepalive_expiry
+        return config
+
     def _match_provider(self, model: str | None = None) -> tuple[Dict[str, Any] | None, str | None]:
         """Match provider config.
 
@@ -510,18 +624,7 @@ class VLMConfig(BaseModel):
         # If credentials are configured, use the first one
         if self.credentials:
             cred = self.credentials[0]
-            return (
-                {
-                    "api_key": cred.api_key,
-                    "api_base": cred.api_base,
-                    "api_version": cred.api_version,
-                    "forward_api_key": cred.forward_api_key,
-                    "extra_headers": cred.extra_headers,
-                    "extra_request_body": cred.extra_request_body,
-                    "stream": cred.stream,
-                },
-                cred.provider,
-            )
+            return self._get_provider_config_from_credential(cred), cred.provider
 
         if self.provider:
             return self._get_provider_config_by_name(self.provider) or {}, self.provider
@@ -598,12 +701,36 @@ class VLMConfig(BaseModel):
                 else:
                     self._vlm_instance = primary
 
+            if self._token_usage_tracker is not None:
+                _bind_token_usage_tracker(self._vlm_instance, self._token_usage_tracker)
             self._vlm_instance = ConcurrencyLimitedVLM(
                 self._vlm_instance,
                 max_concurrent=self.max_concurrent,
             )
 
         return self._vlm_instance
+
+    def set_token_usage_tracker(self, tracker: Any) -> None:
+        """Bind an externally owned tracker without eagerly creating a client."""
+        if self._token_usage_tracker is tracker:
+            return
+        self._token_usage_tracker = tracker
+        if self._vlm_instance is not None:
+            _bind_token_usage_tracker(self._vlm_instance, tracker)
+
+    def close(self) -> None:
+        """Close and clear the cached VLM instance."""
+        instance = self._vlm_instance
+        self._vlm_instance = None
+        if instance is not None:
+            instance.close()
+
+    def __del__(self) -> None:
+        """Release a lazily-created client when the config is no longer referenced."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _build_vlm_config_dict_for_credential(self, credential: VLMCredential) -> Dict[str, Any]:
         """Build VLM instance config dict for a specific credential."""
@@ -612,12 +739,12 @@ class VLMConfig(BaseModel):
             "temperature": self.temperature,
             "max_retries": self.max_retries,
             "timeout": self.timeout,
+            "keepalive_expiry": credential.keepalive_expiry,
             "provider": credential.provider,
             "thinking": self.thinking,
             "max_tokens": (
                 credential.max_tokens if credential.max_tokens is not None else self.max_tokens
             ),
-            "stream": credential.stream if credential.stream is not None else self.stream,
             "api_version": credential.api_version,
             "media": self.media.model_dump(),
         }
@@ -632,6 +759,8 @@ class VLMConfig(BaseModel):
             result["extra_headers"] = credential.extra_headers
         if credential.extra_request_body:
             result["extra_request_body"] = credential.extra_request_body
+        if credential.reasoning_effort:
+            result["reasoning_effort"] = credential.reasoning_effort
 
         return result
 
@@ -639,20 +768,19 @@ class VLMConfig(BaseModel):
         """Build VLM instance config dict."""
         config, name = self.get_provider_config()
 
-        # Get stream from provider config if available, fallback to self.stream
-        stream = (
-            config.get("stream") if config and config.get("stream") is not None else self.stream
-        )
-
         result = {
             "model": self.model,
             "temperature": self.temperature,
             "max_retries": self.max_retries,
             "timeout": self.timeout,
+            "keepalive_expiry": (
+                config.get("keepalive_expiry")
+                if config and config.get("keepalive_expiry") is not None
+                else self.keepalive_expiry
+            ),
             "provider": name,
             "thinking": self.thinking,
             "max_tokens": self.max_tokens,
-            "stream": stream,
             "api_version": self.api_version,
             "media": self.media.model_dump(),
         }
@@ -668,6 +796,8 @@ class VLMConfig(BaseModel):
                 result["extra_headers"] = config.get("extra_headers")
             if config.get("extra_request_body"):
                 result["extra_request_body"] = config.get("extra_request_body")
+            if config.get("reasoning_effort"):
+                result["reasoning_effort"] = config.get("reasoning_effort")
 
         return result
 
@@ -676,6 +806,7 @@ class VLMConfig(BaseModel):
         prompt: str = "",
         thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Any]:
         """Get LLM completion."""
@@ -684,6 +815,7 @@ class VLMConfig(BaseModel):
             prompt=prompt,
             thinking=effective_thinking,
             tools=tools,
+            tool_choice=tool_choice,
             messages=messages,
         )
 
@@ -694,6 +826,7 @@ class VLMConfig(BaseModel):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, Any]:
         """Get LLM completion asynchronously."""
         effective_thinking = self.thinking if thinking is None else thinking
@@ -703,6 +836,7 @@ class VLMConfig(BaseModel):
             tools=tools,
             tool_choice=tool_choice,
             messages=messages,
+            max_tokens=max_tokens,
         )
 
     def is_available(self) -> bool:
@@ -721,6 +855,7 @@ class VLMConfig(BaseModel):
         images: Optional[list] = None,
         thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Any]:
         """Get LLM completion with images."""
@@ -730,6 +865,7 @@ class VLMConfig(BaseModel):
             images=images,
             thinking=effective_thinking,
             tools=tools,
+            tool_choice=tool_choice,
             messages=messages,
         )
 
@@ -792,6 +928,7 @@ class VLMConfig(BaseModel):
         images: Optional[list] = None,
         thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Any]:
         """Get LLM completion with images asynchronously."""
@@ -801,6 +938,7 @@ class VLMConfig(BaseModel):
             images=images,
             thinking=effective_thinking,
             tools=tools,
+            tool_choice=tool_choice,
             messages=messages,
         )
 

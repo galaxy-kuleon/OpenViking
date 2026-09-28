@@ -10,6 +10,8 @@ POST keeps the legacy behavior of just storing the file and returning its ``temp
 
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 
 import httpx
@@ -30,6 +32,7 @@ def _issue(
     user_id: str = "user",
     *,
     to: str = "",
+    parent: str = "",
     reason: str = "",
     actor_peer_id: str = "",
     tags: list[str] | None = None,
@@ -40,6 +43,7 @@ def _issue(
         user_id,
         ttl_seconds=600,
         to=to,
+        parent=parent,
         reason=reason,
         actor_peer_id=actor_peer_id,
         tags=tags,
@@ -57,6 +61,7 @@ def _stub_ingest(service, monkeypatch, root_uri: str = "viking://resources/uploa
         captured["content"] = Path(path).read_bytes()
         captured["ctx"] = ctx
         captured["to"] = kwargs.get("to")
+        captured["parent"] = kwargs.get("parent")
         captured["reason"] = kwargs.get("reason")
         captured["tags"] = kwargs.get("tags")
         captured["tag_mode"] = kwargs.get("tag_mode")
@@ -100,6 +105,21 @@ async def test_token_upload_forwards_to_and_reason(
     assert resp.status_code == 200, resp.text
     assert captured["to"] == "viking://resources/team/proj"
     assert captured["reason"] == "quarterly report"
+
+
+async def test_token_upload_forwards_parent(
+    client: httpx.AsyncClient, service, upload_temp_dir: Path, monkeypatch
+):
+    captured = _stub_ingest(service, monkeypatch)
+    token = _issue(parent="viking://user/user/resources/team")
+    resp = await client.post(
+        "/api/v1/resources/temp_upload",
+        params={"token": token},
+        files={"file": ("r.md", b"data", "text/markdown")},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["parent"] == "viking://user/user/resources/team"
 
 
 async def test_token_upload_forwards_tags_and_tag_mode(
@@ -226,3 +246,54 @@ async def test_apikey_temp_upload_returns_temp_file_id(
     assert resp.status_code == 200, resp.text
     tfid = resp.json()["result"]["temp_file_id"]
     assert (upload_temp_dir / tfid).is_file()
+
+
+def _skill_zip(name: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr(
+            f"{name}/SKILL.md",
+            f"---\nname: {name}\ndescription: Zipped skill for upload tests\n---\n\n# {name}\n",
+        )
+        zf.writestr(f"{name}/scripts/run.sh", "#!/bin/sh\necho ok\n")
+    return buffer.getvalue()
+
+
+async def test_skill_token_upload_installs_zipped_skill_directory(
+    client: httpx.AsyncClient, service, upload_temp_dir: Path
+):
+    token, _ = upload_token_store.issue("acct", "user", ttl_seconds=600, kind="skill")
+    resp = await client.post(
+        "/api/v1/resources/temp_upload",
+        params={"token": token},
+        files={"file": ("zip-skill.zip", _skill_zip("zip-skill"), "application/zip")},
+    )
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["result"]
+    assert result["root_uri"].endswith("/skills/zip-skill")
+    assert result["auxiliary_files"] == 1
+
+
+async def test_skill_token_upload_list_only_does_not_install(
+    client: httpx.AsyncClient, service, upload_temp_dir: Path, monkeypatch
+):
+    async def fail_add_skill(**_kwargs):
+        raise AssertionError("list_only must not install")
+
+    monkeypatch.setattr(service.resources, "add_skill", fail_add_skill)
+    token, _ = upload_token_store.issue(
+        "acct", "user", ttl_seconds=600, kind="skill", list_only=True
+    )
+    resp = await client.post(
+        "/api/v1/resources/temp_upload",
+        params={"token": token},
+        files={"file": ("zip-skill.zip", _skill_zip("zip-skill"), "application/zip")},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"]["skills"] == [
+        {
+            "name": "zip-skill",
+            "description": "Zipped skill for upload tests",
+            "path": "zip-skill",
+        }
+    ]

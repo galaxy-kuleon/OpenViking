@@ -17,6 +17,7 @@ from openviking.utils.model_retry import (
     OrderedCredentialSwitcher,
     PrimaryBackupSwitcher,
     classify_api_error,
+    extract_metric_error_code,
 )
 from openviking_cli.utils import get_logger
 
@@ -81,7 +82,6 @@ class VLMBase(ABC):
         self.max_tokens = config.get("max_tokens")
         self.extra_headers = config.get("extra_headers")
         self.extra_request_body = dict(config.get("extra_request_body") or {})
-        self.stream = config.get("stream", False)
         self.thinking = config.get("thinking", False)
 
         # Token usage tracking
@@ -118,6 +118,7 @@ class VLMBase(ABC):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously
 
@@ -127,6 +128,7 @@ class VLMBase(ABC):
             tools: Optional list of tool definitions in OpenAI function format
             tool_choice: Optional tool choice mode ("auto", "none", or specific tool name)
             messages: Optional list of message dicts (takes precedence over prompt)
+            max_tokens: Optional per-call output cap; overrides the configured value
 
         Returns:
             str if no tools provided, VLMResponse if tools provided
@@ -294,6 +296,32 @@ class VLMBase(ABC):
                     e,
                 )
 
+    def record_failed_call(self, *, duration_seconds: float, error: Exception) -> None:
+        """Record one failed provider request attempt without token usage."""
+        try:
+            from openviking.metrics.datasources import VLMEventDataSource
+            from openviking.observability.context import get_root_observability_context
+
+            root_context = get_root_observability_context()
+            VLMEventDataSource.record_call(
+                provider=str(self.provider),
+                model_name=str(self.model or "unknown"),
+                duration_seconds=max(float(duration_seconds), 0.0),
+                prompt_tokens=0,
+                completion_tokens=0,
+                error_code=extract_metric_error_code(error),
+                account_id=root_context.account_id if root_context is not None else None,
+            )
+        except Exception as metrics_error:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "vlm failed-call metrics emit failed provider=%s model_name=%s err=%s: %s",
+                    self.provider,
+                    self.model,
+                    type(metrics_error).__name__,
+                    metrics_error,
+                )
+
     @property
     def token_tracker(self):
         """Public accessor for this instance's token usage tracker."""
@@ -310,6 +338,9 @@ class VLMBase(ABC):
     def reset_token_usage(self) -> None:
         """Reset token usage"""
         self._token_tracker.reset()
+
+    def close(self) -> None:
+        """Release provider resources, if any."""
 
     def _extract_content_from_response(self, response) -> str:
         if isinstance(response, str):
@@ -705,6 +736,7 @@ class FailoverVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously with failover support."""
         return await self._get_completion_with_failover_async(
@@ -714,6 +746,7 @@ class FailoverVLM(VLMBase):
             tools=tools,
             tool_choice=tool_choice,
             messages=messages,
+            max_tokens=max_tokens,
         )
 
     def get_vision_completion(
@@ -855,8 +888,12 @@ class FailoverVLM(VLMBase):
         """Get combined token usage from both primary and backup instances."""
         from openviking.models.vlm.token_usage import TokenUsageTracker
 
+        primary_tracker = self.primary.token_tracker
+        backup_tracker = self.backup.token_tracker
+        if primary_tracker is backup_tracker:
+            return primary_tracker.to_dict()
         merged_tracker = TokenUsageTracker.merge(
-            self.primary.token_tracker, self.backup.token_tracker
+            primary_tracker, backup_tracker
         )
         return merged_tracker.to_dict()
 
@@ -864,6 +901,11 @@ class FailoverVLM(VLMBase):
         """Reset token usage for both primary and backup instances."""
         self.primary.reset_token_usage()
         self.backup.reset_token_usage()
+
+    def close(self) -> None:
+        """Close both provider instances."""
+        self.primary.close()
+        self.backup.close()
 
 
 class MultiCredentialVLM(VLMBase):
@@ -896,11 +938,24 @@ class MultiCredentialVLM(VLMBase):
         if len(vlm_instances) != len(credential_ids):
             raise ValueError("vlm_instances and credential_ids must have the same length")
 
-        # Use the first instance's config as base
+        # Expose the common runtime behavior expected by callers that inspect
+        # the wrapper as a VLMBase. Provider-specific identity remains on each
+        # credential instance.
         first = vlm_instances[0]
+        configured_token_limits = [
+            instance.max_tokens
+            for instance in vlm_instances
+            if isinstance(instance.max_tokens, int)
+        ]
         config = {
             "model": first.model,
             "provider": first.provider,
+            "temperature": first.temperature,
+            "max_retries": first.max_retries,
+            "timeout": first.timeout,
+            "max_tokens": (
+                min(configured_token_limits) if configured_token_limits else None
+            ),
             "thinking": first.thinking,
         }
         super().__init__(config)
@@ -1079,6 +1134,7 @@ class MultiCredentialVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously with multi-credential failover support."""
         return await self._get_completion_with_failover_async(
@@ -1088,6 +1144,7 @@ class MultiCredentialVLM(VLMBase):
             tools=tools,
             tool_choice=tool_choice,
             messages=messages,
+            max_tokens=max_tokens,
         )
 
     def get_vision_completion(
@@ -1219,9 +1276,11 @@ class MultiCredentialVLM(VLMBase):
         if not self._vlm_instances:
             return {}
 
-        merged_tracker = self._vlm_instances[0].token_tracker
-        for instance in self._vlm_instances[1:]:
-            merged_tracker = TokenUsageTracker.merge(merged_tracker, instance.token_tracker)
+        trackers = [instance.token_tracker for instance in self._vlm_instances]
+        if all(tracker is trackers[0] for tracker in trackers[1:]):
+            return trackers[0].to_dict()
+
+        merged_tracker = TokenUsageTracker.merge(*trackers)
 
         return merged_tracker.to_dict()
 
@@ -1229,3 +1288,8 @@ class MultiCredentialVLM(VLMBase):
         """Reset token usage for all credential instances."""
         for instance in self._vlm_instances:
             instance.reset_token_usage()
+
+    def close(self) -> None:
+        """Close all credential provider instances."""
+        for instance in self._vlm_instances:
+            instance.close()

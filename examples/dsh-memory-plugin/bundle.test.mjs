@@ -3,12 +3,14 @@ import { readFile, readdir } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import semver from "semver";
+import { PLUGIN_VERSION } from "./config.mjs";
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const FORBIDDEN_IDENTIFIER = ["tra", "ex"].join("");
 const FORBIDDEN_PATTERN = new RegExp(FORBIDDEN_IDENTIFIER, "i");
 
-test("bundle uses neutral DSH naming, exact-pinned peers, and an isolated service", async () => {
+test("bundle uses neutral DSH naming, bounded peers, and an isolated service", async () => {
   const manifest = JSON.parse(await readFile(
     new URL("./package.json", import.meta.url),
     "utf8",
@@ -17,22 +19,38 @@ test("bundle uses neutral DSH naming, exact-pinned peers, and an isolated servic
 
   assert.equal(manifest.name, "@openviking/dsh-memory-plugin");
   assert.equal(manifest.dependencies, undefined);
-  // dsh constructors (defineTool / createUserMessage) come from peers the
-  // installation heals at runtime; exact pins because dsh rc subpackages
-  // have stale `latest` dist-tags. devDependencies mirror the pins so CI
-  // tests exercise the same dsh surface a pin bump would ship.
-  for (const [name, version] of Object.entries(manifest.peerDependencies)) {
-    assert.match(version, /^\d+\.\d+\.\d+(-rc\.\d+)?$/, `${name} must be exact-pinned`);
-    assert.equal(manifest.devDependencies[name], version, `${name} devDependency must mirror the peer pin`);
+  for (const [name, range] of Object.entries(manifest.peerDependencies)) {
+    for (const version of ["0.1.0-rc.6", "0.1.5-rc.1", "0.1.5-rc.2", "0.1.5"]) {
+      assert.ok(semver.satisfies(version, range), `${name} must accept ${version}`);
+    }
+    for (const version of ["0.0.1-rc.3", "0.1.0-rc.5", "0.1.5-alpha.2", "0.2.0-rc.1", "0.2.0"]) {
+      assert.ok(!semver.satisfies(version, range), `${name} must reject ${version}`);
+    }
+    assert.equal(manifest.devDependencies[name], "0.1.0-rc.6", `${name} must test the minimum`);
   }
-  assert.ok(manifest.peerDependencies["@deepseek-ai/dsh-tools"]);
+  assert.ok(manifest.peerDependencies["@deepseek-ai/dsh-mcp-client"]);
   assert.ok(manifest.peerDependencies["@deepseek-ai/dsh-llm"]);
+  for (const [name, version] of Object.entries(manifest.peerDependencies)) {
+    assert.equal(
+      manifest.overrides[name],
+      manifest.devDependencies[name],
+      `${name} override must hold the transitive family at the tested minimum`,
+    );
+  }
   assert.equal(manifest.dsh.bundle.patch, "./cordis.patch.yml");
   assert.match(patch, /name: '@deepseek-ai\/cordis-plugin-group'/);
   assert.match(patch, /openvikingMemory: true/);
   assert.match(patch, /name: '@openviking\/dsh-memory-plugin'/);
   assert.doesNotMatch(JSON.stringify(manifest), FORBIDDEN_PATTERN);
   assert.doesNotMatch(patch, FORBIDDEN_PATTERN);
+});
+
+test("the runtime and package lock report the published package version", async () => {
+  const manifest = JSON.parse(await readFile(new URL("./package.json", import.meta.url), "utf8"));
+  const lock = JSON.parse(await readFile(new URL("./package-lock.json", import.meta.url), "utf8"));
+  assert.equal(PLUGIN_VERSION, manifest.version);
+  assert.equal(lock.version, manifest.version);
+  assert.equal(lock.packages[""].version, manifest.version);
 });
 
 test("plugin source tree contains no product-specific identifier", async () => {

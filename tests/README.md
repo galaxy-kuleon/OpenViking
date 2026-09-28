@@ -134,7 +134,6 @@ Tests for the OpenViking HTTP server API and AsyncHTTPClient SDK.
 | `test_api_content.py` | Content endpoints | `read`, `abstract`, `overview` |
 | `test_api_search.py` | Search endpoints | `find` with target_uri/score_threshold, `search` with session, `grep` case-insensitive, `glob` |
 | `test_api_sessions.py` | Session endpoints | Create, list, get, delete session; add messages; compress; extract |
-| `test_api_relations.py` | Relations endpoints | Get relations, link single/multiple targets, unlink |
 | `test_api_observer.py` | Observer endpoints | Queue, VikingDB, VLM, system observer status |
 | `test_error_scenarios.py` | Error handling | Invalid JSON, missing fields, not found, wrong content type, invalid URI format |
 | `test_http_client_sdk.py` | AsyncHTTPClient SDK E2E | Health, add resource, wait, ls, mkdir, tree, session lifecycle, find, full workflow (real HTTP server) |
@@ -147,7 +146,6 @@ Tests for session management (`Session` class).
 |------|-------------|----------------|
 | `test_session_lifecycle.py` | Session creation and persistence | Create new session, create with custom ID, multiple sessions; `load()` existing session, load nonexistent |
 | `test_session_messages.py` | Message management | `add_message()` user/assistant roles, TextPart/ContextPart/ToolPart |
-| `test_session_usage.py` | Usage tracking | `used()` record context URIs, record skill usage, record both; multiple usage records per session |
 | `test_session_commit.py` | Session commit | `commit()` success status, memory extraction trigger, message archiving, empty session handling, multiple commits, usage record persistence |
 | `test_session_context.py` | Context for search | `get_context_for_search()` with `current_messages` + `latest_archive_overview`; latest completed archive only |
 

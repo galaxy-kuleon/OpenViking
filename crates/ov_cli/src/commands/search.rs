@@ -129,6 +129,7 @@ pub async fn find(
     level: Option<Vec<i32>>,
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    read_content: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -145,6 +146,7 @@ pub async fn find(
             level,
             context_type,
             tags,
+            read_content,
         )
         .await?;
     output_search_results(
@@ -170,6 +172,7 @@ pub async fn search(
     level: Option<Vec<i32>>,
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    read_content: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -187,6 +190,7 @@ pub async fn search(
             level,
             context_type,
             tags,
+            read_content,
         )
         .await?;
     output_search_results(
@@ -275,6 +279,7 @@ fn render_search_results_for_table_with_context(
             text_width,
             hide_level_and_score,
             split_name_description,
+            context.is_some_and(|context| context.mode == SearchRenderMode::SkillsFind),
             &mut lines,
         );
     }
@@ -405,6 +410,7 @@ fn render_search_result_card(
     text_width: usize,
     hide_level_and_score: bool,
     split_name_and_description: bool,
+    prefer_root_uri: bool,
     lines: &mut Vec<String>,
 ) {
     let object = item.as_object();
@@ -430,7 +436,13 @@ fn render_search_result_card(
         metadata.join(" · ")
     ));
 
-    if let Some(uri) = search_result_uri(object) {
+    let root_uri = object
+        .filter(|_| prefer_root_uri)
+        .and_then(|object| object.get("root_uri"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty());
+    if let Some(uri) = root_uri.or_else(|| search_result_uri(object)) {
         for line in wrap_display_text(uri, text_width, SEARCH_MAX_URI_LINES) {
             lines.push(format!("{SEARCH_INDENT}{}", theme::sky_value(line).bold()));
         }
@@ -449,6 +461,18 @@ fn render_search_result_card(
         ));
     } else {
         for line in wrapped {
+            lines.push(format!("{SEARCH_INDENT}{}", theme::body(line)));
+        }
+    }
+
+    if let Some(content) = object
+        .and_then(|object| object.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+    {
+        lines.push(String::new());
+        for line in content.lines() {
             lines.push(format!("{SEARCH_INDENT}{}", theme::body(line)));
         }
     }
@@ -619,8 +643,12 @@ pub async fn grep(
     exclude_uri: Option<String>,
     pattern: &str,
     ignore_case: bool,
+    after_context: i32,
+    before_context: i32,
     node_limit: i32,
     level_limit: i32,
+    tags: &[String],
+    show_tags: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -630,23 +658,42 @@ pub async fn grep(
             exclude_uri,
             pattern,
             ignore_case,
+            after_context,
+            before_context,
             node_limit,
             level_limit,
+            tags,
+            show_tags || !tags.is_empty(),
         )
         .await?;
-    output_grep_results(&result, output_format, compact);
+    output_grep_results(&result, output_format, compact, show_tags);
     Ok(())
 }
 
-fn output_grep_results(result: &Value, output_format: OutputFormat, compact: bool) {
-    if let Some(rendered) = render_grep_output_for_table(result, output_format) {
+fn output_grep_results(
+    result: &Value,
+    output_format: OutputFormat,
+    compact: bool,
+    show_tags: bool,
+) {
+    if let Some(rendered) = render_grep_output_for_table_with_tags(result, output_format, show_tags)
+    {
         println!("{rendered}");
     } else {
         output_success(result, output_format, compact);
     }
 }
 
+#[cfg(test)]
 fn render_grep_output_for_table(value: &Value, output_format: OutputFormat) -> Option<String> {
+    render_grep_output_for_table_with_tags(value, output_format, false)
+}
+
+fn render_grep_output_for_table_with_tags(
+    value: &Value,
+    output_format: OutputFormat,
+    show_tags: bool,
+) -> Option<String> {
     if matches!(output_format, OutputFormat::Json) {
         return None;
     }
@@ -684,14 +731,20 @@ fn render_grep_output_for_table(value: &Value, output_format: OutputFormat) -> O
 
     for (index, item) in matches.iter().enumerate() {
         lines.push(String::new());
-        render_grep_match_card(index + 1, item, text_width, &mut lines);
+        render_grep_match_card(index + 1, item, text_width, show_tags, &mut lines);
     }
 
     append_profile_lines(profile, &mut lines);
     Some(lines.join("\n"))
 }
 
-fn render_grep_match_card(rank: usize, item: &Value, text_width: usize, lines: &mut Vec<String>) {
+fn render_grep_match_card(
+    rank: usize,
+    item: &Value,
+    text_width: usize,
+    show_tags: bool,
+    lines: &mut Vec<String>,
+) {
     let object = item.as_object();
     let line_number = object
         .and_then(|object| object.get("line"))
@@ -717,7 +770,14 @@ fn render_grep_match_card(rank: usize, item: &Value, text_width: usize, lines: &
         }
     }
 
-    if let Some(content) = object
+    let has_context = object.is_some_and(|object| {
+        object.contains_key("before_context") || object.contains_key("after_context")
+    });
+    if has_context {
+        render_grep_context_lines(object, "before_context", '-', text_width, lines);
+        render_grep_result_line(object, ':', text_width, true, lines);
+        render_grep_context_lines(object, "after_context", '-', text_width, lines);
+    } else if let Some(content) = object
         .and_then(|object| object.get("content"))
         .and_then(Value::as_str)
         .map(str::trim)
@@ -726,6 +786,66 @@ fn render_grep_match_card(rank: usize, item: &Value, text_width: usize, lines: &
         for line in wrap_display_text(content, text_width, SEARCH_MAX_ABSTRACT_LINES) {
             lines.push(format!("{SEARCH_INDENT}{}", theme::body(line)));
         }
+    }
+    if show_tags {
+        let tags = object
+            .and_then(|object| object.get("tags"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|tags| !tags.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!(
+            "{SEARCH_INDENT}{}",
+            theme::muted(format!("tags: {tags}"))
+        ));
+    }
+}
+
+fn render_grep_context_lines(
+    object: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+    separator: char,
+    text_width: usize,
+    lines: &mut Vec<String>,
+) {
+    if let Some(context) = object
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_array)
+    {
+        for item in context {
+            render_grep_result_line(item.as_object(), separator, text_width, false, lines);
+        }
+    }
+}
+
+fn render_grep_result_line(
+    object: Option<&serde_json::Map<String, Value>>,
+    separator: char,
+    text_width: usize,
+    is_match: bool,
+    lines: &mut Vec<String>,
+) {
+    let Some(object) = object else {
+        return;
+    };
+    let Some(line_number) = object.get("line").and_then(Value::as_i64) else {
+        return;
+    };
+    let content = object.get("content").and_then(Value::as_str).unwrap_or("");
+    let text = format!("{line_number}{separator}{content}");
+    for line in wrap_display_text(&text, text_width, SEARCH_MAX_ABSTRACT_LINES) {
+        let styled = if is_match {
+            theme::body(line)
+        } else {
+            theme::muted(line)
+        };
+        lines.push(format!("{SEARCH_INDENT}{styled}"));
     }
 }
 
@@ -740,9 +860,37 @@ pub async fn glob(
     node_limit: i32,
     output_format: OutputFormat,
     compact: bool,
+    simple: bool,
+    fields: Option<Vec<String>>,
+    tags: &[String],
 ) -> Result<()> {
-    let result = client.glob(pattern, uri, node_limit).await?;
-    output_success(&result, output_format, compact);
+    let has_fields = fields.is_some();
+    let extra: Option<&[String]> = if has_fields {
+        fields.as_deref()
+    } else {
+        None
+    };
+    let include_tags = fields.as_ref().is_some_and(|items| items.iter().any(|item| item == "tags"))
+        || !tags.is_empty();
+    let result = client
+        .glob(pattern, uri, node_limit, extra, tags, include_tags)
+        .await?;
+    if simple && !has_fields && tags.is_empty() {
+        super::filesystem::print_uri_blob_per_line(&result);
+        return Ok(());
+    }
+    if has_fields || simple {
+        let effective_fields = fields.or_else(|| Some(vec!["uri".to_string()]));
+        super::filesystem::output_entry_list(
+            &result,
+            output_format,
+            compact,
+            simple,
+            effective_fields.as_deref(),
+        );
+    } else {
+        output_success(&result, output_format, compact);
+    }
     Ok(())
 }
 
@@ -798,6 +946,28 @@ mod tests {
             assert!(
                 line.chars().count() < 140,
                 "line should not sprawl horizontally: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_result_cards_show_full_inlined_content_after_the_abstract() {
+        let results = json!([
+            {
+                "context_type": "resource",
+                "uri": "viking://resources/deploy.md",
+                "abstract": "Deployment summary.",
+                "content": "# Deploy\n\nStep one.\nStep two.\nStep three."
+            }
+        ]);
+
+        let rendered = strip_ansi(&render_search_results_for_table(&results).expect("cards"));
+
+        assert!(rendered.contains("Deployment summary."));
+        for line in ["# Deploy", "Step one.", "Step two.", "Step three."] {
+            assert!(
+                rendered.contains(line),
+                "missing inlined content line: {line}"
             );
         }
     }
@@ -1063,6 +1233,55 @@ mod tests {
                 "line should not sprawl horizontally: {line}"
             );
         }
+    }
+
+    #[test]
+    fn grep_table_output_shows_requested_tags() {
+        let result = json!({
+            "matches": [{
+                "line": 1,
+                "uri": "viking://resources/a.md",
+                "content": "needle",
+                "tags": ["env=prod", "team=search"]
+            }],
+            "count": 1,
+            "match_count": 1,
+            "files_scanned": 1
+        });
+
+        let rendered = strip_ansi(
+            &render_grep_output_for_table_with_tags(&result, OutputFormat::Table, true)
+                .expect("grep"),
+        );
+
+        assert!(rendered.contains("tags: env=prod, team=search"));
+    }
+
+    #[test]
+    fn grep_table_output_distinguishes_matches_from_context() {
+        let result = json!({
+            "matches": [{
+                "line": 3,
+                "uri": "viking://resources/a.md",
+                "content": "needle",
+                "before_context": [
+                    {"line": 1, "content": "line one"},
+                    {"line": 2, "content": "line two"}
+                ],
+                "after_context": [
+                    {"line": 4, "content": "line four"}
+                ]
+            }],
+            "count": 1
+        });
+
+        let rendered =
+            strip_ansi(&render_grep_output_for_table(&result, OutputFormat::Table).expect("grep"));
+
+        assert!(rendered.contains("1-line one"));
+        assert!(rendered.contains("2-line two"));
+        assert!(rendered.contains("3:needle"));
+        assert!(rendered.contains("4-line four"));
     }
 
     #[test]

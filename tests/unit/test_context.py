@@ -12,6 +12,7 @@ from openviking.core.context import (
     ResourceContentType,
     Vectorize,
 )
+from openviking.utils.content_hash import content_md5
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -273,6 +274,7 @@ class TestContextMethods:
 
         assert ctx.get_vectorization_text() == "Test abstract"
 
+
 class TestContextToDict:
     """Test Context.to_dict."""
 
@@ -476,14 +478,14 @@ class TestContextWithUser:
         ctx = Context(uri="viking://user/test/memories/test.md", user=user)
 
         assert ctx.owner_user_id == "test"
-        assert ctx.owner_space == user.user_id
+        assert ctx.owner_space == "test"
 
     def test_owner_fields_session(self):
         """Test owner fields for session URI."""
         user = UserIdentifier(account_id="account-123", user_id="user-123")
-        ctx = Context(uri="viking://session/test/msg/1.md", user=user)
+        ctx = Context(uri="viking://user/user-123/sessions/test/msg/1.md", user=user)
 
-        assert ctx.owner_user_id is None
+        assert ctx.owner_user_id == user.user_id
         assert ctx.owner_space == user.user_id
 
     def test_owner_fields_resource_default(self):
@@ -543,3 +545,22 @@ class TestContextEdgeCases:
         ctx = Context(uri="viking://test/path%20with%20spaces/")
 
         assert ctx.uri == "viking://test/path%20with%20spaces/"
+
+    def test_md5_roundtrip_preserves_known_fingerprint(self):
+        md5 = content_md5(b"print(1)")
+        ctx = Context(uri="viking://resources/x/a.py", is_leaf=True, md5=md5)
+
+        assert ctx.to_dict()["md5"] == md5
+        assert Context.from_dict(ctx.to_dict()).md5 == md5
+
+    def test_missing_md5_is_omitted_from_dict(self):
+        ctx = Context(uri="viking://resources/x/b.py", is_leaf=True)
+
+        assert "md5" not in ctx.to_dict()
+        assert Context.from_dict({"uri": "viking://resources/x/b.py"}).md5 == ""
+
+
+def test_content_md5_is_stable_hex_digest():
+    assert content_md5(b"print(1)") == content_md5(b"print(1)")
+    assert content_md5(b"a") != content_md5(b"b")
+    assert len(content_md5(b"x")) == 32

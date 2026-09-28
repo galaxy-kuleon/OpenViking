@@ -31,8 +31,43 @@ def test_consume_roundtrip(store):
     consumed = store.consume(token)
     assert (consumed.account_id, consumed.user_id) == ("acct", "user")
     # Business params default to empty when not supplied at issue time.
-    assert (consumed.to, consumed.reason, consumed.actor_peer_id) == ("", "", "")
+    assert (consumed.to, consumed.parent, consumed.reason, consumed.actor_peer_id) == (
+        "",
+        "",
+        "",
+        "",
+    )
     assert consumed.parse_mode == "default"
+
+
+def test_consume_defaults_to_resource_kind(store):
+    token, _ = store.issue("acct", "user", ttl_seconds=60)
+    consumed = store.consume(token)
+    assert consumed.kind == "resource"
+    assert (consumed.skill_target_uri, consumed.skill_names, consumed.list_only) == (
+        "",
+        None,
+        False,
+    )
+
+
+def test_consume_returns_skill_install_params(store):
+    token, _ = store.issue(
+        "acct",
+        "user",
+        ttl_seconds=60,
+        actor_peer_id="bot-a",
+        kind="skill",
+        skill_target_uri="viking://agent/skills",
+        skill_names=["pdf", "xlsx"],
+        list_only=True,
+    )
+    consumed = store.consume(token)
+    assert consumed.kind == "skill"
+    assert consumed.skill_target_uri == "viking://agent/skills"
+    assert consumed.skill_names == ["pdf", "xlsx"]
+    assert consumed.list_only is True
+    assert consumed.actor_peer_id == "bot-a"
 
 
 def test_consume_returns_bound_business_params(store):
@@ -41,6 +76,7 @@ def test_consume_returns_bound_business_params(store):
         "user",
         ttl_seconds=60,
         to="viking://resources/team/proj",
+        parent="viking://user/user/resources/team",
         reason="quarterly",
         actor_peer_id="bot-a",
         processing_mode="vectors_only",
@@ -48,6 +84,7 @@ def test_consume_returns_bound_business_params(store):
     )
     consumed = store.consume(token)
     assert consumed.to == "viking://resources/team/proj"
+    assert consumed.parent == "viking://user/user/resources/team"
     assert consumed.reason == "quarterly"
     assert consumed.actor_peer_id == "bot-a"
     assert consumed.processing_mode == "vectors_only"

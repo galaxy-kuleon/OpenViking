@@ -9,3 +9,14 @@
 htmlcov
 node_modules
 web-studio/node_modules
+__pycache__
+.pytest_cache
+.ruff_cache
+target/
+src/build/
+docs/.vitepress/dist/
+web-studio/dist
+openviking/web_studio/dist
+web-studio/.vite
+*.log
+*.tmp

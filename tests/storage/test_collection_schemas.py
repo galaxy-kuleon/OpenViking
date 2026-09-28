@@ -5,23 +5,37 @@ import hashlib
 import inspect
 import json
 import logging
+import threading
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+import requests
 
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
 from openviking.server.identity import RequestContext, Role, UserIdentifier
+from openviking.service.resource_service import ResourceService
 from openviking.storage.collection_schemas import (
     CollectionSchemas,
-    TextEmbeddingHandler,
     _build_embedding_metadata,
     init_context_collection,
 )
-from openviking.storage.errors import EmbeddingRebuildRequiredError
+from openviking.storage.collection_schemas import (
+    TextEmbeddingHandler as ProductionTextEmbeddingHandler,
+)
+from openviking.storage.errors import (
+    ConnectionError,
+    EmbeddingRebuildRequiredError,
+    VikingDBException,
+)
 from openviking.storage.expr import Eq
+from openviking.storage.index_action import IndexAction
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+from openviking.storage.queuefs.process_result import ProcessOutcome
+from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.vectordb import engine as vectordb_engine
-from openviking.storage.vectordb.collection.result import UpsertDataResult
+from openviking.storage.vectordb.collection.result import UpdateResult, UpsertDataResult
+from openviking.storage.vectordb.collection.vikingdb_clients import VikingDBClient
 from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
 from openviking.storage.vectordb.collection.volcengine_api_key_collection import (
     VolcengineApiKeyCollection,
@@ -38,10 +52,48 @@ from openviking.storage.viking_vector_index_backend import (
     VikingVectorIndexBackend,
     _SingleAccountBackend,
 )
+from openviking_cli.exceptions import InternalError
 from openviking_cli.utils.config.vectordb_config import (
     VectorDBBackendConfig,
     VolcengineConfig,
 )
+
+
+class TextEmbeddingHandler(ProductionTextEmbeddingHandler):
+    """Inject account resources into the existing worker behavior tests."""
+
+    def __init__(self, vikingdb):
+        from openviking.config.embedding import AccountEmbeddingProvider
+        from openviking.config.vector import AccountVectorConfigResolver, VectorRuntimeSettings
+        from openviking_cli.utils.config import get_openviking_config
+        from openviking_cli.utils.config.embedding_config import EmbeddingConfig
+
+        config = get_openviking_config()
+        embedding = EmbeddingConfig(
+            dense={"provider": "openai", "model": "test", "api_key": "test", "dimension": 2},
+            max_input_tokens=max(100, config.embedding.max_input_tokens),
+            circuit_breaker=vars(config.embedding.circuit_breaker),
+        )
+        settings = VectorRuntimeSettings(
+            embedding, VectorDBBackendConfig(dimension=2), "test", False
+        )
+        manager = SimpleNamespace(
+            add_update_consumer=lambda **kwargs: None,
+            resolve_account=AsyncMock(return_value=settings),
+        )
+        # Factory is injected on this test's effective model only.
+        object.__setattr__(embedding, "get_embedder", config.embedding.get_embedder)
+        provider = AccountEmbeddingProvider(AccountVectorConfigResolver(manager), manager)
+        vikingdb.account_uses_content_field = AsyncMock(
+            return_value=getattr(
+                vikingdb, "uses_content_field",
+                config.storage.vectordb.backend in {"volcengine", "vikingdb"},
+            )
+        )
+        super().__init__(vikingdb, provider)
+
+    async def breaker(self):
+        return (await self._embedding_provider._resource_for("default")).breaker
 
 
 class _DummyEmbedder:
@@ -58,6 +110,9 @@ class _DummyEmbedder:
 
     async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
         return self.embed(text, is_query=is_query)
+
+    def close(self):
+        pass
 
 
 class _DummyConfig:
@@ -127,7 +182,445 @@ def _build_queue_payload_for_account(account_id: str) -> dict:
     return {"data": json.dumps(msg.to_dict())}
 
 
-def test_embedding_handler_builds_circuit_breaker_from_config(monkeypatch):
+def _build_operation_payload(msg: EmbeddingMsg) -> dict:
+    return {"data": msg.to_json()}
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_delete_skips_embedder_and_strictly_deletes_ids(monkeypatch):
+    class _DeletingVikingDB:
+        is_closing = False
+
+        def __init__(self):
+            self.deleted = []
+
+        async def strict_delete(self, ids, *, ctx):
+            self.deleted.append((list(ids), ctx.account_id))
+            return len(ids)
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    vikingdb = _DeletingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    msg = EmbeddingMsg.for_delete(
+        record_ids=["l0-id", "l1-id"],
+        context_data={"account_id": "acct", "uri": "viking://resources/repo"},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert result.value == {"deleted_count": 2}
+    assert vikingdb.deleted == [(["l0-id", "l1-id"], "acct")]
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_update_fields_reads_merges_and_uses_strict_partial_update(
+    monkeypatch,
+):
+    existing = {
+        "id": "l2-id",
+        "uri": "viking://resources/repo/a.py",
+        "account_id": "acct",
+        "abstract": "old abstract",
+        "md5": "old-md5",
+        "vector": [0.1, 0.2],
+    }
+
+    class _UpdatingVikingDB:
+        is_closing = False
+
+        def __init__(self):
+            self.reads = []
+            self.updates = []
+
+        async def get_strict(self, ids, *, ctx):
+            self.reads.append((list(ids), ctx.account_id))
+            return [dict(existing)]
+
+        async def update(self, data, *, ctx):
+            self.updates.append((dict(data), ctx.account_id))
+            return UpdateResult(ok=True, ids=[data["id"]], updated_count=1)
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    vikingdb = _UpdatingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    msg = EmbeddingMsg.for_update_fields(
+        record_id="l2-id",
+        fields={"abstract": "new abstract", "md5": "new-md5"},
+        context_data={"account_id": "acct", "uri": existing["uri"]},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert vikingdb.reads == [(["l2-id"], "acct")]
+    assert len(vikingdb.updates) == 1
+    updated, account_id = vikingdb.updates[0]
+    assert account_id == "acct"
+    assert updated == {
+        "id": "l2-id",
+        "abstract": "new abstract",
+        "md5": "new-md5",
+        "updated_at": updated["updated_at"],
+    }
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert result.value == updated
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_update_fields_append_uses_latest_tags_and_skips_noop(
+    monkeypatch,
+):
+    existing = {
+        "id": "l2-id",
+        "uri": "viking://resources/repo/a.py",
+        "account_id": "acct",
+        "level": 2,
+        "vector": [0.1, 0.2],
+        "search_tags": ["env=old", "scope=new"],
+    }
+
+    class _UpdatingVikingDB:
+        is_closing = False
+
+        def __init__(self):
+            self.updates = []
+
+        async def get_strict(self, ids, *, ctx):
+            return [dict(existing)]
+
+        async def update(self, data, *, ctx):
+            self.updates.append(dict(data))
+            return UpdateResult(ok=True, ids=[data["id"]], updated_count=1)
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    vikingdb = _UpdatingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    msg = EmbeddingMsg.for_update_fields(
+        record_id="l2-id",
+        fields={"search_tags": ["scope=new"]},
+        field_modes={"search_tags": "append"},
+        context_data={"account_id": "acct", "uri": existing["uri"]},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert result.value == {"id": "l2-id", "status": "skipped"}
+    assert vikingdb.updates == []
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_update_fields_replace_and_clear_do_not_merge_old_tags(
+    monkeypatch,
+):
+    existing = {
+        "id": "l2-id",
+        "uri": "viking://resources/repo/a.py",
+        "account_id": "acct",
+        "level": 2,
+        "vector": [0.1, 0.2],
+        "search_tags": ["env=old"],
+    }
+
+    class _UpdatingVikingDB:
+        is_closing = False
+
+        def __init__(self):
+            self.updates = []
+
+        async def get_strict(self, ids, *, ctx):
+            return [dict(existing)]
+
+        async def update(self, data, *, ctx):
+            self.updates.append(dict(data))
+            return UpdateResult(ok=True, ids=[data["id"]], updated_count=1)
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    vikingdb = _UpdatingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+
+    for tags in (["scope=new"], []):
+        msg = EmbeddingMsg.for_update_fields(
+            record_id="l2-id",
+            fields={"search_tags": tags},
+            field_modes={"search_tags": "replace"},
+            context_data={"account_id": "acct", "uri": existing["uri"]},
+        )
+        result = await handler.on_dequeue(_build_operation_payload(msg))
+        assert result.outcome is ProcessOutcome.SUCCESS
+
+    assert [item["search_tags"] for item in vikingdb.updates] == [["scope=new"], []]
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_update_fields_read_failure_does_not_create(monkeypatch):
+    class _BrokenVikingDB:
+        is_closing = False
+
+        async def get_strict(self, ids, *, ctx):
+            raise RuntimeError("read failed")
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            raise AssertionError("read failure must not be treated as not found")
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    handler = TextEmbeddingHandler(_BrokenVikingDB())
+    msg = EmbeddingMsg.for_update_fields(
+        record_id="l2-id",
+        fields={"search_tags": ["scope=new"]},
+        field_modes={"search_tags": "append"},
+        initial_fields={
+            "uri": "viking://resources/repo/a.py",
+            "account_id": "acct",
+            "level": 2,
+            "vector": [0.1, 0.2],
+        },
+        context_data={"account_id": "acct", "uri": "viking://resources/repo/a.py"},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.FAILED
+    assert "read failed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_update_fields_not_found_creates_from_complete_initial_fields(
+    monkeypatch,
+):
+    class _MissingVikingDB:
+        is_closing = False
+
+        def __init__(self):
+            self.upserts = []
+
+        async def get_strict(self, ids, *, ctx):
+            return []
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            self.upserts.append((dict(data), ctx.account_id, options))
+            return data["id"]
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    vikingdb = _MissingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    msg = EmbeddingMsg.for_update_fields(
+        record_id="l2-id",
+        fields={"search_tags": ["scope=new"]},
+        field_modes={"search_tags": "append"},
+        initial_fields={
+            "uri": "viking://resources/repo/a.py",
+            "account_id": "acct",
+            "level": 2,
+            "vector": [0.1, 0.2],
+        },
+        context_data={"account_id": "acct", "uri": "viking://resources/repo/a.py"},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+    created, account_id, options = vikingdb.upserts[0]
+    assert account_id == "acct"
+    assert created["search_tags"] == ["scope=new"]
+    assert options.partial_update is False
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_update_fields_not_found_rejects_incomplete_initial_fields(
+    monkeypatch,
+):
+    class _MissingVikingDB:
+        is_closing = False
+
+        async def get_strict(self, ids, *, ctx):
+            return []
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            raise AssertionError("incomplete record must not be written")
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    monkeypatch.setattr(
+        config.embedding,
+        "get_embedder",
+        lambda: (_ for _ in ()).throw(AssertionError("embedder must stay lazy")),
+    )
+    handler = TextEmbeddingHandler(_MissingVikingDB())
+    msg = EmbeddingMsg.for_update_fields(
+        record_id="l2-id",
+        fields={"search_tags": ["scope=new"]},
+        field_modes={"search_tags": "append"},
+        initial_fields={
+            "uri": "viking://resources/repo/a.py",
+            "account_id": "acct",
+            "level": 2,
+        },
+        context_data={"account_id": "acct", "uri": "viking://resources/repo/a.py"},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.FAILED
+    assert "missing_fields=['vector']" in result.error
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_merge_action_reads_and_merges_before_full_upsert(monkeypatch):
+    embedder = _DummyEmbedder()
+    config = _DummyConfig(embedder)
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+    captured = {}
+
+    class _MergingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def get_strict(self, ids, *, ctx):
+            captured["read"] = (list(ids), ctx.account_id)
+            return [{"id": ids[0], "search_tags": ["env=old"], "created_at": "old"}]
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["data"] = dict(data)
+            captured["options"] = options
+            return data["id"]
+
+    handler = TextEmbeddingHandler(_MergingVikingDB())
+    msg = EmbeddingMsg(
+        message="body",
+        action=IndexAction.MERGE,
+        context_data={
+            "id": "generated-id",
+            "_upsert_record_id": "generated-id",
+            "uri": "viking://resources/repo/a.py",
+            "account_id": "acct",
+            "abstract": "summary",
+        },
+        update_fields={"search_tags": ["scope=new"]},
+        field_modes={"search_tags": "append"},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert captured["read"] == (["generated-id"], "acct")
+    assert captured["data"]["search_tags"] == ["env=old", "scope=new"]
+    assert captured["data"]["created_at"] == "old"
+    assert captured["options"].partial_update is False
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_merge_not_found_creates_from_generated_vector(monkeypatch):
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    captured = {}
+
+    class _MissingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def get_strict(self, ids, *, ctx):
+            return []
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["data"] = dict(data)
+            return data["id"]
+
+    handler = TextEmbeddingHandler(_MissingVikingDB())
+    msg = EmbeddingMsg(
+        message="body",
+        action=IndexAction.MERGE,
+        context_data={
+            "_upsert_record_id": "generated-id",
+            "uri": "viking://resources/repo/a.py",
+            "account_id": "acct",
+            "level": 2,
+            "abstract": "summary",
+        },
+        update_fields={"search_tags": ["scope=new"]},
+        field_modes={"search_tags": "append"},
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert captured["data"]["id"] == "generated-id"
+    assert captured["data"]["vector"] == [0.1, 0.2]
+    assert captured["data"]["search_tags"] == ["scope=new"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_skips_noop_action_without_vector_db_or_embedder(monkeypatch):
+    from openviking.storage.index_action import IndexAction
+
+    config = _DummyConfig(_DummyEmbedder())
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+
+    class _NoopVikingDB:
+        is_closing = False
+
+        def __getattr__(self, name):
+            raise AssertionError(f"noop must not call {name}")
+
+    handler = ProductionTextEmbeddingHandler(_NoopVikingDB())
+    msg = EmbeddingMsg(
+        message=None,
+        context_data={"account_id": "acct", "uri": "viking://resources/repo"},
+        action=IndexAction.NONE,
+    )
+
+    result = await handler.on_dequeue(_build_operation_payload(msg))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_builds_circuit_breaker_from_config(monkeypatch):
     class _DummyVikingDB:
         is_closing = False
 
@@ -145,9 +638,10 @@ def test_embedding_handler_builds_circuit_breaker_from_config(monkeypatch):
 
     handler = TextEmbeddingHandler(_DummyVikingDB())
 
-    assert handler._circuit_breaker._failure_threshold == 7
-    assert handler._circuit_breaker._base_reset_timeout == 60.0
-    assert handler._circuit_breaker._max_reset_timeout == 600.0
+    breaker = await handler.breaker()
+    assert breaker._failure_threshold == 7
+    assert breaker._base_reset_timeout == 60.0
+    assert breaker._max_reset_timeout == 600.0
 
 
 @pytest.mark.asyncio
@@ -178,6 +672,11 @@ async def test_init_context_collection_writes_embedding_metadata(monkeypatch):
 @pytest.mark.asyncio
 async def test_init_context_collection_backfills_metadata_for_empty_legacy_collection(monkeypatch):
     updates = []
+    schema_updates = []
+    config = _DummyConfig(_DummyEmbedder(), backend="local")
+    existing_schema = CollectionSchemas.context_collection("context", config.embedding.dimension)
+    existing_fields = [field for field in existing_schema["Fields"] if field["FieldName"] != "tags"]
+    existing_scalar_index = [field for field in existing_schema["ScalarIndex"] if field != "tags"]
 
     class _FakeStorage:
         async def create_collection(self, name, schema):
@@ -185,7 +684,11 @@ async def test_init_context_collection_backfills_metadata_for_empty_legacy_colle
             return False
 
         async def get_collection_meta(self):
-            return {"Description": "Unified context collection"}
+            return {
+                "Description": "Unified context collection",
+                "Fields": existing_fields,
+                "ScalarIndex": existing_scalar_index,
+            }
 
         async def count(self):
             return 0
@@ -194,7 +697,9 @@ async def test_init_context_collection_backfills_metadata_for_empty_legacy_colle
             updates.append(description)
             return True
 
-    config = _DummyConfig(_DummyEmbedder())
+        async def update_collection_schema(self, fields, scalar_index):
+            schema_updates.append((fields, scalar_index))
+
     monkeypatch.setattr(
         "openviking_cli.utils.config.get_openviking_config",
         lambda: config,
@@ -205,6 +710,12 @@ async def test_init_context_collection_backfills_metadata_for_empty_legacy_colle
     assert created is False
     assert len(updates) == 1
     assert '"provider": "local"' in updates[0]
+    assert len(schema_updates) == 1
+    fields, scalar_index = schema_updates[0]
+    assert {field["FieldName"] for field in fields} - {
+        field["FieldName"] for field in existing_fields
+    } == {"tags"}
+    assert set(scalar_index) - set(existing_scalar_index) == {"tags"}
 
 
 @pytest.mark.asyncio
@@ -273,20 +784,13 @@ async def test_embedding_handler_skip_all_work_when_manager_is_closing(monkeypat
     )
 
     handler = TextEmbeddingHandler(_ClosingVikingDB())
-    status = {"success": 0, "requeue": 0, "error": 0}
-    handler.set_callbacks(
-        on_success=lambda: status.__setitem__("success", status["success"] + 1),
-        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
-        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
-    )
 
     result = await handler.on_dequeue(_build_queue_payload())
 
-    assert result is None
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert result.value is None
+    assert result.error is None
     assert embedder.calls == 0
-    assert status["success"] == 1
-    assert status["requeue"] == 0
-    assert status["error"] == 0
 
 
 @pytest.mark.asyncio
@@ -313,32 +817,32 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
     )
 
     handler = TextEmbeddingHandler(_QueueingVikingDB())
-    status = {"success": 0, "requeue": 0, "error": 0}
-    handler.set_callbacks(
-        on_success=lambda: status.__setitem__("success", status["success"] + 1),
-        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
-        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
-    )
     monkeypatch.setattr(
-        handler._circuit_breaker,
+        await handler.breaker(),
         "check",
         lambda: (_ for _ in ()).throw(CircuitBreakerOpen("open")),
     )
 
     import openviking.storage.collection_schemas as collection_schemas
 
+    monkeypatch.setattr(collection_schemas.logger, "propagate", False)
     collection_schemas.logger.addHandler(caplog.handler)
     collection_schemas.logger.setLevel(logging.WARNING)
     try:
         with caplog.at_level(logging.WARNING):
-            await handler.on_dequeue(_build_queue_payload())
-            await handler.on_dequeue(_build_queue_payload())
+            first_result = await handler.on_dequeue(_build_queue_payload())
+            second_result = await handler.on_dequeue(_build_queue_payload())
     finally:
         collection_schemas.logger.removeHandler(caplog.handler)
 
     warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-    assert warnings.count("Embedding circuit breaker is open; re-enqueueing messages") == 1
-    assert status == {"success": 2, "requeue": 2, "error": 0}
+    assert warnings.count(
+        "Embedding circuit breaker is open; re-enqueueing messages account=default"
+    ) == 1
+    for result in (first_result, second_result):
+        assert result.outcome is ProcessOutcome.REQUEUED
+        assert result.value is None
+        assert result.error is None
 
 
 @pytest.mark.asyncio
@@ -368,19 +872,18 @@ async def test_embedding_auth_error_fails_terminally_without_reenqueue(monkeypat
         lambda: _DummyConfig(_AuthErrorEmbedder()),
     )
     handler = TextEmbeddingHandler(vikingdb)
-    status = {"success": 0, "requeue": 0, "error": 0}
-    handler.set_callbacks(
-        on_success=lambda: status.__setitem__("success", status["success"] + 1),
-        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
-        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
-    )
 
     result = await handler.on_dequeue(_build_queue_payload_for_account("acct"))
 
-    assert result is None
+    assert result.outcome is ProcessOutcome.FAILED
+    assert result.value is None
+    assert result.error == (
+        "Failed to generate embedding: "
+        "Error code: 401 - {'code': 'AuthenticationError'} Unauthorized "
+        "(uri=viking://resources/sample)"
+    )
     assert vikingdb.enqueued == []  # terminal: not re-enqueued
-    assert status == {"success": 0, "requeue": 0, "error": 1}
-    handler._circuit_breaker.check()  # breaker not tripped (would raise if open)
+    (await handler.breaker()).check()  # breaker not tripped (would raise if open)
 
 
 @pytest.mark.asyncio
@@ -393,7 +896,7 @@ async def test_embedding_handler_treats_shutdown_write_lock_as_success(monkeypat
             self.calls = 0
 
         async def upsert(self, _data, *, ctx, options=UpsertOptions()):
-            assert options.partial_update is True
+            assert options.partial_update is False
             self.calls += 1
             self.is_closing = True
             raise RuntimeError("IO error: lock /tmp/LOCK: already held by process")
@@ -406,21 +909,14 @@ async def test_embedding_handler_treats_shutdown_write_lock_as_success(monkeypat
 
     vikingdb = _ClosingDuringUpsertVikingDB()
     handler = TextEmbeddingHandler(vikingdb)
-    status = {"success": 0, "requeue": 0, "error": 0}
-    handler.set_callbacks(
-        on_success=lambda: status.__setitem__("success", status["success"] + 1),
-        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
-        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
-    )
 
     result = await handler.on_dequeue(_build_queue_payload())
 
-    assert result is None
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert result.value is None
+    assert result.error is None
     assert vikingdb.calls == 1
     assert embedder.calls == 1
-    assert status["success"] == 1
-    assert status["requeue"] == 0
-    assert status["error"] == 0
 
 
 @pytest.mark.asyncio
@@ -468,6 +964,7 @@ async def test_embedding_handler_materialize_content_read_failure_is_not_hidden(
         "embedding text",
         {
             "uri": "viking://resources/missing.txt",
+            "account_id": "default",
             "abstract": "abstract fallback",
             "is_leaf": True,
             "context_type": "resource",
@@ -493,7 +990,7 @@ async def test_embedding_handler_materialize_content_keeps_inline(monkeypatch):
     handler = TextEmbeddingHandler(_DummyVikingDB())
     msg = EmbeddingMsg(
         "already inline",
-        {"abstract": "abstract fallback", "is_leaf": False},
+        {"abstract": "abstract fallback", "is_leaf": False, "account_id": "default"},
     )
     ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
 
@@ -569,7 +1066,7 @@ async def test_embedding_handler_truncates_queue_input_before_embed(monkeypatch)
     handler = TextEmbeddingHandler(_CapturingVikingDB())
     payload = _build_queue_payload()
     queue_data = json.loads(payload["data"])
-    queue_data["message"] = " ".join(f"token-{idx}" for idx in range(200))
+    queue_data["payload"]["message"] = " ".join(f"token-{idx}" for idx in range(200))
     payload["data"] = json.dumps(queue_data)
 
     await handler.on_dequeue(payload)
@@ -610,19 +1107,18 @@ async def test_embedding_handler_drops_input_too_large_without_requeue(monkeypat
     )
 
     handler = TextEmbeddingHandler(vikingdb)
-    status = {"success": 0, "requeue": 0, "error": 0}
-    handler.set_callbacks(
-        on_success=lambda: status.__setitem__("success", status["success"] + 1),
-        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
-        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
-    )
 
     result = await handler.on_dequeue(_build_queue_payload())
 
-    assert result is None
+    assert result.outcome is ProcessOutcome.FAILED
+    assert result.value is None
+    assert result.error == (
+        "Failed to generate embedding: "
+        "Malformed input request: expected maxLength: 50000, actual: 75000 "
+        "(uri=viking://resources/sample)"
+    )
     assert vikingdb.enqueued == []
-    assert status == {"success": 0, "requeue": 0, "error": 1}
-    assert handler._circuit_breaker._failure_count == 0
+    assert (await handler.breaker())._failure_count == 0
 
 
 @pytest.mark.asyncio
@@ -635,7 +1131,7 @@ async def test_embedding_handler_preserves_parent_uri_for_backend_upsert_logic(m
         uses_content_field = False
 
         async def upsert(self, data, *, ctx, options=UpsertOptions()):
-            assert options.partial_update is True
+            assert options.partial_update is False
             captured["data"] = dict(data)
             return "rec-1"
 
@@ -648,14 +1144,101 @@ async def test_embedding_handler_preserves_parent_uri_for_backend_upsert_logic(m
     handler = TextEmbeddingHandler(_CapturingVikingDB())
     payload = _build_queue_payload()
     queue_data = json.loads(payload["data"])
-    queue_data["context_data"]["parent_uri"] = "viking://resources"
+    queue_data["payload"]["context_data"]["parent_uri"] = "viking://resources"
     payload["data"] = json.dumps(queue_data)
 
     result = await handler.on_dequeue(payload)
 
-    assert result is not None
+    assert result.outcome is ProcessOutcome.SUCCESS
+    assert result.error is None
+    assert result.value == {
+        **queue_data["payload"]["context_data"],
+        "id": vector_record_id("default", "viking://resources/sample", 2),
+        "vector": [0.1, 0.2],
+    }
     assert "data" in captured
     assert captured["data"]["parent_uri"] == "viking://resources"
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_honors_explicit_full_upsert(monkeypatch):
+    captured = {}
+
+    class _CapturingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["partial_update"] = options.partial_update
+            return data["id"]
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    payload = _build_queue_payload()
+    queue_data = json.loads(payload["data"])
+    queue_data["payload"]["context_data"]["_upsert_options"] = {"partial_update": False}
+    payload["data"] = json.dumps(queue_data)
+
+    await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
+
+    assert captured["partial_update"] is False
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_honors_existing_record_id_override(monkeypatch):
+    captured = {}
+
+    class _CapturingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["data"] = dict(data)
+            return data["id"]
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    payload = _build_queue_payload_for_account("acct-existing-id")
+    queue_data = json.loads(payload["data"])
+    queue_data["payload"]["context_data"]["_upsert_record_id"] = "id-from-vector-db"
+    payload["data"] = json.dumps(queue_data)
+
+    await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
+
+    assert captured["data"]["id"] == "id-from-vector-db"
+    assert "_upsert_record_id" not in captured["data"]
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_generates_id_when_no_existing_override(monkeypatch):
+    from openviking.storage.vector_ids import vector_record_id
+
+    captured = {}
+
+    class _CapturingVikingDB:
+        is_closing = False
+        uses_content_field = False
+
+        async def upsert(self, data, *, ctx, options=UpsertOptions()):
+            captured["data"] = dict(data)
+            return data["id"]
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    payload = _build_queue_payload_for_account("acct-new-id")
+
+    await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
+
+    assert captured["data"]["id"] == vector_record_id("acct-new-id", "viking://resources/sample", 2)
 
 
 @pytest.mark.asyncio
@@ -666,7 +1249,7 @@ async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch)
         uses_content_field = False
 
         async def upsert(self, _data, *, ctx, options=UpsertOptions()):
-            assert options.partial_update is True
+            assert options.partial_update is False
             return "rec-1"
 
     embedder = _DummyEmbedder()
@@ -679,8 +1262,8 @@ async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch)
     monkeypatch.setattr(
         "openviking.storage.collection_schemas.get_request_wait_tracker",
         lambda: SimpleNamespace(
-            mark_embedding_done=lambda telemetry_id, root_id: completed.append(
-                (telemetry_id, root_id)
+            mark_embedding_done=lambda telemetry_id, root_id, **kwargs: completed.append(
+                (telemetry_id, root_id, kwargs)
             )
         ),
     )
@@ -693,16 +1276,32 @@ async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch)
 
     await handler.on_dequeue(payload)
 
-    assert completed == [("request-1", queue_data["id"])]
+    assert completed == [("request-1", queue_data["id"], {"vector_written": True})]
 
 
-def test_context_collection_excludes_parent_uri():
+def test_context_collection_uses_acl_mode_and_excludes_parent_uri():
     schema = CollectionSchemas.context_collection("ctx", 8)
 
     field_names = [field["FieldName"] for field in schema["Fields"]]
+    acl_mode = next(field for field in schema["Fields"] if field["FieldName"] == "acl_mode")
 
+    assert acl_mode == {
+        "FieldName": "acl_mode",
+        "FieldType": "string",
+        "DefaultValue": "none",
+    }
+    assert "acl_mode" in schema["ScalarIndex"]
+    assert "acl_enabled" not in field_names
+    assert "acl_enabled" not in schema["ScalarIndex"]
     assert "parent_uri" not in field_names
+    # md5 fingerprint field backs incremental diff; it is a scalar value column,
+    # not indexed (looked up alongside a URI/level scan, never filtered on).
+    md5_field = next(field for field in schema["Fields"] if field["FieldName"] == "md5")
+    assert md5_field == {"FieldName": "md5", "FieldType": "string", "DefaultValue": ""}
+    assert "md5" not in schema["ScalarIndex"]
     assert "parent_uri" not in schema["ScalarIndex"]
+    assert "acl_restricted" not in field_names
+    assert "acl_restricted" not in schema["ScalarIndex"]
 
 
 def test_context_collection_signature_has_no_include_parent_uri():
@@ -806,6 +1405,92 @@ def test_private_vikingdb_collection_ignores_unknown_fields_on_writes():
     assert calls[1][1]["ignore_unknown_fields"] is True
 
 
+def test_private_vikingdb_collection_raises_on_data_api_error(monkeypatch):
+    class _Response:
+        status_code = 403
+        text = '{"code":"AccessDenied","message":"license state Downgraded rejects data write"}'
+
+        def json(self):
+            return {
+                "code": "AccessDenied",
+                "message": "license state Downgraded rejects data write",
+            }
+
+    collection = VikingDBCollection(
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+    monkeypatch.setattr(collection.client, "do_req", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(VikingDBException, match="license state Downgraded") as exc_info:
+        collection.upsert_data([{"id": "rec-1", "content": "hello"}])
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.code == "AccessDenied"
+    assert exc_info.value.error_type == "http_client_error"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.action == "/api/vikingdb/data/upsert"
+
+
+def test_private_vikingdb_collection_marks_server_error_retryable(monkeypatch):
+    class _Response:
+        status_code = 503
+        text = '{"code":"ServiceUnavailable","message":"temporarily unavailable"}'
+
+        def json(self):
+            return {
+                "code": "ServiceUnavailable",
+                "message": "temporarily unavailable",
+            }
+
+    collection = VikingDBCollection(
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+    monkeypatch.setattr(collection.client, "do_req", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(VikingDBException) as exc_info:
+        collection.upsert_data([{"id": "rec-1", "content": "hello"}])
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "ServiceUnavailable"
+    assert exc_info.value.error_type == "http_server_error"
+    assert exc_info.value.retryable is True
+
+
+def test_private_vikingdb_client_wraps_connection_error(monkeypatch):
+    def _raise_connection_error(**kwargs):
+        del kwargs
+        raise requests.ConnectionError("connection refused")
+
+    client = VikingDBClient("https://vikingdb.example.com")
+    monkeypatch.setattr(client._session, "request", _raise_connection_error)
+
+    with pytest.raises(ConnectionError, match="connection refused") as exc_info:
+        client.do_req(
+            "POST",
+            "/api/vikingdb/data/upsert",
+            req_body={},
+        )
+
+    assert exc_info.value.status_code is None
+    assert exc_info.value.error_type == "connection_error"
+    assert exc_info.value.retryable is True
+    assert exc_info.value.action == "/api/vikingdb/data/upsert"
+
+
+def test_resource_service_raises_on_queue_status_errors():
+    status = {
+        "embedding": {"processed_count": 1, "error_count": 1, "errors": ["AccessDenied"]},
+        "indexing": {"processed_count": 0, "error_count": 0, "errors": []},
+    }
+
+    with pytest.raises(InternalError, match="queue processing failed") as exc_info:
+        ResourceService._raise_queue_status_errors(status)
+
+    assert "AccessDenied" in str(exc_info.value)
+
+
 def _exercise_fetch_and_search_apis(collection):
     collection.fetch_data(["rec-1"])
     collection.search_by_vector("default", dense_vector=[0.1, 0.2])
@@ -848,7 +1533,7 @@ def test_volcengine_aksk_collection_ignores_unknown_fields_on_fetch_and_search()
     calls = []
 
     class _Collection(VolcengineCollection):
-        def _data_post(self, path, data):
+        def _data_post(self, path, data, **kwargs):
             calls.append((path, data))
             return {}
 
@@ -1277,11 +1962,14 @@ async def test_single_account_backend_upsert_runs_adapter_in_threadpool(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_single_account_backend_update_runs_adapter_in_threadpool(monkeypatch):
+async def test_single_account_backend_update_runs_adapter_in_threadpool():
     calls = []
+    event_loop_thread = threading.get_ident()
+    adapter_threads = []
 
     class _Collection:
         def get_meta_data(self):
+            adapter_threads.append(threading.get_ident())
             return {
                 "Fields": [
                     {"FieldName": "id"},
@@ -1299,15 +1987,9 @@ async def test_single_account_backend_update_runs_adapter_in_threadpool(monkeypa
             return _Collection()
 
         def update_data(self, data):
+            adapter_threads.append(threading.get_ident())
+            calls.append(data)
             return [data[0]["id"]]
-
-    async def _fake_to_thread(func, /, *args, **kwargs):
-        calls.append((func.__name__, args, kwargs))
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr(
-        "openviking.storage.viking_vector_index_backend.asyncio.to_thread", _fake_to_thread
-    )
 
     backend = _SingleAccountBackend(
         config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
@@ -1330,8 +2012,9 @@ async def test_single_account_backend_update_runs_adapter_in_threadpool(monkeypa
     assert result.updated_count == 1
     assert result.error_code is None
     assert result.error_message is None
-    assert [call[0] for call in calls] == ["_prepare_upsert_payload", "update_data"]
-    assert calls[-1][1] == (
+    assert len(adapter_threads) == 2
+    assert all(thread_id != event_loop_thread for thread_id in adapter_threads)
+    assert calls == [
         [
             {
                 "id": "rec-1",
@@ -1340,15 +2023,65 @@ async def test_single_account_backend_update_runs_adapter_in_threadpool(monkeypa
                 "account_id": "acc1",
             }
         ],
-    )
+    ]
 
 
 @pytest.mark.asyncio
-async def test_local_backend_update_preserves_omitted_fields_end_to_end(tmp_path):
+async def test_single_account_backend_partial_update_does_not_fill_omitted_text_or_vector_fields():
+    calls = []
+
+    class _Collection:
+        def get_meta_data(self):
+            return {
+                "Fields": [
+                    {"FieldName": "id", "FieldType": "string"},
+                    {"FieldName": "abstract", "FieldType": "string"},
+                    {"FieldName": "content", "FieldType": "text"},
+                    {"FieldName": "vector", "FieldType": "vector"},
+                    {"FieldName": "search_tags", "FieldType": "list<string>"},
+                    {"FieldName": "account_id", "FieldType": "string"},
+                ]
+            }
+
+    class _Adapter:
+        mode = "local"
+        USE_CONTENT_FIELD = True
+
+        def get_collection(self):
+            return _Collection()
+
+        def update_data(self, data):
+            calls.append(data)
+            return [data[0]["id"]]
+
+    backend = _SingleAccountBackend(
+        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        bound_account_id="acc1",
+        shared_adapter=_Adapter(),
+    )
+
+    result = await backend.update({"id": "rec-1", "search_tags": ["team=search"]})
+
+    assert result.ok is True
+    assert calls == [
+        [
+            {
+                "id": "rec-1",
+                "search_tags": ["team=search"],
+                "account_id": "acc1",
+            }
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_backend_update_preserves_omitted_fields_end_to_end(
+    vector_backend_factory, tmp_path
+):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is not available in this environment")
 
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local",
             name="context",
@@ -1401,11 +2134,13 @@ async def test_local_backend_update_preserves_omitted_fields_end_to_end(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_local_backend_update_can_clear_string_field_end_to_end(tmp_path):
+async def test_local_backend_update_can_clear_string_field_end_to_end(
+    vector_backend_factory, tmp_path
+):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is not available in this environment")
 
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local",
             name="context",
@@ -1870,7 +2605,7 @@ async def test_single_account_backend_upsert_partial_update_creates_when_record_
 
 
 @pytest.mark.asyncio
-async def test_single_account_backend_upsert_partial_update_returns_empty_when_get_fails():
+async def test_single_account_backend_upsert_partial_update_raises_when_get_fails():
     class _Adapter:
         mode = "local"
         USE_CONTENT_FIELD = False
@@ -1888,12 +2623,31 @@ async def test_single_account_backend_upsert_partial_update_returns_empty_when_g
         shared_adapter=_Adapter(),
     )
 
-    result = await backend.upsert(
-        {"id": "rec-1", "abstract": "patched"},
-        options=UpsertOptions(partial_update=True),
+    with pytest.raises(RuntimeError, match="backend exploded"):
+        await backend.upsert(
+            {"id": "rec-1", "abstract": "patched"},
+            options=UpsertOptions(partial_update=True),
+        )
+
+
+@pytest.mark.asyncio
+async def test_single_account_backend_count_raises_when_adapter_count_fails():
+    class _Adapter:
+        mode = "local"
+        USE_CONTENT_FIELD = False
+
+        def count(self, filter=None):
+            del filter
+            raise RuntimeError("count backend exploded")
+
+    backend = _SingleAccountBackend(
+        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        bound_account_id="acc1",
+        shared_adapter=_Adapter(),
     )
 
-    assert result == ""
+    with pytest.raises(RuntimeError, match="count backend exploded"):
+        await backend.count()
 
 
 @pytest.mark.asyncio
@@ -1921,8 +2675,10 @@ async def test_single_account_backend_upsert_without_partial_update_keeps_legacy
 
 
 @pytest.mark.asyncio
-async def test_viking_vector_index_backend_upsert_partial_update_delegates_to_account_backend():
-    backend = VikingVectorIndexBackend(
+async def test_viking_vector_index_backend_upsert_partial_update_delegates_to_account_backend(
+    vector_backend_factory,
+):
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(backend="local", name="context", dimension=2)
     )
     ctx = SimpleNamespace(account_id="acc1")
@@ -1933,7 +2689,7 @@ async def test_viking_vector_index_backend_upsert_partial_update_delegates_to_ac
             calls.append((data, options))
             return data["id"]
 
-    backend._get_backend_for_context = lambda _ctx: _BoundBackend()
+    backend._get_backend_for_context = AsyncMock(return_value=_BoundBackend())
 
     result = await backend.upsert(
         {"id": "rec-1", "abstract": "patched"},
@@ -1942,9 +2698,7 @@ async def test_viking_vector_index_backend_upsert_partial_update_delegates_to_ac
     )
 
     assert result == "rec-1"
-    assert calls == [
-        ({"id": "rec-1", "abstract": "patched"}, UpsertOptions(True, "append"))
-    ]
+    assert calls == [({"id": "rec-1", "abstract": "patched"}, UpsertOptions(True, "append"))]
 
 
 @pytest.mark.asyncio
@@ -2397,37 +3151,37 @@ async def test_update_search_tags_with_levels_rejects_invalid_mode_before_filter
 
 
 @pytest.mark.asyncio
-async def test_single_account_backend_mutations_run_adapter_in_threadpool(monkeypatch):
+async def test_single_account_backend_mutations_run_adapter_in_threadpool():
     calls = []
+    event_loop_thread = threading.get_ident()
+
+    def record(name, kwargs=None):
+        assert threading.get_ident() != event_loop_thread
+        calls.append((name, kwargs))
 
     class _Adapter:
         mode = "local"
         USE_CONTENT_FIELD = False
 
         def drop_collection(self):
+            record("drop_collection")
             return True
 
         def delete(self, **kwargs):
-            calls.append(("adapter_delete_kwargs", kwargs))
+            record("delete", kwargs)
             return 2
 
         def count(self, **kwargs):
-            calls.append(("adapter_count_kwargs", kwargs))
+            record("count", kwargs)
             return 3
 
         def clear(self):
+            record("clear")
             return True
 
         def close(self):
+            record("close")
             return None
-
-    async def _fake_to_thread(func, /, *args, **kwargs):
-        calls.append((func.__name__, args, kwargs))
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr(
-        "openviking.storage.viking_vector_index_backend.asyncio.to_thread", _fake_to_thread
-    )
 
     backend = _SingleAccountBackend(
         config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
@@ -2443,7 +3197,7 @@ async def test_single_account_backend_mutations_run_adapter_in_threadpool(monkey
     assert await backend.clear() is True
     await backend.close()
 
-    assert [call[0] for call in calls if not call[0].startswith("adapter_")] == [
+    assert [call[0] for call in calls] == [
         "drop_collection",
         "delete",
         "delete",

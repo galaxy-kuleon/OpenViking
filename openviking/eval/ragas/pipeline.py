@@ -52,10 +52,16 @@ class RAGQueryPipeline:
     def _get_llm(self):
         """Lazy initialization of LLM for answer generation."""
         if self._llm is None:
-            from openviking_cli.utils.config import get_openviking_config
+            from openviking.config.vlm import ClusterVLMResolver
+            from openviking_cli.utils.config.open_viking_config import (
+                OpenVikingConfigSingleton,
+            )
 
-            config = get_openviking_config()
-            self._llm = config.vlm
+            config_path = Path(self.config_path).expanduser()
+            if not config_path.is_file():
+                raise FileNotFoundError(f"VLM config file does not exist: {config_path}")
+            config = OpenVikingConfigSingleton.initialize(config_path=str(config_path))
+            self._llm = ClusterVLMResolver(lambda: config).get_vlm_sync()
         return self._llm
 
     def add_documents(
@@ -86,7 +92,7 @@ class RAGQueryPipeline:
 
             logger.info(f"Adding document: {path}")
             result = client.add_resource(
-                path=str(path),
+                str(path),
                 wait=wait,
                 timeout=timeout,
             )
@@ -141,7 +147,7 @@ class RAGQueryPipeline:
         # Retrieve contexts
         logger.debug(f"Searching for: {question}")
         search_result = client.search(
-            query=question,
+            question,
             limit=top_k,
         )
 

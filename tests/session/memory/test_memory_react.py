@@ -5,9 +5,10 @@ Tests for memory ExtractLoop orchestrator.
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import BaseModel, Field
 
 from openviking.session.memory.dataclass import (
     MemoryFile,
@@ -18,7 +19,9 @@ from openviking.session.memory.dataclass import (
 from openviking.session.memory.extract_loop import (
     ExtractLoop,
 )
+from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.merge_op import SearchReplaceBlock, StrPatch
+from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 
 
@@ -160,17 +163,153 @@ class TestAllowedDirectoriesList:
 
 
 class TestExtractLoopFinalJsonRetry:
-    @pytest.fixture(autouse=True)
-    def _memory_config(self, monkeypatch):
-        config = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
-        monkeypatch.setattr(
-            "openviking.session.memory.extract_loop.get_openviking_config",
-            lambda: config,
+    @pytest.mark.asyncio
+    async def test_schema_echo_is_retried_and_cannot_become_empty_success(self):
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def get_completion_async(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return '{"$defs": {}, "properties": {}, "title": "StructuredMemoryOperations", "type": "object"}'
+                return '{"preferences": [], "delete_ids": []}'
+
+        class FakeContextProvider:
+            read_file_contents = {}
+
+            def get_memory_schemas(self, ctx):
+                return [
+                    MemoryTypeSchema(
+                        memory_type="preferences",
+                        description="Preferences",
+                        directory="viking://user/{user_space}/memories/preferences",
+                        filename_template="{topic}.md",
+                        fields=[],
+                    )
+                ]
+
+            def get_tools(self):
+                return []
+
+            def get_extract_context(self):
+                return MagicMock()
+
+            def get_output_language(self):
+                return "en"
+
+            def instruction(self):
+                return "Extract memory operations."
+
+            async def prefetch(self):
+                return []
+
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=FakeContextProvider(),
+            max_iterations=1,
         )
-        monkeypatch.setattr(
-            "openviking_cli.utils.config.get_openviking_config",
-            lambda: config,
+        resolved = ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[],
+            errors=[],
         )
+        extract_loop.resolve_operations = AsyncMock(return_value=(resolved, []))
+        extract_loop._check_unread_existing_files = AsyncMock(return_value={})
+        extract_loop._validate_patch_operations = AsyncMock(return_value=[])
+        extract_loop.finalize_operations = AsyncMock()
+
+        result, _ = await extract_loop.run()
+
+        assert result == resolved
+        assert vlm.calls == 2
+
+    @staticmethod
+    def _invalid_peer_resolution_loop(target_uri=None):
+        schema = MemoryTypeSchema(
+            memory_type="preferences",
+            description="Preferences",
+            directory="viking://user/{{ user_space }}/memories",
+            filename_template="preferences.md",
+            fields=[],
+        )
+        context_provider = MagicMock()
+        context_provider.get_memory_schemas.return_value = [schema]
+        context_provider.read_file_contents = {}
+
+        ctx = MagicMock()
+        ctx.user.user_id = "user_a"
+        extract_context = MagicMock()
+        extract_context.messages = []
+        extract_context.page_id_map.resolve.return_value = target_uri
+
+        extract_loop = object.__new__(ExtractLoop)
+        extract_loop.ctx = ctx
+        extract_loop.context_provider = context_provider
+        extract_loop._extract_context = extract_context
+        extract_loop._isolation_handler = MemoryIsolationHandler(ctx, extract_context)
+        return extract_loop
+
+    @pytest.mark.asyncio
+    async def test_existing_page_id_keeps_write_target_without_invalid_peer_metadata(self):
+        class PreferenceItem(BaseModel):
+            page_id: int
+            peer_id: str
+
+        class Operations(BaseModel):
+            preferences: list[PreferenceItem]
+            delete_ids: list = Field(default_factory=list)
+
+        target_uri = "viking://user/user_a/memories/preferences.md"
+        extract_loop = self._invalid_peer_resolution_loop(target_uri)
+
+        resolved, _ = await extract_loop.resolve_operations(
+            Operations(
+                preferences=[
+                    PreferenceItem(page_id=7, peer_id="web/visitor/alice"),
+                ]
+            )
+        )
+
+        operation = resolved.upsert_operations[0]
+        assert operation.uris == [target_uri]
+        assert operation.resolution_skip is None
+        assert operation.memory_fields == {
+            "memory_type": "preferences",
+            "user_id": "user_a",
+        }
+
+    @pytest.mark.asyncio
+    async def test_invalid_peer_hint_preserves_legacy_self_write_fallback(self):
+        class PreferenceItem(BaseModel):
+            page_id: int
+            peer_id: str
+
+        class Operations(BaseModel):
+            preferences: list[PreferenceItem]
+            delete_ids: list = Field(default_factory=list)
+
+        extract_loop = self._invalid_peer_resolution_loop()
+
+        resolved, _ = await extract_loop.resolve_operations(
+            Operations(
+                preferences=[
+                    PreferenceItem(page_id=101, peer_id="web/visitor/alice"),
+                ]
+            )
+        )
+
+        operation = resolved.upsert_operations[0]
+        assert operation.uris == ["viking://user/user_a/memories/preferences.md"]
+        assert operation.resolution_skip is None
+        assert operation.memory_fields == {
+            "memory_type": "preferences",
+            "user_id": "user_a",
+        }
 
     @pytest.mark.asyncio
     async def test_structured_parser_preserves_delete_ids(self):
@@ -206,8 +345,14 @@ class TestExtractLoopFinalJsonRetry:
         vlm = MagicMock()
         vlm.model = "test-model"
         vlm.get_completion_async = AsyncMock(
-            return_value=('{"delete_ids": [{"delete_page_id": 7, "replacement_page_id": 11}]}')
+            return_value='{"delete_ids": [{"delete_page_id": 7, "replacement_page_id": 11}]}'
         )
+        # decision_reasoning response retained for when the schema field is re-enabled:
+        # return_value=(
+        #     '{"delete_ids": [{"delete_page_id": 7, "replacement_page_id": 11}], '
+        #     '"decision_reasoning": [{"page_id": 7, "remove": [], '
+        #     '"has_unaffected_facts": false, "action": "DELETE"}]}'
+        # )
         extract_loop = ExtractLoop(
             vlm=vlm,
             viking_fs=MagicMock(),
@@ -223,13 +368,22 @@ class TestExtractLoopFinalJsonRetry:
         extract_loop._check_unread_existing_files = AsyncMock(return_value={})
         extract_loop._validate_patch_operations = AsyncMock(return_value=[])
         extract_loop.finalize_operations = AsyncMock()
+        config = SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="json")
+        )
 
-        await extract_loop.run()
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            return_value=config,
+        ):
+            await extract_loop.run()
 
         parsed_operations = extract_loop.resolve_operations.await_args.args[0]
         assert len(parsed_operations.delete_ids) == 1
         assert parsed_operations.delete_ids[0].delete_page_id == 7
         assert parsed_operations.delete_ids[0].replacement_page_id == 11
+        # assert parsed_operations.decision_reasoning[0].action == "DELETE"
+        # assert parsed_operations.decision_reasoning[0].remove == []
 
     def test_add_only_contract_does_not_allow_delete_ids(self):
         schema = MemoryTypeSchema(
@@ -242,18 +396,48 @@ class TestExtractLoopFinalJsonRetry:
         )
         generator = SchemaModelGenerator([schema], template_context={"language": "en"})
 
-        assert "delete_ids" not in generator.create_structured_operations_model().model_fields
+        operations_model = generator.create_structured_operations_model()
+        fields = operations_model.model_fields
+        assert "decision_reasoning" not in fields
+        assert "delete_ids" not in fields
 
-    def test_final_instruction_includes_schema_aware_empty_json(self):
-        extract_loop = object.__new__(ExtractLoop)
-        extract_loop._expected_fields = ["preferences", "tools"]
-
-        instruction = extract_loop._build_final_operations_instruction()
-
-        assert "ONLY a valid JSON object" in instruction
-        assert '"delete_ids": []' in instruction
-        assert '"preferences": []' in instruction
-        assert '"tools": []' in instruction
+        # decision_reasoning schema tests retained for when the field is re-enabled:
+        # assert next(iter(fields)) == "decision_reasoning"
+        # description = fields["decision_reasoning"].description
+        # assert "one decision for every related read page" in description
+        # decisions = operations_model.model_validate(
+        #     {
+        #         "decision_reasoning": [
+        #             {
+        #                 "page_id": 7,
+        #                 "remove": ["- affected fact"],
+        #                 "has_unaffected_facts": True,
+        #                 "action": "UPDATE",
+        #             }
+        #         ]
+        #     }
+        # ).decision_reasoning
+        # assert decisions[0].has_unaffected_facts is True
+        # assert operations_model.model_validate({}).decision_reasoning == []
+        # with pytest.raises(ValueError):
+        #     operations_model.model_validate(
+        #         {
+        #             "decision_reasoning": [
+        #                 {
+        #                     "page_id": 7,
+        #                     "remove": [],
+        #                     "has_unaffected_facts": True,
+        #                     "action": "REMOVE",
+        #                 }
+        #             ]
+        #         }
+        #     )
+        # merge_fields = (
+        #     SchemaModelGenerator([schema], include_decision_reasoning=False)
+        #     .create_structured_operations_model()
+        #     .model_fields
+        # )
+        # assert "decision_reasoning" not in merge_fields
 
     @pytest.mark.asyncio
     async def test_patch_validation_uses_plain_and_sequential_content(self):
@@ -351,9 +535,16 @@ class TestExtractLoopFinalJsonRetry:
             context_provider=FakeContextProvider(),
             max_iterations=1,
         )
+        config = SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="json")
+        )
 
-        with pytest.raises(RuntimeError, match="could not be parsed as JSON memory operations"):
-            await extract_loop.run()
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config",
+            return_value=config,
+        ):
+            with pytest.raises(RuntimeError, match="Final response could not be parsed"):
+                await extract_loop.run()
 
         final_prompts = [
             message["content"]
@@ -366,19 +557,30 @@ class TestExtractLoopFinalJsonRetry:
         assert '"delete_ids": []' in final_prompts[-1]
         assert '"preferences": []' in final_prompts[-1]
 
+        system_prompts = [
+            message["content"]
+            for messages in vlm.seen_messages
+            for message in messages
+            if message.get("role") == "system"
+        ]
+        assert system_prompts
+        initial_system_prompt = system_prompts[0]
+        assert "`delete_ids` deletes the whole item" in initial_system_prompt
+        assert "only if every substantive fact is in scope" in initial_system_prompt
+        assert "otherwise MUST use DELETE blocks" in initial_system_prompt
+        assert "not inferring scope from the file name/topic" in initial_system_prompt
+
     @pytest.mark.asyncio
-    async def test_schema_echo_is_retried_and_cannot_become_empty_success(self):
+    async def test_python_protocol_retries_then_raises_on_empty_response(self):
         class FakeVLM:
             model = "test-model"
 
             def __init__(self):
-                self.calls = 0
+                self.seen_messages = []
 
             async def get_completion_async(self, **kwargs):
-                self.calls += 1
-                if self.calls == 1:
-                    return '{"$defs": {}, "properties": {}, "title": "StructuredMemoryOperations", "type": "object"}'
-                return '{"preferences": [], "delete_ids": []}'
+                self.seen_messages.append(list(kwargs["messages"]))
+                return ""
 
         class FakeContextProvider:
             read_file_contents = {}
@@ -398,13 +600,13 @@ class TestExtractLoopFinalJsonRetry:
                 return []
 
             def get_extract_context(self):
-                return MagicMock()
+                return SimpleNamespace(page_id_map=PageIdMap())
 
             def get_output_language(self):
                 return "en"
 
             def instruction(self):
-                return "Extract memory operations."
+                return "Extract memory operations and output ONLY a JSON object (no extra text before or after)."
 
             async def prefetch(self):
                 return []
@@ -416,17 +618,205 @@ class TestExtractLoopFinalJsonRetry:
             context_provider=FakeContextProvider(),
             max_iterations=1,
         )
-        resolved = ResolvedOperations(
-            upsert_operations=[],
-            delete_file_contents=[],
-            errors=[],
+        config = SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="python")
         )
-        extract_loop.resolve_operations = AsyncMock(return_value=(resolved, []))
+
+        with (
+            patch(
+                "openviking.session.memory.extract_loop.get_openviking_config",
+                return_value=config,
+            ),
+            patch(
+                "openviking_cli.utils.config.get_openviking_config",
+                return_value=config,
+            ),
+            patch("openviking.session.memory.extract_loop.tracer.error") as tracer_error,
+            patch("openviking.session.memory.extract_loop.logger.warning") as logger_warning,
+        ):
+            extract_loop._check_unread_existing_files = AsyncMock(return_value={})
+            extract_loop._validate_patch_operations = AsyncMock(return_value=[])
+            extract_loop.finalize_operations = AsyncMock()
+
+            with pytest.raises(RuntimeError, match="failure_kind=empty_response"):
+                await extract_loop.run()
+
+        extract_loop.finalize_operations.assert_not_awaited()
+
+        assert len(vlm.seen_messages) == 2
+        system_prompt = vlm.seen_messages[0][0]["content"]
+        assert "restricted Python memory SDK" in system_prompt
+        assert "output ONLY a JSON object" not in system_prompt
+        assert any(
+            "not a valid restricted Python memory SDK program" in message.get("content", "")
+            for message in vlm.seen_messages[-1]
+        )
+        assert tracer_error.call_count == 1
+        assert logger_warning.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_python_protocol_parse_retry_success_does_not_log_error(self):
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.responses = iter(
+                    ["sdk.create_profile(content='Engineer')\nsdk.commit()", "sdk.commit()"]
+                )
+
+            async def get_completion_async(self, **kwargs):
+                del kwargs
+                return next(self.responses)
+
+        class FakeContextProvider:
+            read_file_contents = {}
+
+            def get_memory_schemas(self, ctx):
+                del ctx
+                return [
+                    MemoryTypeSchema(
+                        memory_type="profile",
+                        description="Profile",
+                        directory="viking://user/{user_space}/memories",
+                        filename_template="profile.md",
+                        fields=[],
+                    )
+                ]
+
+            def get_tools(self):
+                return []
+
+            def get_extract_context(self):
+                return SimpleNamespace(page_id_map=PageIdMap())
+
+            def get_output_language(self):
+                return "en"
+
+            def instruction(self):
+                return "Extract memory operations."
+
+            async def prefetch(self):
+                return []
+
+        config = SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="python")
+        )
+        extract_loop = ExtractLoop(
+            vlm=FakeVLM(),
+            viking_fs=MagicMock(),
+            context_provider=FakeContextProvider(),
+            max_iterations=1,
+        )
+        empty_operations = ResolvedOperations(
+            upsert_operations=[], delete_file_contents=[], errors=[]
+        )
+        extract_loop.resolve_operations = AsyncMock(return_value=(empty_operations, []))
         extract_loop._check_unread_existing_files = AsyncMock(return_value={})
-        extract_loop._validate_patch_operations = AsyncMock(return_value=[])
-        extract_loop.finalize_operations = AsyncMock()
 
-        result, _ = await extract_loop.run()
+        with (
+            patch(
+                "openviking.session.memory.extract_loop.get_openviking_config",
+                return_value=config,
+            ),
+            patch(
+                "openviking_cli.utils.config.get_openviking_config",
+                return_value=config,
+            ),
+            patch("openviking.session.memory.extract_loop.tracer.error") as tracer_error,
+            patch("openviking.session.memory.extract_loop.logger.warning") as logger_warning,
+        ):
+            operations, _ = await extract_loop.run()
 
-        assert result == resolved
-        assert vlm.calls == 2
+        assert operations is empty_operations
+        assert tracer_error.call_count == 0
+        assert logger_warning.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_python_protocol_resets_format_retry_after_refetch(self):
+        class FakeVLM:
+            model = "test-model"
+
+            def __init__(self):
+                self.responses = iter(
+                    [
+                        "sdk.create_profile(content='invalid')\nsdk.commit()",
+                        "sdk.commit()",
+                        "# Caroline\n- Transgender woman (as of 2023-06-09)",
+                        "sdk.commit()",
+                    ]
+                )
+                self.call_count = 0
+
+            async def get_completion_async(self, **kwargs):
+                del kwargs
+                self.call_count += 1
+                return next(self.responses)
+
+        class FakeContextProvider:
+            read_file_contents = {}
+
+            def get_memory_schemas(self, ctx):
+                del ctx
+                return [
+                    MemoryTypeSchema(
+                        memory_type="profile",
+                        description="Profile",
+                        directory="viking://user/{user_space}/memories",
+                        filename_template="profile.md",
+                        fields=[],
+                    )
+                ]
+
+            def get_tools(self):
+                return []
+
+            def get_extract_context(self):
+                return SimpleNamespace(page_id_map=PageIdMap())
+
+            def get_output_language(self):
+                return "en"
+
+            def instruction(self):
+                return "Extract memory operations."
+
+            async def prefetch(self):
+                return []
+
+        config = SimpleNamespace(
+            memory=SimpleNamespace(link_enabled=False, extraction_output_format="python")
+        )
+        vlm = FakeVLM()
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=FakeContextProvider(),
+            max_iterations=2,
+        )
+        empty_operations = ResolvedOperations(
+            upsert_operations=[], delete_file_contents=[], errors=[]
+        )
+        extract_loop.resolve_operations = AsyncMock(return_value=(empty_operations, []))
+        extract_loop._check_unread_existing_files = AsyncMock(
+            side_effect=[{"viking://user/default/memories/profile.md": {}}, {}]
+        )
+        extract_loop._add_refetch_results_to_messages = AsyncMock()
+
+        with (
+            patch(
+                "openviking.session.memory.extract_loop.get_openviking_config",
+                return_value=config,
+            ),
+            patch(
+                "openviking_cli.utils.config.get_openviking_config",
+                return_value=config,
+            ),
+            patch("openviking.session.memory.extract_loop.tracer.error") as tracer_error,
+            patch("openviking.session.memory.extract_loop.logger.warning") as logger_warning,
+        ):
+            operations, _ = await extract_loop.run()
+
+        assert operations is empty_operations
+        assert vlm.call_count == 4
+        assert extract_loop._add_refetch_results_to_messages.await_count == 1
+        assert tracer_error.call_count == 0
+        assert logger_warning.call_count == 0

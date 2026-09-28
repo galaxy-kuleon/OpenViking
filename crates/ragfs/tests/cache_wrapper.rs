@@ -1,14 +1,15 @@
 use async_trait::async_trait;
-use bytes::Bytes;
 use ragfs::cache::{
-    CacheDecision, CacheError, CacheNamespace, CachePolicy, CacheProvider, CacheResult,
-    CacheTraversalMode, CachedFileSystem, MemoryCacheProvider, MemoryMockProvider,
+    CacheDecision, CacheNamespace, CachePolicy, CacheTraversalMode, CachedFileSystem,
 };
-use ragfs::core::{FsContextInner, GrepResult, MultiWriteWrappedFS, TreeEntry, FS_CTX};
+use ragfs::cache_runtime::{CacheRuntime, MemoryMockProvider};
+use ragfs::core::{
+    FsContextInner, GrepOptions, GrepResult, MultiWriteWrappedFS, TreeEntry, FS_CTX,
+};
 use ragfs::plugins::MemFileSystem;
 use ragfs::{Error, FileInfo, FileSystem, Result, WriteFlag};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -21,185 +22,6 @@ struct CountingFileSystem {
     trees: Arc<AtomicU64>,
     read_delay: Duration,
     partial_remove_path: Option<String>,
-}
-
-struct DeleteFailingProvider {
-    inner: MemoryCacheProvider,
-}
-
-struct TrackingProvider {
-    inner: MemoryCacheProvider,
-    gets: AtomicU64,
-    batch_gets: AtomicU64,
-    active_gets: AtomicU64,
-    max_active_gets: AtomicU64,
-    seen_get_keys: Mutex<Vec<String>>,
-    seen_batch_get_keys: Mutex<Vec<Vec<String>>>,
-    get_delay: Duration,
-}
-
-struct UnavailableProvider;
-
-impl DeleteFailingProvider {
-    fn new() -> Self {
-        Self {
-            inner: MemoryCacheProvider::new(),
-        }
-    }
-}
-
-impl TrackingProvider {
-    fn new() -> Self {
-        Self {
-            inner: MemoryCacheProvider::new(),
-            gets: AtomicU64::new(0),
-            batch_gets: AtomicU64::new(0),
-            active_gets: AtomicU64::new(0),
-            max_active_gets: AtomicU64::new(0),
-            seen_get_keys: Mutex::new(Vec::new()),
-            seen_batch_get_keys: Mutex::new(Vec::new()),
-            get_delay: Duration::ZERO,
-        }
-    }
-
-    fn with_get_delay(mut self, delay: Duration) -> Self {
-        self.get_delay = delay;
-        self
-    }
-
-    fn reset_observed_reads(&self) {
-        self.gets.store(0, Ordering::Relaxed);
-        self.batch_gets.store(0, Ordering::Relaxed);
-        self.active_gets.store(0, Ordering::Relaxed);
-        self.max_active_gets.store(0, Ordering::Relaxed);
-        self.seen_get_keys.lock().unwrap().clear();
-        self.seen_batch_get_keys.lock().unwrap().clear();
-    }
-
-    fn batch_get_count(&self) -> u64 {
-        self.batch_gets.load(Ordering::Relaxed)
-    }
-
-    fn observed_read_keys(&self) -> Vec<String> {
-        let mut keys = self.seen_get_keys.lock().unwrap().clone();
-        keys.extend(
-            self.seen_batch_get_keys
-                .lock()
-                .unwrap()
-                .iter()
-                .flat_map(|batch| batch.iter().cloned()),
-        );
-        keys
-    }
-
-    fn max_concurrent_gets(&self) -> u64 {
-        self.max_active_gets.load(Ordering::Relaxed)
-    }
-
-    fn enter_get(&self) {
-        let active = self.active_gets.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut current = self.max_active_gets.load(Ordering::Relaxed);
-        while active > current {
-            match self.max_active_gets.compare_exchange_weak(
-                current,
-                active,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn exit_get(&self) {
-        self.active_gets.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-#[async_trait]
-impl CacheProvider for DeleteFailingProvider {
-    fn name(&self) -> &'static str {
-        "delete-failing"
-    }
-
-    async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.inner.get(key).await
-    }
-
-    async fn put(&self, key: &str, value: Bytes) -> CacheResult<()> {
-        self.inner.put(key, value).await
-    }
-
-    async fn delete(&self, _key: &str) -> CacheResult<()> {
-        Err(CacheError::Unavailable(
-            "delete intentionally failed".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl CacheProvider for TrackingProvider {
-    fn name(&self) -> &'static str {
-        "tracking"
-    }
-
-    fn capabilities(&self) -> ragfs::cache::ProviderCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.gets.fetch_add(1, Ordering::Relaxed);
-        self.seen_get_keys.lock().unwrap().push(key.to_string());
-        self.enter_get();
-        if !self.get_delay.is_zero() {
-            tokio::time::sleep(self.get_delay).await;
-        }
-        let result = self.inner.get(key).await;
-        self.exit_get();
-        result
-    }
-
-    async fn put(&self, key: &str, value: Bytes) -> CacheResult<()> {
-        self.inner.put(key, value).await
-    }
-
-    async fn delete(&self, key: &str) -> CacheResult<()> {
-        self.inner.delete(key).await
-    }
-
-    async fn batch_get(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
-        self.batch_gets.fetch_add(1, Ordering::Relaxed);
-        self.seen_batch_get_keys.lock().unwrap().push(keys.to_vec());
-        self.inner.batch_get(keys).await
-    }
-
-    async fn batch_put(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
-        self.inner.batch_put(entries).await
-    }
-
-    async fn invalidate(&self, keys: &[String]) -> CacheResult<()> {
-        self.inner.invalidate(keys).await
-    }
-}
-
-#[async_trait]
-impl CacheProvider for UnavailableProvider {
-    fn name(&self) -> &'static str {
-        "unavailable"
-    }
-
-    async fn get(&self, _key: &str) -> CacheResult<Option<Bytes>> {
-        Err(CacheError::Unavailable("provider is down".to_string()))
-    }
-
-    async fn put(&self, _key: &str, _value: Bytes) -> CacheResult<()> {
-        Err(CacheError::Unavailable("provider is down".to_string()))
-    }
-
-    async fn delete(&self, _key: &str) -> CacheResult<()> {
-        Err(CacheError::Unavailable("provider is down".to_string()))
-    }
 }
 
 impl CountingFileSystem {
@@ -309,24 +131,10 @@ impl FileSystem for CountingFileSystem {
         &self,
         path: &str,
         pattern: &str,
-        recursive: bool,
-        case_insensitive: bool,
-        node_limit: Option<usize>,
-        exclude_path: Option<&str>,
-        level_limit: Option<usize>,
+        options: GrepOptions<'_>,
     ) -> Result<GrepResult> {
         self.greps.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .grep(
-                path,
-                pattern,
-                recursive,
-                case_insensitive,
-                node_limit,
-                exclude_path,
-                level_limit,
-            )
-            .await
+        self.inner.grep(path, pattern, options).await
     }
 
     async fn tree_directory(
@@ -343,18 +151,18 @@ impl FileSystem for CountingFileSystem {
     }
 }
 
-fn cached_fs(backend: CountingFileSystem) -> (Arc<CachedFileSystem>, Arc<MemoryCacheProvider>) {
+fn cached_fs(backend: CountingFileSystem) -> (Arc<CachedFileSystem>, Arc<MemoryMockProvider>) {
     cached_fs_with_policy(backend, CachePolicy::default())
 }
 
 fn cached_fs_with_policy(
     backend: CountingFileSystem,
     policy: CachePolicy,
-) -> (Arc<CachedFileSystem>, Arc<MemoryCacheProvider>) {
-    let provider = Arc::new(MemoryCacheProvider::new());
-    let fs = Arc::new(CachedFileSystem::new(
+) -> (Arc<CachedFileSystem>, Arc<MemoryMockProvider>) {
+    let provider = Arc::new(MemoryMockProvider::new());
+    let fs = Arc::new(CachedFileSystem::with_runtime(
         Box::new(backend),
-        provider.clone(),
+        CacheRuntime::memory_with_provider(provider.clone()),
         CacheNamespace::new("test"),
         policy,
     ));
@@ -364,18 +172,18 @@ fn cached_fs_with_policy(
 fn cached_fs_with_tracking_provider(
     backend: CountingFileSystem,
     policy: CachePolicy,
-) -> (Arc<CachedFileSystem>, Arc<TrackingProvider>) {
-    cached_fs_with_tracking_provider_instance(backend, policy, Arc::new(TrackingProvider::new()))
+) -> (Arc<CachedFileSystem>, Arc<MemoryMockProvider>) {
+    cached_fs_with_tracking_provider_instance(backend, policy, Arc::new(MemoryMockProvider::new()))
 }
 
 fn cached_fs_with_tracking_provider_instance(
     backend: CountingFileSystem,
     policy: CachePolicy,
-    provider: Arc<TrackingProvider>,
-) -> (Arc<CachedFileSystem>, Arc<TrackingProvider>) {
-    let fs = Arc::new(CachedFileSystem::new(
+    provider: Arc<MemoryMockProvider>,
+) -> (Arc<CachedFileSystem>, Arc<MemoryMockProvider>) {
+    let fs = Arc::new(CachedFileSystem::with_runtime(
         Box::new(backend),
-        provider.clone(),
+        CacheRuntime::memory_with_provider(provider.clone()),
         CacheNamespace::new("tracking"),
         policy,
     ));
@@ -387,6 +195,48 @@ fn cache_policy_traversal_mode_defaults_to_backend() {
     assert_eq!(
         CachePolicy::default().traversal_mode(),
         CacheTraversalMode::Backend
+    );
+}
+
+#[tokio::test]
+async fn cached_filesystem_accepts_the_unified_runtime_without_changing_read_through() {
+    let backend = CountingFileSystem::new();
+    backend
+        .write("/runtime.md", b"runtime", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let probe = backend.clone();
+    let fs = CachedFileSystem::with_runtime(
+        Box::new(backend),
+        CacheRuntime::memory(),
+        CacheNamespace::new("runtime"),
+        CachePolicy::default(),
+    );
+
+    assert_eq!(fs.read("/runtime.md", 0, 0).await.unwrap(), b"runtime");
+    assert_eq!(fs.read("/runtime.md", 0, 0).await.unwrap(), b"runtime");
+    assert_eq!(probe.read_count(), 1);
+}
+
+#[tokio::test]
+async fn unified_runtime_failure_still_falls_back_to_backend_reads() {
+    let backend = CountingFileSystem::new();
+    backend
+        .write("/fallback.txt", b"backend", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+    let runtime = CacheRuntime::memory();
+    runtime.close().await.unwrap();
+    let cached = CachedFileSystem::with_runtime(
+        Box::new(backend),
+        runtime,
+        CacheNamespace::new("runtime-fail-open"),
+        CachePolicy::default(),
+    );
+
+    assert_eq!(
+        cached.read("/fallback.txt", 0, 0).await.unwrap(),
+        b"backend"
     );
 }
 
@@ -420,7 +270,14 @@ async fn default_grep_delegates_to_backend() {
     let (fs, _) = cached_fs(backend);
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -483,7 +340,14 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     );
 
     let first = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(first.count, 2);
@@ -493,7 +357,14 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     assert_eq!(probe.stat_count(), 1);
 
     let second = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(second.count, 2);
@@ -515,6 +386,47 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
 }
 
 #[tokio::test]
+async fn cached_grep_includes_context_from_cached_content() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write(
+            "/docs/a.md",
+            b"first\nbefore\nneedle\nafter",
+            0,
+            WriteFlag::Create,
+        )
+        .await
+        .unwrap();
+    let (fs, _) = cached_fs_with_policy(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    let result = fs
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                before_context: 2,
+                after_context: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let matched = &result.matches[0];
+    assert_eq!(matched.before_context.as_ref().unwrap()[0].content, "first");
+    assert_eq!(
+        matched.before_context.as_ref().unwrap()[1].content,
+        "before"
+    );
+    assert_eq!(matched.after_context.as_ref().unwrap()[0].content, "after");
+}
+
+#[tokio::test]
 async fn cached_grep_batches_generation_validation_after_warmup() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
@@ -532,13 +444,27 @@ async fn cached_grep_batches_generation_validation_after_warmup() {
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
 
-    fs.grep("/docs", "needle", true, false, None, None, None)
-        .await
-        .unwrap();
+    fs.grep(
+        "/docs",
+        "needle",
+        GrepOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     provider.reset_observed_reads();
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -567,13 +493,27 @@ async fn cached_grep_memoizes_generation_keys_within_one_traversal() {
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
 
-    fs.grep("/docs", "needle", true, false, None, None, None)
-        .await
-        .unwrap();
+    fs.grep(
+        "/docs",
+        "needle",
+        GrepOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     provider.reset_observed_reads();
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -608,20 +548,34 @@ async fn cached_grep_scans_cached_files_with_bounded_concurrency() {
             .await
             .unwrap();
     }
-    let provider = Arc::new(TrackingProvider::new().with_get_delay(Duration::from_millis(30)));
+    let provider = Arc::new(MemoryMockProvider::new().with_get_delay(Duration::from_millis(30)));
     let (fs, provider) = cached_fs_with_tracking_provider_instance(
         backend,
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
         provider,
     );
 
-    fs.grep("/docs", "needle", true, false, None, None, None)
-        .await
-        .unwrap();
+    fs.grep(
+        "/docs",
+        "needle",
+        GrepOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     provider.reset_observed_reads();
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -665,11 +619,14 @@ async fn cached_grep_traversal_matches_default_grep_semantics() {
         .grep(
             "/docs",
             "needle",
-            true,
-            true,
-            Some(2),
-            Some("/docs/skip"),
-            Some(1),
+            GrepOptions {
+                recursive: true,
+                case_insensitive: true,
+                node_limit: Some(2),
+                exclude_path: Some("/docs/skip"),
+                level_limit: Some(1),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -677,11 +634,14 @@ async fn cached_grep_traversal_matches_default_grep_semantics() {
         .grep(
             "/docs",
             "needle",
-            true,
-            true,
-            Some(2),
-            Some("/docs/skip"),
-            Some(1),
+            GrepOptions {
+                recursive: true,
+                case_insensitive: true,
+                node_limit: Some(2),
+                exclude_path: Some("/docs/skip"),
+                level_limit: Some(1),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -708,9 +668,9 @@ async fn cached_grep_traversal_falls_back_for_multiwrite_backend() {
     let multiwrite = MultiWriteWrappedFS::builder(Arc::new(primary))
         .build()
         .unwrap();
-    let fs = CachedFileSystem::new(
+    let fs = CachedFileSystem::with_runtime(
         Box::new(multiwrite),
-        Arc::new(MemoryCacheProvider::new()),
+        CacheRuntime::memory(),
         CacheNamespace::new("grep-multiwrite"),
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
@@ -718,9 +678,16 @@ async fn cached_grep_traversal_falls_back_for_multiwrite_backend() {
     let ctx = Arc::new(FsContextInner::new("acct"));
     let result = FS_CTX
         .scope(ctx, async {
-            fs.grep("/docs", "needle", true, false, None, None, None)
-                .await
-                .unwrap()
+            fs.grep(
+                "/docs",
+                "needle",
+                GrepOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
         })
         .await;
 
@@ -839,9 +806,11 @@ async fn cached_tree_traversal_falls_back_when_provider_is_unavailable() {
         .await
         .unwrap();
     let probe = backend.clone();
-    let fs = CachedFileSystem::new(
+    let provider = Arc::new(MemoryMockProvider::new());
+    provider.set_unavailable(true);
+    let fs = CachedFileSystem::with_runtime(
         Box::new(backend),
-        Arc::new(UnavailableProvider),
+        CacheRuntime::memory_with_provider(provider),
         CacheNamespace::new("tree-unavailable"),
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
@@ -876,9 +845,9 @@ async fn cached_tree_traversal_falls_back_for_multiwrite_backend() {
     let multiwrite = MultiWriteWrappedFS::builder(Arc::new(primary))
         .build()
         .unwrap();
-    let fs = CachedFileSystem::new(
+    let fs = CachedFileSystem::with_runtime(
         Box::new(multiwrite),
-        Arc::new(MemoryCacheProvider::new()),
+        CacheRuntime::memory(),
         CacheNamespace::new("tree-multiwrite"),
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
@@ -929,44 +898,6 @@ fn cache_policy_marks_high_value_objects_as_preferred() {
         CacheDecision::Cache
     );
     assert_eq!(policy.directory_decision("/docs"), CacheDecision::Prefer);
-}
-
-#[tokio::test]
-async fn memory_provider_satisfies_the_common_contract() {
-    let provider = MemoryMockProvider::new();
-
-    provider.put("one", Bytes::from_static(b"1")).await.unwrap();
-    assert!(provider.exists("one").await.unwrap());
-    assert_eq!(
-        provider.get("one").await.unwrap(),
-        Some(Bytes::from_static(b"1"))
-    );
-
-    provider
-        .batch_put(vec![
-            ("two".to_string(), Bytes::from_static(b"2")),
-            ("three".to_string(), Bytes::from_static(b"3")),
-        ])
-        .await
-        .unwrap();
-    assert_eq!(
-        provider
-            .batch_get(&["one".to_string(), "missing".to_string()])
-            .await
-            .unwrap(),
-        vec![Some(Bytes::from_static(b"1")), None]
-    );
-
-    provider
-        .invalidate(&["one".to_string(), "two".to_string()])
-        .await
-        .unwrap();
-    assert!(!provider.exists("one").await.unwrap());
-    assert!(!provider.exists("two").await.unwrap());
-    provider.flush().await.unwrap();
-    assert!(!provider.exists("three").await.unwrap());
-    provider.close().await.unwrap();
-    assert!(provider.get("three").await.is_err());
 }
 
 #[tokio::test]
@@ -1260,17 +1191,17 @@ async fn shared_provider_generation_bump_invalidates_other_wrappers() {
         .unwrap();
     let direct = backend.clone();
     let probe = backend.clone();
-    let provider = Arc::new(MemoryCacheProvider::new());
+    let runtime = CacheRuntime::memory();
 
-    let first = CachedFileSystem::new(
+    let first = CachedFileSystem::with_runtime(
         Box::new(backend.clone()),
-        provider.clone(),
+        runtime.clone(),
         CacheNamespace::new("shared"),
         CachePolicy::default(),
     );
-    let second = CachedFileSystem::new(
+    let second = CachedFileSystem::with_runtime(
         Box::new(backend),
-        provider,
+        runtime,
         CacheNamespace::new("shared"),
         CachePolicy::default(),
     );
@@ -1298,11 +1229,12 @@ async fn provider_generation_eviction_after_restart_cannot_revive_old_descendant
         .unwrap();
     let direct = backend.clone();
     let probe = backend.clone();
-    let provider = Arc::new(MemoryCacheProvider::new());
+    let provider = Arc::new(MemoryMockProvider::new());
+    let first_runtime = CacheRuntime::memory_with_provider(provider.clone());
 
-    let first = CachedFileSystem::new(
+    let first = CachedFileSystem::with_runtime(
         Box::new(backend.clone()),
-        provider.clone(),
+        first_runtime.clone(),
         CacheNamespace::new("restart"),
         CachePolicy::default(),
     );
@@ -1317,14 +1249,15 @@ async fn provider_generation_eviction_after_restart_cannot_revive_old_descendant
 
     for key in provider.keys().await {
         if key.contains(":subtree:") {
-            provider.delete(&key).await.unwrap();
+            first_runtime.del(&[key]).await.unwrap();
         }
     }
     drop(first);
+    drop(first_runtime);
 
-    let restarted = CachedFileSystem::new(
+    let restarted = CachedFileSystem::with_runtime(
         Box::new(backend),
-        provider,
+        CacheRuntime::memory_with_provider(provider),
         CacheNamespace::new("restart"),
         CachePolicy::default(),
     );
@@ -1423,9 +1356,11 @@ async fn failed_invalidation_bypasses_cache_instead_of_serving_stale_data() {
         .await
         .unwrap();
     let probe = backend.clone();
-    let fs = CachedFileSystem::new(
+    let provider = Arc::new(MemoryMockProvider::new());
+    provider.set_delete_failure(true);
+    let fs = CachedFileSystem::with_runtime(
         Box::new(backend),
-        Arc::new(DeleteFailingProvider::new()),
+        CacheRuntime::memory_with_provider(provider),
         CacheNamespace::new("delete-failure"),
         CachePolicy::default(),
     );
@@ -1450,9 +1385,11 @@ async fn unavailable_provider_falls_back_to_backend_and_enters_bypass() {
         .await
         .unwrap();
     let probe = backend.clone();
-    let fs = CachedFileSystem::new(
+    let provider = Arc::new(MemoryMockProvider::new());
+    provider.set_unavailable(true);
+    let fs = CachedFileSystem::with_runtime(
         Box::new(backend),
-        Arc::new(UnavailableProvider),
+        CacheRuntime::memory_with_provider(provider),
         CacheNamespace::new("unavailable"),
         CachePolicy::default(),
     );
@@ -1464,6 +1401,50 @@ async fn unavailable_provider_falls_back_to_backend_and_enters_bypass() {
     let metrics = fs.metrics().snapshot();
     assert!(metrics.errors >= 2);
     assert!(metrics.policy_bypasses >= 1);
+}
+
+#[tokio::test]
+async fn generation_backfill_is_bounded_and_continues_after_one_set_failure() {
+    let backend = CountingFileSystem::new();
+    let mut current = String::new();
+    for component in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"] {
+        current.push('/');
+        current.push_str(component);
+        backend.mkdir(&current, 0o755).await.unwrap();
+    }
+    let path = "/a/b/c/d/e/f/g/h/i/j/k/l/file.md";
+    backend
+        .write(path, b"generation", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+
+    let provider = Arc::new(MemoryMockProvider::new().with_set_delay(Duration::from_millis(20)));
+    provider.fail_next_set_matching(":subtree:");
+    let fs = CachedFileSystem::with_runtime(
+        Box::new(backend),
+        CacheRuntime::memory_with_provider(Arc::clone(&provider)),
+        CacheNamespace::new("generation-set-failure"),
+        CachePolicy::default(),
+    );
+
+    assert_eq!(fs.read(path, 0, 0).await.unwrap(), b"generation");
+
+    let keys = provider.keys().await;
+    assert_eq!(
+        keys.iter().filter(|key| key.contains(":subtree:")).count(),
+        13,
+        "one of the fourteen ancestor generation writes should fail"
+    );
+    assert_eq!(
+        keys.iter().filter(|key| key.contains(":file:")).count(),
+        1,
+        "a generation write failure must not prevent the file cache fill"
+    );
+    assert_eq!(fs.metrics().snapshot().errors, 1);
+    assert!(
+        (2..=8).contains(&provider.max_concurrent_sets()),
+        "generation writes should run concurrently with a fixed upper bound"
+    );
 }
 
 #[tokio::test]

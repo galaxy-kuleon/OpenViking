@@ -4,24 +4,31 @@
 # ragfs-python's default S3-enabled dependency set currently requires rustc >= 1.91.1.
 FROM rust:1.91.1-trixie AS rust-toolchain
 
-# Stage 2: build Python environment with uv (builds Rust CLI + C++ extension + web-studio from source)
+# Stage 2: build Studio separately so npm failures stop the Docker build.
+FROM node:24-trixie-slim AS web-studio-builder
+ARG TARGETPLATFORM
+WORKDIR /app/web-studio
+
+# Keep npm install cached when only Studio sources change.
+COPY web-studio/package.json web-studio/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,id=npm-${TARGETPLATFORM} npm ci
+COPY web-studio/ ./
+RUN npm run build -- --base=/studio/ \
+ && test -f dist/index.html
+
+# Stage 3: build Python environment with uv (builds Rust CLI + C++ extension)
 FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim AS py-builder
 
 # Reuse Rust toolchain from stage 1 so setup.py can compile ov CLI in-place.
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
-# Provide Node.js so setup.py build_py can build web-studio SPA in-tree.
-COPY --from=node:24-trixie-slim /usr/local/bin/node /usr/local/bin/
-COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
-RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
- && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 ENV CARGO_HOME=/usr/local/cargo
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
 # Archive builds have no .git metadata. Keep the package version in this
 # committed Dockerfile so the image contents are a function of the gitlink.
 # The arg remains overridable for upstream release workflows.
-ARG OPENVIKING_VERSION=0.4.15
+ARG OPENVIKING_VERSION=0.4.22
 ARG TARGETPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,29 +55,24 @@ WORKDIR /app
 # Copy source required for setup.py artifact builds and native extension build.
 COPY Cargo.toml Cargo.lock ./
 COPY pyproject.toml uv.lock setup.py README.md ./
-COPY build_support/ build_support/
+COPY scripts/build_support/ scripts/build_support/
 COPY bot/ bot/
 COPY crates/ crates/
 COPY openviking/ openviking/
+COPY --from=web-studio-builder /app/web-studio/dist/ openviking/web_studio/dist/
 COPY openviking_cli/ openviking_cli/
 COPY src/ src/
 COPY third_party/ third_party/
-COPY web-studio/ web-studio/
 
-# Install project and dependencies (triggers setup.py build_py → web-studio
-# SPA build + build_ext → native extensions). The committed lockfile is part
-# of the image provenance: a stale lock must fail the build instead of silently
-# resolving a different dependency graph under the same source revision.
 RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
-    --mount=type=cache,target=/root/.npm,id=npm-${TARGETPLATFORM} \
     --mount=type=cache,target=/cargo-target,id=cargo-target-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
     --mount=type=cache,target=/root/.ccache,id=ccache-${TARGETPLATFORM} \
     export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"; \
-    uv sync --locked --no-editable --extra bot --extra gemini
+    uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss
 
-# Stage 3: runtime
+# Stage 4: runtime
 FROM python:3.13-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -78,15 +80,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     libstdc++6 \
-    ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Resolve relative storage paths inside the persistent mount.
+WORKDIR /app/.openviking
 
 COPY --from=py-builder /app/.venv /app/.venv
-COPY docker/openviking-entrypoint.sh /usr/local/bin/openviking-entrypoint
-COPY docker/pending_health_server.py /usr/local/bin/openviking-pending-health
+# Fail the image build if VikingBot and the separately released SDK drift apart.
+RUN /app/.venv/bin/python -I -c "import inspect; from importlib.metadata import version; from openviking_sdk.client import AsyncHTTPClient; signature = inspect.signature(AsyncHTTPClient.get_skill); raise SystemExit(0 if 'include_integrity' in signature.parameters else f\"incompatible openviking-sdk {version('openviking-sdk')}: AsyncHTTPClient.get_skill{signature} lacks include_integrity\")"
+RUN /app/.venv/bin/python -I -c "from importlib.util import find_spec; from pathlib import Path; spec = find_spec('openviking.web_studio'); locations = list(spec.submodule_search_locations or ()) if spec else []; root = Path('/app/.venv').resolve(); p = (Path(locations[0]).resolve() / 'dist/index.html').resolve() if len(locations) == 1 else None; valid = p is not None and p.is_file() and p.is_relative_to(root); raise SystemExit(0 if valid else f'missing or misplaced Studio bundle: spec_found={spec is not None}, locations={locations!r}, resource={p}')"
+COPY deploy/docker/openviking-entrypoint.sh /usr/local/bin/openviking-entrypoint
+COPY deploy/docker/pending_health_server.py /usr/local/bin/openviking-pending-health
 RUN mkdir -p /app/.openviking \
+ && sed -i 's/\r$//' /usr/local/bin/openviking-entrypoint /usr/local/bin/openviking-pending-health \
  && chmod +x /usr/local/bin/openviking-entrypoint /usr/local/bin/openviking-pending-health
 ENV HOME="/app" \
     PATH="/app/.venv/bin:$PATH" \
@@ -98,7 +104,7 @@ EXPOSE 1933
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["openviking-entrypoint", "--healthcheck"]
 
-# All persistent state (ov.conf, ovcli.conf, workspace data) lives under
+# Default persistent state (ov.conf, ovcli.conf, workspace data) lives under
 # /app/.openviking, which mirrors the host's ~/.openviking layout. Mount one
 # volume there to persist everything across container restarts:
 #   docker run -v ~/.openviking:/app/.openviking <image>

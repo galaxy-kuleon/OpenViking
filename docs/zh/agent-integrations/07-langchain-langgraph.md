@@ -292,16 +292,17 @@ commit 策略。如果后续批次或写入后的 commit 失败，`OpenVikingPar
 仓库内提供了可直接运行的最小示例，使用内存测试客户端，无需模型凭证：
 
 ```bash
-uv run --project integrations/langchain --extra langgraph python examples/langchain-langgraph/langchain/rag/quick_app.py
-uv run --project integrations/langchain --extra langgraph python examples/langchain-langgraph/langchain/context-backend/quick_app.py
-uv run --project integrations/langchain --extra langgraph python examples/langchain-langgraph/langchain/message-history/quick_app.py
-uv run --project integrations/langchain --extra langgraph python examples/langchain-langgraph/langgraph/agent/quick_app.py
-uv run --project integrations/langchain --extra langgraph python examples/langchain-langgraph/langgraph/middleware/quick_app.py
+uv run --project examples/langchain --extra langgraph python examples/langchain-langgraph/langchain/rag/quick_app.py
+uv run --project examples/langchain --extra langgraph python examples/langchain-langgraph/langchain/context-backend/quick_app.py
+uv run --project examples/langchain --extra langgraph python examples/langchain-langgraph/langchain/message-history/quick_app.py
+uv run --project examples/langchain --extra langgraph python examples/langchain-langgraph/langgraph/agent/quick_app.py
+uv run --project examples/langchain --extra langgraph python examples/langchain-langgraph/langgraph/middleware/quick_app.py
 ```
 
 连接真实 OpenViking 服务和 OpenAI 兼容模型的示例见 [live LangGraph app](https://github.com/volcengine/OpenViking/blob/main/examples/langchain-langgraph/langgraph/agent/live_app.py)。
 
 ## 参见
 
+- [集成能力参考](./16-capability-reference.md)
 - [examples/langchain-langgraph/](https://github.com/volcengine/OpenViking/tree/main/examples/langchain-langgraph) — 上面所有示例的完整源码
 - [MCP 客户端](./06-mcp-clients.md) — 非 SDK 方式的 MCP 集成

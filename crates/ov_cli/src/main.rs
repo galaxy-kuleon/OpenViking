@@ -289,6 +289,36 @@ enum AttrsCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum AclCommands {
+    Get {
+        uri: String,
+    },
+    Set {
+        uri: String,
+        #[arg(long = "entry")]
+        entries: Vec<String>,
+        /// Whether this node uses inherited grants or direct grants only
+        #[arg(long, value_parser = ["inherit", "restricted"])]
+        acl_mode: Option<String>,
+    },
+    Grant {
+        uri: String,
+        #[arg(long)]
+        principal: String,
+        #[arg(long)]
+        level: String,
+    },
+    Revoke {
+        uri: String,
+        #[arg(long)]
+        principal: String,
+    },
+    Rm {
+        uri: String,
+    },
+}
+
 // Commands are organized with category tags in their doc comments.
 //
 // # Command Tagging System
@@ -323,7 +353,7 @@ enum Commands {
             conflicts_with_all = [
                 "add_type", "to", "parent", "parent_auto_create",
                 "strict_mode", "ignore_dirs", "include", "exclude",
-                "no_directly_upload_media", "tags", "tag_mode",
+                "no_directly_upload_media", "tags", "tag_mode", "acl",
                 "reason", "instruction"
             ]
         )]
@@ -422,47 +452,25 @@ enum Commands {
         /// locally, e.g. --args dry_run:true (supported keys: catalog, dry_run, skip_failed)
         #[arg(long = "args")]
         resource_args: Option<String>,
-        /// Explicit k=v retrieval tag to apply after import. Can be repeated.
-        #[arg(long = "tag", value_name = "k=v", help_heading = "Common options")]
+        /// Comma-separated k=v retrieval tags to apply after import
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
         tags: Vec<String>,
-        /// Tag update mode when --tag is provided
+        /// Tag update mode; clear does not require --tags
         #[arg(
             long = "tag-mode",
             default_value = "replace",
-            value_parser = ["replace", "append"],
+            value_parser = ["replace", "append", "clear"],
             help_heading = "Common options"
         )]
         tag_mode: String,
         #[command(flatten)]
         upload_options: UploadCliOptions,
+        /// ACL JSON, for example {"acl_mode":"restricted","entries":[]}
+        #[arg(long, value_parser = |s: &str| serde_json::from_str::<serde_json::Value>(s))]
+        acl: Option<serde_json::Value>,
     },
-    /// [Data] Add a skill into OpenViking
-    AddSkill {
-        /// Skill directory, SKILL.md, or raw content
-        #[arg(value_name = "skill-path-or-content")]
-        data: String,
-        /// Wait until processing is complete
-        #[arg(long, help_heading = "Common options")]
-        wait: bool,
-        /// Wait timeout in seconds
-        #[arg(
-            long,
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds",
-            help_heading = "Common options"
-        )]
-        timeout: Option<f64>,
-        /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
-        #[arg(
-            short = 'p',
-            long = "parent-auto-create",
-            value_name = "uri",
-            help_heading = "Skill options"
-        )]
-        parent: Option<String>,
-        #[command(flatten)]
-        upload_options: UploadCliOptions,
-    },
+    /// [Data] Add skills from a source (same as `skills add`)
+    AddSkill(SkillAddArgs),
     /// [Data] Manage installed skills
     Skills {
         #[command(subcommand)]
@@ -496,13 +504,47 @@ enum Commands {
         #[arg(
             long = "node-limit",
             short = 'n',
-            alias = "limit",
             default_value = "256",
             value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
         node_limit: i32,
+        /// Number of visible entries to skip
+        #[arg(
+            long,
+            default_value = "0",
+            value_parser = clap::value_parser!(i32).range(0..),
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        offset: i32,
+        /// Maximum number of visible entries to return
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(i32).range(1..),
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        limit: Option<i32>,
+        /// Sort entries by name or modification time
+        #[arg(long, value_parser = ["name", "mtime"], value_name = "field", help_heading = "Common options")]
+        sort_by: Option<String>,
+        /// Sort direction
+        #[arg(
+            long,
+            requires = "sort_by",
+            value_parser = ["asc", "desc"],
+            value_name = "order",
+            help_heading = "Common options"
+        )]
+        sort_order: Option<String>,
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,count,tags,abstract)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
     },
     /// [Data] Get directory tree
     Tree {
@@ -525,13 +567,29 @@ enum Commands {
         #[arg(
             long = "node-limit",
             short = 'n',
-            alias = "limit",
             default_value = "256",
             value_parser = clap::value_parser!(i32).range(0..),
             value_name = "n",
             help_heading = "Common options"
         )]
         node_limit: i32,
+        /// Number of visible entries to skip
+        #[arg(
+            long,
+            default_value = "0",
+            value_parser = clap::value_parser!(i32).range(0..),
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        offset: i32,
+        /// Maximum number of visible entries to return
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(i32).range(1..),
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        limit: Option<i32>,
         /// Maximum depth level to traverse (default: 3)
         #[arg(
             short = 'L',
@@ -541,6 +599,15 @@ enum Commands {
             help_heading = "Common options"
         )]
         level_limit: i32,
+        /// Simple path output (just paths, no tree formatting)
+        #[arg(short, long, help_heading = "Common options")]
+        simple: bool,
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,count,tags)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
     },
     /// [Data] Create directory
     Mkdir {
@@ -550,6 +617,9 @@ enum Commands {
         /// Initial directory description
         #[arg(long, value_name = "text", help_heading = "Common options")]
         description: Option<String>,
+        /// ACL JSON, for example {"acl_mode":"restricted","entries":[]}
+        #[arg(long, value_parser = |s: &str| serde_json::from_str::<serde_json::Value>(s))]
+        acl: Option<serde_json::Value>,
     },
     /// [Data] Remove resource
     #[command(alias = "del", alias = "delete")]
@@ -572,6 +642,18 @@ enum Commands {
         )]
         timeout: Option<f64>,
     },
+    /// [Data] Copy a file or directory
+    Cp {
+        /// Source URI
+        #[arg(value_name = "source")]
+        from_uri: String,
+        /// Target URI
+        #[arg(value_name = "target")]
+        to_uri: String,
+        /// Copy a directory recursively
+        #[arg(short, long, help_heading = "Common options")]
+        recursive: bool,
+    },
     /// [Data] Move or rename resource
     #[command(alias = "rename")]
     Mv {
@@ -592,6 +674,11 @@ enum Commands {
     Attrs {
         #[command(subcommand)]
         action: AttrsCommands,
+    },
+    /// [Data] Manage resource ACL
+    Acl {
+        #[command(subcommand)]
+        action: AclCommands,
     },
     /// [Data] Read file content (Level 2)
     Read {
@@ -662,6 +749,15 @@ enum Commands {
             help_heading = "Common options"
         )]
         timeout: Option<f64>,
+        /// Comma-separated k=v retrieval tags to write with the content
+        #[arg(long = "tags", value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Tag update mode; clear does not require --tags
+        #[arg(long = "tag-mode", default_value = "replace", value_parser = ["replace", "append", "clear"])]
+        tag_mode: String,
+        /// ACL JSON, for example {"acl_mode":"restricted","entries":[]}
+        #[arg(long, value_parser = |s: &str| serde_json::from_str::<serde_json::Value>(s))]
+        acl: Option<serde_json::Value>,
     },
     /// [Data] Update explicit retrieval tags metadata for a file or directory
     #[command(hide = true)]
@@ -752,6 +848,9 @@ enum Commands {
         /// Only include results matching all of these explicit tags
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        /// Include the full visible content for every matched URI
+        #[arg(long, help_heading = "Advanced options")]
+        read_content: bool,
     },
     /// [Experimental][Data] Run context-aware retrieval
     Search {
@@ -821,6 +920,9 @@ enum Commands {
         /// Only include results matching all of these explicit tags
         #[arg(long = "tags", value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        /// Include the full visible content for every matched URI
+        #[arg(long, help_heading = "Advanced options")]
+        read_content: bool,
     },
     /// [Data] Run content pattern search
     Grep {
@@ -847,6 +949,26 @@ enum Commands {
         /// Case insensitive
         #[arg(short, long, help_heading = "Common options")]
         ignore_case: bool,
+        /// Number of lines to show after each match
+        #[arg(
+            short = 'a',
+            long = "after-context",
+            default_value = "0",
+            value_parser = clap::value_parser!(i32).range(0..),
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        after_context: i32,
+        /// Number of lines to show before each match
+        #[arg(
+            short = 'b',
+            long = "before-context",
+            default_value = "0",
+            value_parser = clap::value_parser!(i32).range(0..),
+            value_name = "n",
+            help_heading = "Common options"
+        )]
+        before_context: i32,
         /// Maximum number of results
         #[arg(
             short = 'n',
@@ -867,6 +989,12 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         level_limit: i32,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
+        /// Fields to include in output (currently: tags)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
     },
     /// [Data] Run file glob pattern search
     Glob {
@@ -893,6 +1021,15 @@ enum Commands {
             help_heading = "Common options"
         )]
         node_limit: i32,
+        /// Simple output (one entry per line)
+        #[arg(short, long, help_heading = "Common options")]
+        simple: bool,
+        /// Comma-separated k=v retrieval tags; all tags must match
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
+        tags: Vec<String>,
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,tags)
+        #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
+        fields: Option<Vec<String>>,
     },
     /// [Data] Session management commands
     Session {
@@ -911,38 +1048,6 @@ enum Commands {
     Privacy {
         #[command(subcommand)]
         action: PrivacyCommands,
-    },
-    /// [Experimental][Data] List relations of a resource
-    Relations {
-        /// Viking URI
-        #[arg(value_name = "uri")]
-        uri: String,
-    },
-    /// [Experimental][Data] Create relation links from one URI to one or more targets
-    Link {
-        /// Source URI
-        #[arg(value_name = "from-uri")]
-        from_uri: String,
-        /// One or more target URIs
-        #[arg(value_name = "to-uri")]
-        to_uris: Vec<String>,
-        /// Reason for linking
-        #[arg(
-            long,
-            default_value = "",
-            value_name = "text",
-            help_heading = "Common options"
-        )]
-        reason: String,
-    },
-    /// [Experimental][Data] Remove a relation link
-    Unlink {
-        /// Source URI
-        #[arg(value_name = "from-uri")]
-        from_uri: String,
-        /// Target URI to unlink
-        #[arg(value_name = "to-uri")]
-        to_uri: String,
     },
     /// [Data] Export context as .ovpack
     Export {
@@ -1052,7 +1157,7 @@ enum Commands {
     },
     /// [Interactive] Compile source materials with a VikingBot Skill
     Compile {
-        /// Source directory; repeat the flag or separate directories with commas
+        /// Source file or directory; repeat the flag or separate entries with commas
         #[arg(
             long = "from",
             required = true,
@@ -1066,27 +1171,12 @@ enum Commands {
         /// Skill directory or SKILL.md Viking URI
         #[arg(long, value_name = "uri")]
         skill: String,
-        /// Description of this organization task
+        /// Additional instructions for this Compile task
         #[arg(long, value_name = "text")]
-        reason: Option<String>,
-        /// Wait for the Compile task to finish
-        #[arg(long)]
-        wait: bool,
-        /// Local wait timeout in seconds; does not cancel the task
-        #[arg(
-            long,
-            requires = "wait",
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds"
-        )]
-        timeout: Option<f64>,
-        /// Server-side runtime limit in seconds; reaching it saves partial resource output
-        #[arg(
-            long = "runtime-timeout",
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds"
-        )]
-        runtime_timeout: Option<f64>,
+        instruction: Option<String>,
+        /// Provider arguments as a JSON object
+        #[arg(long, value_name = "json")]
+        args: Option<String>,
     },
 
     // --- Status & Observability ---
@@ -1176,17 +1266,26 @@ enum Commands {
         /// Preview prune_orphans deletions without mutating vectors
         #[arg(long, help_heading = "Common options")]
         dry_run: bool,
-        /// Explicit k=v retrieval tag for rebuilt vector records. Can be repeated.
-        #[arg(long = "tag", value_name = "k=v", help_heading = "Common options")]
+        /// Comma-separated k=v retrieval tags for rebuilt vector records
+        #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
         tags: Vec<String>,
-        /// Tag update mode when --tag is provided
+        /// Tag update mode; clear does not require --tags
         #[arg(
             long = "tag-mode",
             default_value = "replace",
-            value_parser = ["replace", "append"],
+            value_parser = ["replace", "append", "clear"],
             help_heading = "Common options"
         )]
         tag_mode: String,
+        /// Recursively reindex subdirectories (only affects semantic_and_vectors)
+        #[arg(
+            long,
+            default_value_t = true,
+            action = ArgAction::Set,
+            value_name = "bool",
+            help_heading = "Common options"
+        )]
+        recursive: bool,
     },
 }
 
@@ -1204,7 +1303,14 @@ impl Commands {
     }
 
     fn supports_upload_options(&self) -> bool {
-        matches!(self, Self::AddResource { .. } | Self::AddSkill { .. })
+        matches!(
+            self,
+            Self::AddResource { .. }
+                | Self::AddSkill(_)
+                | Self::Skills {
+                    action: SkillCommands::Add(_)
+                }
+        )
     }
 }
 
@@ -1214,7 +1320,7 @@ fn legacy_upload_option_error(
 ) -> Option<&'static str> {
     if options.is_set() && !command.supports_upload_options() {
         Some(
-            "--progress, --no-progress, and --verbose are only supported for add-resource and add-skill.",
+            "--progress, --no-progress, and --verbose are only supported for add-resource, add-skill, and skills add.",
         )
     } else {
         None
@@ -1225,13 +1331,13 @@ fn legacy_upload_option_error(
 enum TaskCommands {
     /// Show status of a specific task
     Status {
-        /// Task ID returned by add-resource/add-skill
+        /// Task ID returned by an asynchronous command, including compile
         #[arg(value_name = "task-id")]
         task_id: String,
     },
     /// Cancel a task
     Cancel {
-        /// Task ID returned by add-resource/add-skill
+        /// Task ID returned by an asynchronous command, including compile
         #[arg(value_name = "task-id")]
         task_id: String,
     },
@@ -1549,29 +1655,34 @@ enum SessionConfigCommands {
     },
 }
 
+#[derive(Args)]
+struct SkillAddArgs {
+    /// Local skill file/directory, Git repository or GitHub tree URL, or raw content
+    #[arg(value_name = "source")]
+    source: String,
+    /// Install only the named skill(s); use '*' to install all skills in a source
+    #[arg(short = 's', long = "skill", value_name = "NAME", num_args = 1.., value_delimiter = ',')]
+    skills: Vec<String>,
+    /// List available skills in the source without installing
+    #[arg(short = 'l', long = "list")]
+    list: bool,
+    /// Wait until processing is complete
+    #[arg(short = 'w', long)]
+    wait: bool,
+    /// Skip confirmation prompt
+    #[arg(short = 'y', long = "yes")]
+    yes: bool,
+    /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
+    #[arg(short = 'p', long = "parent-auto-create", value_name = "uri")]
+    parent: Option<String>,
+    #[command(flatten)]
+    upload_options: UploadCliOptions,
+}
+
 #[derive(Subcommand)]
 enum SkillCommands {
     /// Add skills from a source
-    Add {
-        /// Skill source
-        #[arg(value_name = "source")]
-        source: String,
-        /// Install only the named skill(s); use '*' to install all skills in a source
-        #[arg(short = 's', long = "skill", value_name = "NAME", num_args = 1.., value_delimiter = ',')]
-        skills: Vec<String>,
-        /// List available skills in the source without installing
-        #[arg(short = 'l', long = "list")]
-        list: bool,
-        /// Wait until processing is complete
-        #[arg(short = 'w', long)]
-        wait: bool,
-        /// Skip confirmation prompt
-        #[arg(short = 'y', long = "yes")]
-        yes: bool,
-        /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
-        #[arg(short = 'p', long = "parent-auto-create", value_name = "uri")]
-        parent: Option<String>,
-    },
+    Add(SkillAddArgs),
     /// List installed agent skills
     #[command(alias = "ls")]
     List {
@@ -1849,7 +1960,17 @@ enum AdminCommands {
         user_config_json: Option<String>,
     },
     /// List all accounts (ROOT only)
-    ListAccounts,
+    ListAccounts {
+        /// Filter accounts by ID (supports wildcard * and ?)
+        #[arg(long, value_name = "pattern")]
+        name: Option<String>,
+        /// Page size; omit to list all accounts
+        #[arg(long, value_name = "n")]
+        limit: Option<u32>,
+        /// 1-based page number (requires --limit)
+        #[arg(long, default_value = "1", value_name = "n")]
+        page: u32,
+    },
     /// Delete an account and all associated users (ROOT only)
     DeleteAccount {
         /// Account ID to delete
@@ -1885,15 +2006,62 @@ enum AdminCommands {
         /// Account ID
         #[arg(value_name = "account-id")]
         account_id: String,
-        /// Maximum number of users to list (default: 100)
-        #[arg(long, default_value = "100", value_name = "n")]
-        limit: u32,
+        /// Page size; omit to list all users
+        #[arg(long, value_name = "n")]
+        limit: Option<u32>,
         /// Filter users by name (supports wildcard * and ?)
         #[arg(long, value_name = "pattern")]
         name: Option<String>,
         /// Filter users by role
         #[arg(long, value_name = "role")]
         role: Option<String>,
+        /// 1-based page number (requires --limit)
+        #[arg(long, default_value = "1", value_name = "n")]
+        page: u32,
+    },
+    /// Create an empty account-scoped group
+    CreateGroup {
+        #[arg(value_name = "account-id")]
+        account_id: String,
+        #[arg(value_name = "group-id")]
+        group_id: String,
+    },
+    /// List groups in an account
+    ListGroups {
+        #[arg(value_name = "account-id")]
+        account_id: String,
+    },
+    /// List the users in a group
+    ListGroupMembers {
+        #[arg(value_name = "account-id")]
+        account_id: String,
+        #[arg(value_name = "group-id")]
+        group_id: String,
+    },
+    /// Add an existing account user to a group
+    AddGroupMember {
+        #[arg(value_name = "account-id")]
+        account_id: String,
+        #[arg(value_name = "group-id")]
+        group_id: String,
+        #[arg(value_name = "user-id")]
+        user_id: String,
+    },
+    /// Remove a user from a group
+    RemoveGroupMember {
+        #[arg(value_name = "account-id")]
+        account_id: String,
+        #[arg(value_name = "group-id")]
+        group_id: String,
+        #[arg(value_name = "user-id")]
+        user_id: String,
+    },
+    /// Delete an empty group
+    DeleteGroup {
+        #[arg(value_name = "account-id")]
+        account_id: String,
+        #[arg(value_name = "group-id")]
+        group_id: String,
     },
     /// Remove a user from an account
     RemoveUser {
@@ -1927,6 +2095,20 @@ enum AdminCommands {
         /// Deterministic API key seed
         #[arg(long, value_name = "seed")]
         seed: Option<String>,
+    },
+    /// Update allowlisted settings for an account
+    SetAccountSettings {
+        /// Account ID
+        #[arg(value_name = "account-id")]
+        account_id: String,
+        /// Enable ACL authorization for shared resources
+        #[arg(
+            long,
+            required = true,
+            action = ArgAction::Set,
+            value_name = "true|false"
+        )]
+        acl_enabled: bool,
     },
 }
 
@@ -2481,9 +2663,6 @@ fn is_top_level_server_command(command: &str) -> bool {
             | "grep"
             | "glob"
             | "add-memory"
-            | "relations"
-            | "link"
-            | "unlink"
             | "export"
             | "backup"
             | "import"
@@ -2520,9 +2699,16 @@ fn is_admin_subcommand(token: &str) -> bool {
             | "migrate"
             | "register-user"
             | "list-users"
+            | "create-group"
+            | "list-groups"
+            | "list-group-members"
+            | "add-group-member"
+            | "remove-group-member"
+            | "delete-group"
             | "remove-user"
             | "set-role"
             | "regenerate-key"
+            | "set-account-settings"
     )
 }
 
@@ -3060,6 +3246,9 @@ async fn main() {
             instruction,
             wait,
             timeout,
+            tags,
+            tag_mode,
+            acl,
             strict_mode,
             ignore_dirs,
             include,
@@ -3068,8 +3257,6 @@ async fn main() {
             watch_interval,
             processing_mode,
             resource_args,
-            tags,
-            tag_mode,
             upload_options,
         } => {
             let ctx =
@@ -3118,6 +3305,7 @@ async fn main() {
                     resource_args,
                     tags,
                     tag_mode,
+                    acl,
                     ctx,
                 )
                 .await
@@ -3127,41 +3315,12 @@ async fn main() {
                 ))
             }
         }
-        Commands::AddSkill {
-            data,
-            wait,
-            timeout,
-            parent,
-            upload_options,
-        } => {
-            let ctx =
-                ctx.with_upload_options(upload_options.merged_with_legacy(legacy_upload_options));
-            handlers::handle_add_skill(data, wait, timeout, parent, ctx).await
+        Commands::AddSkill(args) => {
+            handlers::handle_add_skill(args, legacy_upload_options, ctx).await
         }
         Commands::Skills { action } => match action {
-            SkillCommands::Add {
-                source,
-                skills,
-                list,
-                wait,
-                yes,
-                parent,
-            } => {
-                let client = ctx.get_client();
-                commands::skills::add(
-                    &client,
-                    &source,
-                    skills,
-                    list,
-                    wait,
-                    yes,
-                    ctx.should_show_progress(),
-                    ctx.is_verbose(),
-                    ctx.output_format,
-                    ctx.compact,
-                    parent.as_deref(),
-                )
-                .await
+            SkillCommands::Add(args) => {
+                handlers::handle_add_skill(args, legacy_upload_options, ctx).await
             }
             SkillCommands::List { node_limit, parent } => {
                 let client = ctx.get_client();
@@ -3263,15 +3422,6 @@ async fn main() {
                     .await
             }
         },
-        Commands::Relations { uri } => handlers::handle_relations(uri, ctx).await,
-        Commands::Link {
-            from_uri,
-            to_uris,
-            reason,
-        } => handlers::handle_link(from_uri, to_uris, reason, ctx).await,
-        Commands::Unlink { from_uri, to_uri } => {
-            handlers::handle_unlink(from_uri, to_uri, ctx).await
-        }
         Commands::Export {
             uri,
             to,
@@ -3389,21 +3539,73 @@ async fn main() {
             abs_limit,
             all,
             node_limit,
-        } => handlers::handle_ls(uri, simple, recursive, abs_limit, all, node_limit, ctx).await,
+            offset,
+            limit,
+            sort_by,
+            sort_order,
+            fields,
+            tags,
+        } => {
+            handlers::handle_ls(
+                uri,
+                simple,
+                recursive,
+                abs_limit,
+                all,
+                node_limit,
+                offset,
+                limit,
+                sort_by,
+                sort_order,
+                fields,
+                tags,
+                ctx,
+            )
+            .await
+        }
         Commands::Tree {
             uri,
             abs_limit,
             all,
             node_limit,
+            offset,
+            limit,
             level_limit,
-        } => handlers::handle_tree(uri, abs_limit, all, node_limit, level_limit, ctx).await,
-        Commands::Mkdir { uri, description } => handlers::handle_mkdir(uri, description, ctx).await,
+            simple,
+            fields,
+            tags,
+        } => {
+            handlers::handle_tree(
+                uri,
+                abs_limit,
+                all,
+                node_limit,
+                offset,
+                limit,
+                level_limit,
+                simple,
+                fields,
+                tags,
+                ctx,
+            )
+            .await
+        }
+        Commands::Mkdir {
+            uri,
+            description,
+            acl,
+        } => handlers::handle_mkdir(uri, description, acl, ctx).await,
         Commands::Rm {
             uri,
             recursive,
             wait,
             timeout,
         } => handlers::handle_rm(uri, recursive, wait, timeout, ctx).await,
+        Commands::Cp {
+            from_uri,
+            to_uri,
+            recursive,
+        } => handlers::handle_cp(from_uri, to_uri, recursive, ctx).await,
         Commands::Mv { from_uri, to_uri } => handlers::handle_mv(from_uri, to_uri, ctx).await,
         Commands::Stat { uri } => handlers::handle_stat(uri, ctx).await,
         Commands::Attrs { action } => match action {
@@ -3415,6 +3617,7 @@ async fn main() {
                 recursive,
             } => handlers::handle_set_tags(uri, tags, mode, recursive, ctx).await,
         },
+        Commands::Acl { action } => handlers::handle_acl(action, ctx).await,
         Commands::AddMemory { content } => handlers::handle_add_memory(content, ctx).await,
         Commands::Tui { uri } => handlers::handle_tui(uri, ctx).await,
         Commands::Chat {
@@ -3453,10 +3656,8 @@ async fn main() {
             from_uris,
             to,
             skill,
-            reason,
-            wait,
-            timeout,
-            runtime_timeout,
+            instruction,
+            args,
         } => {
             let client = ctx.get_client();
             commands::compile::run(
@@ -3464,10 +3665,8 @@ async fn main() {
                 from_uris,
                 to,
                 skill,
-                reason,
-                wait,
-                timeout,
-                runtime_timeout,
+                instruction,
+                args,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -3512,6 +3711,9 @@ async fn main() {
             wait,
             processing_mode,
             timeout,
+            tags,
+            tag_mode,
+            acl,
         } => {
             let effective_mode = if let Some(m) = mode {
                 m
@@ -3528,6 +3730,9 @@ async fn main() {
                 wait,
                 timeout,
                 processing_mode,
+                tags,
+                tag_mode,
+                acl,
                 ctx,
             )
             .await
@@ -3545,7 +3750,10 @@ async fn main() {
             dry_run,
             tags,
             tag_mode,
-        } => handlers::handle_reindex(uri, mode, wait, dry_run, tags, tag_mode, ctx).await,
+            recursive,
+        } => {
+            handlers::handle_reindex(uri, mode, wait, dry_run, tags, tag_mode, recursive, ctx).await
+        }
         Commands::Get { uri, local_path } => handlers::handle_get(uri, local_path, ctx).await,
         Commands::Find {
             query,
@@ -3558,6 +3766,7 @@ async fn main() {
             level,
             context_type,
             tags,
+            read_content,
         } => {
             handlers::handle_find(
                 query,
@@ -3570,6 +3779,7 @@ async fn main() {
                 level,
                 context_type,
                 tags,
+                read_content,
                 ctx,
             )
             .await
@@ -3586,6 +3796,7 @@ async fn main() {
             level,
             context_type,
             tags,
+            read_content,
         } => {
             handlers::handle_search(
                 query,
@@ -3599,6 +3810,7 @@ async fn main() {
                 level,
                 context_type,
                 tags,
+                read_content,
                 ctx,
             )
             .await
@@ -3608,16 +3820,24 @@ async fn main() {
             exclude_uri,
             pattern,
             ignore_case,
+            after_context,
+            before_context,
             node_limit,
             level_limit,
+            tags,
+            fields,
         } => {
             handlers::handle_grep(
                 uri,
                 exclude_uri,
                 pattern,
                 ignore_case,
+                after_context,
+                before_context,
                 node_limit,
                 level_limit,
+                tags,
+                fields,
                 ctx,
             )
             .await
@@ -3627,7 +3847,10 @@ async fn main() {
             pattern,
             uri,
             node_limit,
-        } => handlers::handle_glob(pattern, uri, node_limit, ctx).await,
+            simple,
+            fields,
+            tags,
+        } => handlers::handle_glob(pattern, uri, node_limit, simple, fields, tags, ctx).await,
     };
 
     if let Err(e) = result {
@@ -3682,6 +3905,42 @@ mod tests {
         assert_eq!(cli.account.as_deref(), Some("acme"));
         assert_eq!(cli.user.as_deref(), Some("alice"));
         assert_eq!(cli.actor_peer_id.as_deref(), Some("peer-a"));
+    }
+
+    #[test]
+    fn cli_parses_copy_recursive_flag() {
+        let file = Cli::try_parse_from([
+            "ov",
+            "cp",
+            "viking://resources/a.md",
+            "viking://resources/b.md",
+        ])
+        .expect("file copy should parse");
+        match file.command {
+            Commands::Cp {
+                from_uri,
+                to_uri,
+                recursive,
+            } => {
+                assert_eq!(from_uri, "viking://resources/a.md");
+                assert_eq!(to_uri, "viking://resources/b.md");
+                assert!(!recursive);
+            }
+            _ => panic!("expected cp command"),
+        }
+
+        let directory = Cli::try_parse_from([
+            "ov",
+            "cp",
+            "-r",
+            "viking://resources/src",
+            "viking://resources/dst",
+        ])
+        .expect("recursive directory copy should parse");
+        match directory.command {
+            Commands::Cp { recursive, .. } => assert!(recursive),
+            _ => panic!("expected cp command"),
+        }
     }
 
     #[test]
@@ -3810,6 +4069,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_grep_context_lines() {
+        let cli = Cli::try_parse_from([
+            "ov",
+            "grep",
+            "--uri",
+            "viking://resources",
+            "-a",
+            "2",
+            "-b",
+            "3",
+            "needle",
+        ])
+        .expect("grep context should parse");
+
+        match cli.command {
+            Commands::Grep {
+                after_context,
+                before_context,
+                ..
+            } => {
+                assert_eq!(after_context, 2);
+                assert_eq!(before_context, 3);
+            }
+            _ => panic!("expected grep command"),
+        }
+    }
+
+    #[test]
     fn cli_find_and_search_reject_removed_peer_id_flag() {
         assert!(Cli::try_parse_from(["ov", "find", "invoice", "--peer-id", "peer-a"]).is_err());
         assert!(Cli::try_parse_from(["ov", "search", "invoice", "--peer-id", "peer-a"]).is_err());
@@ -3855,29 +4142,24 @@ mod tests {
             "viking://resources/wiki",
             "--skill",
             "viking://agent/skills/wiki",
-            "--wait",
-            "--timeout",
-            "10",
-            "--runtime-timeout",
-            "86400",
+            "--instruction",
+            "Keep supporting evidence.",
+            "--args",
+            r#"{"model_name":"endpoint-1"}"#,
         ])
         .expect("compile flags should parse");
         match cli.command {
             Commands::Compile {
                 from_uris,
                 skill,
-                reason,
-                wait,
-                timeout,
-                runtime_timeout,
+                instruction,
+                args,
                 ..
             } => {
                 assert_eq!(from_uris.len(), 3);
                 assert_eq!(skill, "viking://agent/skills/wiki");
-                assert!(reason.is_none());
-                assert!(wait);
-                assert_eq!(timeout, Some(10.0));
-                assert_eq!(runtime_timeout, Some(86_400.0));
+                assert_eq!(instruction.as_deref(), Some("Keep supporting evidence."));
+                assert_eq!(args.as_deref(), Some(r#"{"model_name":"endpoint-1"}"#));
             }
             _ => panic!("expected compile command"),
         }
@@ -3890,21 +4172,6 @@ mod tests {
                 "viking://resources/a",
                 "--to",
                 "viking://resources/wiki",
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "ov",
-                "compile",
-                "--from",
-                "viking://resources/a",
-                "--to",
-                "viking://resources/wiki",
-                "--skill",
-                "viking://agent/skills/wiki",
-                "--timeout",
-                "10",
             ])
             .is_err()
         );
@@ -3930,8 +4197,61 @@ mod tests {
     #[test]
     fn server_commands_require_existing_cli_config() {
         let cli = Cli::try_parse_from(["ov", "ls"]).expect("ls should parse");
+        let paged_ls = Cli::try_parse_from([
+            "ov",
+            "ls",
+            "--offset",
+            "4",
+            "--limit",
+            "5",
+            "--sort-by",
+            "mtime",
+            "--sort-order",
+            "desc",
+        ])
+        .expect("paged ls should parse");
+        let paged_tree = Cli::try_parse_from([
+            "ov",
+            "tree",
+            "viking://resources",
+            "--offset",
+            "6",
+            "--limit",
+            "7",
+        ])
+        .expect("paged tree should parse");
         let health = Cli::try_parse_from(["ov", "health"]).expect("health should parse");
 
+        match paged_ls.command {
+            Commands::Ls {
+                offset,
+                limit,
+                sort_by,
+                sort_order,
+                node_limit,
+                ..
+            } => {
+                assert_eq!(offset, 4);
+                assert_eq!(limit, Some(5));
+                assert_eq!(sort_by.as_deref(), Some("mtime"));
+                assert_eq!(sort_order.as_deref(), Some("desc"));
+                assert_eq!(node_limit, 256);
+            }
+            _ => panic!("expected ls command"),
+        }
+        match paged_tree.command {
+            Commands::Tree {
+                offset,
+                limit,
+                node_limit,
+                ..
+            } => {
+                assert_eq!(offset, 6);
+                assert_eq!(limit, Some(7));
+                assert_eq!(node_limit, 256);
+            }
+            _ => panic!("expected tree command"),
+        }
         assert!(cli.command.requires_cli_config_file());
         assert!(health.command.requires_cli_config_file());
     }
@@ -4106,9 +4426,6 @@ mod tests {
             "grep",
             "glob",
             "add-memory",
-            "relations",
-            "link",
-            "unlink",
             "export",
             "backup",
             "import",
@@ -4149,9 +4466,16 @@ mod tests {
             &["ov", "admin", "migrate"],
             &["ov", "admin", "register-user"],
             &["ov", "admin", "list-users"],
+            &["ov", "admin", "create-group"],
+            &["ov", "admin", "list-groups"],
+            &["ov", "admin", "list-group-members"],
+            &["ov", "admin", "add-group-member"],
+            &["ov", "admin", "remove-group-member"],
+            &["ov", "admin", "delete-group"],
             &["ov", "admin", "remove-user"],
             &["ov", "admin", "set-role"],
             &["ov", "admin", "regenerate-key"],
+            &["ov", "admin", "set-account-settings"],
             &["ov", "system", "wait"],
             &["ov", "system", "status"],
             &["ov", "system", "health"],
@@ -4352,13 +4676,13 @@ mod tests {
         let add_skill = Cli::try_parse_from(["ov", "add-skill", "./skill", "--no-progress"])
             .expect("add-skill upload flags should parse");
         match add_skill.command {
-            Commands::AddSkill { upload_options, .. } => {
-                assert!(upload_options.no_progress);
+            Commands::AddSkill(args) => {
+                assert!(args.upload_options.no_progress);
             }
             _ => panic!("expected add-skill command"),
         }
 
-        assert!(Cli::try_parse_from(["ov", "skills", "add", "./skill", "--progress"]).is_err());
+        assert!(Cli::try_parse_from(["ov", "skills", "add", "./skill", "--progress"]).is_ok());
         assert!(Cli::try_parse_from(["ov", "skills", "update", "--progress"]).is_err());
     }
 
@@ -4423,10 +4747,8 @@ mod tests {
             "ov",
             "add-resource",
             "./README.md",
-            "--tag",
-            "team=search",
-            "--tag",
-            "env=test",
+            "--tags",
+            "team=search,env=test",
             "--tag-mode",
             "append",
         ])
@@ -4439,6 +4761,53 @@ mod tests {
             }
             _ => panic!("expected add-resource command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_clear_tag_mode_without_tags() {
+        let add = Cli::try_parse_from([
+            "ov",
+            "add-resource",
+            "./README.md",
+            "--tag-mode",
+            "clear",
+        ])
+        .expect("add-resource clear mode should parse");
+        match add.command {
+            Commands::AddResource { tags, tag_mode, .. } => {
+                assert!(tags.is_empty());
+                assert_eq!(tag_mode, "clear");
+            }
+            _ => panic!("expected add-resource command"),
+        }
+
+        let write = Cli::try_parse_from([
+            "ov",
+            "write",
+            "viking://resources/demo.md",
+            "--content",
+            "content",
+            "--tag-mode",
+            "clear",
+        ])
+        .expect("write clear mode should parse");
+        assert!(matches!(
+            write.command,
+            Commands::Write { tag_mode, tags, .. } if tag_mode == "clear" && tags.is_empty()
+        ));
+
+        let reindex = Cli::try_parse_from([
+            "ov",
+            "reindex",
+            "viking://resources/demo",
+            "--tag-mode",
+            "clear",
+        ])
+        .expect("reindex clear mode should parse");
+        assert!(matches!(
+            reindex.command,
+            Commands::Reindex { tag_mode, tags, .. } if tag_mode == "clear" && tags.is_empty()
+        ));
     }
 
     #[test]
@@ -4497,35 +4866,35 @@ mod tests {
             _ => panic!("expected skills update"),
         }
 
-        let add_selected = Cli::try_parse_from([
-            "ov",
-            "skills",
-            "add",
-            "https://github.com/acme/skills.git",
-            "--skill",
-            "foo",
-            "bar",
-            "--list",
-            "--yes",
-        ])
-        .expect("skills add RFC flags should parse");
-        match add_selected.command {
-            Commands::Skills {
-                action:
-                    SkillCommands::Add {
-                        source,
-                        skills,
-                        list,
-                        yes,
-                        ..
-                    },
-            } => {
-                assert_eq!(source, "https://github.com/acme/skills.git");
-                assert_eq!(skills, vec!["foo", "bar"]);
-                assert!(list);
-                assert!(yes);
-            }
-            _ => panic!("expected skills add"),
+        for mut argv in [vec!["ov", "add-skill"], vec!["ov", "skills", "add"]] {
+            argv.extend([
+                "https://github.com/acme/skills.git",
+                "--skill",
+                "foo",
+                "bar",
+                "--list",
+                "--yes",
+                "--wait",
+                "--parent-auto-create",
+                "viking://agent/skills",
+                "--no-progress",
+            ]);
+            let add_selected = Cli::try_parse_from(argv)
+                .expect("both skill add commands should accept the same options");
+            let args = match add_selected.command {
+                Commands::AddSkill(args)
+                | Commands::Skills {
+                    action: SkillCommands::Add(args),
+                } => args,
+                _ => panic!("expected skill add command"),
+            };
+            assert_eq!(args.source, "https://github.com/acme/skills.git");
+            assert_eq!(args.skills, vec!["foo", "bar"]);
+            assert!(args.list);
+            assert!(args.yes);
+            assert!(args.wait);
+            assert_eq!(args.parent.as_deref(), Some("viking://agent/skills"));
+            assert!(args.upload_options.no_progress);
         }
 
         let show = Cli::try_parse_from([
@@ -4623,7 +4992,7 @@ mod tests {
         assert_eq!(
             legacy_upload_option_error(upload_options, &tree.command),
             Some(
-                "--progress, --no-progress, and --verbose are only supported for add-resource and add-skill."
+                "--progress, --no-progress, and --verbose are only supported for add-resource, add-skill, and skills add."
             )
         );
 
@@ -4633,12 +5002,7 @@ mod tests {
 
         let skills_add = Cli::try_parse_from(["ov", "--progress", "skills", "add", "./skill"])
             .expect("hidden legacy flag still parses before runtime validation");
-        assert_eq!(
-            legacy_upload_option_error(upload_options, &skills_add.command),
-            Some(
-                "--progress, --no-progress, and --verbose are only supported for add-resource and add-skill."
-            )
-        );
+        assert!(legacy_upload_option_error(upload_options, &skills_add.command).is_none());
     }
 
     #[test]
@@ -4720,7 +5084,6 @@ mod tests {
     fn all_timeout_options_require_positive_finite_seconds() {
         let command_prefixes = [
             vec!["ov", "add-resource", "https://example.com", "--timeout"],
-            vec!["ov", "add-skill", "skill", "--timeout"],
             vec!["ov", "rm", "viking://resources/item", "--timeout"],
             vec![
                 "ov",
@@ -4728,18 +5091,6 @@ mod tests {
                 "viking://resources/item",
                 "--content",
                 "value",
-                "--timeout",
-            ],
-            vec![
-                "ov",
-                "compile",
-                "--from",
-                "viking://resources/source",
-                "--to",
-                "viking://resources/target",
-                "--skill",
-                "viking://user/skills/compiler",
-                "--wait",
                 "--timeout",
             ],
             vec!["ov", "wait", "--timeout"],
@@ -4799,6 +5150,32 @@ mod tests {
                 Cli::try_parse_from(&args).is_ok(),
                 "{args:?} should accept a positive node limit"
             );
+        }
+
+        for prefix in [
+            vec!["ov", "ls", "--limit"],
+            vec!["ov", "tree", "viking://resources", "--limit"],
+        ] {
+            let mut zero_args = prefix.clone();
+            zero_args.push("0");
+            assert!(Cli::try_parse_from(&zero_args).is_err());
+
+            let mut positive_args = prefix;
+            positive_args.push("1");
+            assert!(Cli::try_parse_from(&positive_args).is_ok());
+        }
+
+        for prefix in [
+            vec!["ov", "ls", "--offset"],
+            vec!["ov", "tree", "viking://resources", "--offset"],
+        ] {
+            let mut negative_args = prefix.clone();
+            negative_args.push("-1");
+            assert!(Cli::try_parse_from(&negative_args).is_err());
+
+            let mut zero_args = prefix;
+            zero_args.push("0");
+            assert!(Cli::try_parse_from(&zero_args).is_ok());
         }
     }
 
@@ -5398,17 +5775,24 @@ mod tests {
             "prune_orphans",
             "--wait=false",
             "--dry-run",
-            "--tag",
+            "--tags",
             "team=search",
             "--tag-mode",
             "append",
+            "--recursive=false",
         ]);
 
         let cli = result.expect("reindex command should parse");
         match cli.command {
-            Commands::Reindex { tags, tag_mode, .. } => {
+            Commands::Reindex {
+                tags,
+                tag_mode,
+                recursive,
+                ..
+            } => {
                 assert_eq!(tags, vec!["team=search"]);
                 assert_eq!(tag_mode, "append");
+                assert!(!recursive);
             }
             _ => panic!("expected reindex command"),
         }

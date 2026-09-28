@@ -4,17 +4,20 @@
 Tests for MemoryUpdater.
 """
 
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from openviking.message import Message
-from openviking.message.part import TextPart
+from openviking.message.part import TextPart, ToolPart
 from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.dataclass import (
     MemoryField,
     MemoryFile,
+    MemoryOperationSkip,
+    MemoryOperationSkipCode,
     MemoryOperationSource,
     MemoryTypeSchema,
     ResolvedOperation,
@@ -37,6 +40,7 @@ from openviking.session.memory.utils import (
     MemoryFileUtils,
     parse_memory_file_with_fields,
 )
+from openviking.storage.abstract_overview import parse_abstract_overview
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -156,6 +160,94 @@ class TestMemoryUpdater:
         content = extract_context.get_event_content("0", "")
 
         assert "Gina can expand her clothing store now." in content
+
+    @pytest.mark.parametrize("peer_id", [None, "project-peer"])
+    def test_extract_context_event_content_skips_tool_only_messages(self, peer_id):
+        messages = [
+            Message(
+                id="0",
+                role="assistant",
+                peer_id=peer_id,
+                parts=[TextPart(text="Started writing. "), TextPart(text="Keep spacing.")],
+            ),
+            Message(
+                id="1",
+                role="assistant",
+                peer_id=peer_id,
+                parts=[ToolPart(tool_name="write", tool_status="running")],
+            ),
+            Message(
+                id="2",
+                role="user",
+                peer_id=peer_id,
+                parts=[ToolPart(tool_name="write", tool_status="completed", tool_output="OK")],
+            ),
+            Message(
+                id="3",
+                role="assistant",
+                peer_id=peer_id,
+                parts=[TextPart(text="Finished writing."), ToolPart(tool_name="write")],
+            ),
+        ]
+        original = deepcopy(messages)
+        context = ExtractContext(messages)
+        speaker = peer_id or "assistant"
+        expected = (
+            f"**{speaker}**: Started writing. Keep spacing.\n**{speaker}**: Finished writing."
+        )
+
+        assert context.get_event_content("0-3", "Summary", 0) == expected
+        assert context.get_event_content("0,3", "Summary", 0) == expected.replace("\n", "\n...\n")
+        assert context.read_message_ranges("1-2").elements == [messages[1:3]]
+        assert messages == original
+
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.load_from_yaml(
+            str(PromptManager._get_bundled_templates_dir() / "memory" / "events.yaml")
+        )
+        rendered = MemoryFileUtils.write(
+            MemoryFile(extra_fields={"summary": "Summary", "ranges": "0-3"}),
+            content_template=registry.get("events").content_template,
+            extract_context=context,
+        )
+        assert expected in rendered
+        assert not any(line.strip() == f"**{speaker}**:" for line in rendered.splitlines())
+
+    @pytest.mark.parametrize("peer_id", [None, "project-peer"])
+    @pytest.mark.parametrize(
+        "parts",
+        [
+            pytest.param([], id="no-parts"),
+            pytest.param([TextPart(text="")], id="empty-text"),
+            pytest.param([TextPart(text=" \t\n")], id="whitespace-text"),
+            pytest.param([ToolPart(tool_name="read", tool_status="running")], id="tool-call"),
+            pytest.param(
+                [ToolPart(tool_name="read", tool_status="completed", tool_output="OK")],
+                id="tool-result",
+            ),
+        ],
+    )
+    def test_extract_context_event_content_skips_empty_bodies(self, peer_id, parts):
+        context = ExtractContext([Message(id="0", role="user", peer_id=peer_id, parts=parts)])
+
+        assert context.read_message_ranges("0").pretty_print() == ""
+        assert context.get_event_content("0", "", 0) == ""
+        assert context.get_event_content("0", "Summary", 0) == "Summary"
+
+    @pytest.mark.parametrize("peer_id", [None, "project-peer"])
+    def test_extract_context_event_content_preserves_chunks_around_tool_messages(self, peer_id):
+        text = "A long source message with several sentences. " * 12
+        messages = [
+            Message(id="0", role="assistant", peer_id=peer_id, parts=[TextPart(text=text)]),
+            Message(id="1", role="assistant", peer_id=peer_id, parts=[ToolPart(tool_name="read")]),
+            Message(id="2", role="user", peer_id=peer_id, parts=[TextPart(text="Confirmed.")]),
+        ]
+        context = ExtractContext(messages)
+
+        assert len(context.messages) > len(messages)
+        assert context.get_event_content(f"0-{len(context.messages) - 1}", "", 0) == (
+            f"**{peer_id or 'assistant'}**: {text}\n**{peer_id or 'user'}**: Confirmed."
+        )
 
     def test_create(self):
         """Test creating a MemoryUpdater."""
@@ -314,12 +406,43 @@ class TestMemoryUpdater:
         updater._get_viking_fs = MagicMock(return_value=viking_fs)
         ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
 
-        await updater.generate_overview("events", directory, ctx, extract_context=None)
+        with patch(
+            "openviking.utils.embedding_utils.vectorize_directory_meta",
+            new_callable=AsyncMock,
+        ) as vectorize_directory_meta:
+            generated = await updater.generate_overview(
+                "events", directory, ctx, extract_context=None
+            )
 
-        assert "**Date:**" not in viking_fs.store[overview_uri]
-        assert "- [kept event](./kept_event.md)" in viking_fs.store[overview_uri]
-        assert "- [plain_event.md](./plain_event.md)" in viking_fs.store[overview_uri]
-        assert "deleted_event.md" not in viking_fs.store[overview_uri]
+        assert generated is True
+        vectorize_directory_meta.assert_awaited_once_with(
+            uri=directory,
+            abstract="",
+            overview=(
+                "# Events Overview\n\n"
+                "- [kept event](./kept_event.md)\n\n"
+                "- [plain_event.md](./plain_event.md)"
+            ),
+            context_type="memory",
+            ctx=ctx,
+            include_abstract=False,
+        )
+
+        document = parse_abstract_overview(viking_fs.store[overview_uri])
+        assert document.metadata["generated_by"] == {
+            "component": "MemoryUpdater",
+            "trigger": "memory_update",
+        }
+        assert document.metadata["freshness"] == {
+            "total_entries": 2,
+            "sampled_entries": 2,
+            "unsampled_entries": 0,
+            "pending_child_changes": 0,
+        }
+        assert "**Date:**" not in document.body
+        assert "- [kept event](./kept_event.md)" in document.body
+        assert "- [plain_event.md](./plain_event.md)" in document.body
+        assert "deleted_event.md" not in document.body
 
     @pytest.mark.asyncio
     async def test_generate_overview_template_fallbacks_for_preferences_and_entities(self):
@@ -359,8 +482,16 @@ class TestMemoryUpdater:
         updater._get_viking_fs = MagicMock(return_value=viking_fs)
         ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
 
-        await updater.generate_overview("entities", entity_dir, ctx, extract_context=None)
-        await updater.generate_overview("preferences", preference_dir, ctx, extract_context=None)
+        with patch(
+            "openviking.utils.embedding_utils.vectorize_directory_meta",
+            new_callable=AsyncMock,
+        ) as vectorize_directory_meta:
+            await updater.generate_overview("entities", entity_dir, ctx, extract_context=None)
+            await updater.generate_overview(
+                "preferences", preference_dir, ctx, extract_context=None
+            )
+
+        assert vectorize_directory_meta.await_count == 2
 
         assert "**Category:** 动漫角色" in viking_fs.store[entity_overview_uri]
         assert "- [越前龙马.md](./越前龙马.md)" in viking_fs.store[entity_overview_uri]
@@ -469,6 +600,49 @@ class TestMemoryUpdater:
         )
 
     @pytest.mark.asyncio
+    async def test_apply_operations_reports_expected_empty_uri_as_skip(self):
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=MagicMock())
+        updater._apply_upsert = AsyncMock(return_value=None)
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        operation = ResolvedOperation(
+            memory_fields={"peer_id": "web-visitor-alice"},
+            memory_type="preferences",
+            uris=[],
+            page_id=102,
+            resolution_skip=MemoryOperationSkip(
+                reason_code=MemoryOperationSkipCode.PEER_NOT_ALLOWED,
+                reason="Target peer is outside the allowed memory scope",
+            ),
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[operation],
+            delete_file_contents=[],
+            errors=[],
+        )
+        ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+        with (
+            patch("openviking.session.memory.memory_updater.tracer.info") as tracer_info,
+            patch("openviking.session.memory.memory_updater.tracer.error") as tracer_error,
+        ):
+            result = await updater.apply_operations(operations=operations, ctx=ctx)
+
+        assert result.errors == []
+        assert len(result.skipped_operations) == 1
+        assert result.skipped_operations[0].reason_code == (
+            MemoryOperationSkipCode.PEER_NOT_ALLOWED
+        )
+        updater._apply_upsert.assert_not_awaited()
+        tracer_error.assert_not_called()
+        tracer_info.assert_any_call(
+            "Skipping memory operation by resolution policy: "
+            "memory_type=preferences page_id=102 reason_code=peer_not_allowed"
+        )
+
+    @pytest.mark.asyncio
     async def test_apply_operations_skips_deletes_when_replacement_uri_is_unresolved(self):
         registry = MagicMock()
         registry.get.return_value = MemoryTypeSchema(
@@ -519,6 +693,46 @@ class TestMemoryUpdater:
         assert [(target, str(error)) for target, error in result.errors] == [
             ("events(page_id=102)", "Missing resolved URI"),
             (old_uri, "Skipped delete because batch contains unresolved upsert URIs"),
+        ]
+        updater._apply_delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_operations_preserves_legacy_delete_suppression_for_expected_skip(self):
+        updater = MemoryUpdater(registry=MagicMock())
+        updater._get_viking_fs = MagicMock(return_value=MagicMock())
+        updater._apply_upsert = AsyncMock(return_value=None)
+        updater._apply_delete = AsyncMock()
+        updater._sync_resource_refs_for_result = AsyncMock()
+        updater._vectorize_memories = AsyncMock()
+        updater.generate_overview = AsyncMock()
+        old_uri = "viking://user/alice/memories/preferences/old.md"
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    memory_fields={"ranges": "99"},
+                    memory_type="preferences",
+                    uris=[],
+                    page_id=102,
+                    resolution_skip=MemoryOperationSkip(
+                        reason_code=MemoryOperationSkipCode.INVALID_RANGES,
+                        reason="Message ranges are malformed or out of bounds",
+                    ),
+                )
+            ],
+            delete_file_contents=[
+                MemoryFile(uri=old_uri, extra_fields={"memory_type": "preferences"})
+            ],
+            errors=[],
+        )
+        ctx = RequestContext(user=UserIdentifier("acme", "alice"), role=Role.USER)
+
+        result = await updater.apply_operations(operations=operations, ctx=ctx)
+
+        assert [(target, str(error)) for target, error in result.errors] == [
+            (old_uri, "Skipped delete because batch contains unresolved upsert URIs")
+        ]
+        assert [item.reason_code for item in result.skipped_operations] == [
+            MemoryOperationSkipCode.INVALID_RANGES,
         ]
         updater._apply_delete.assert_not_awaited()
 
