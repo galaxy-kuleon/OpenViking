@@ -629,6 +629,10 @@ class HierarchicalRetriever:
             level = c.get("level", 2)
             display_uri = self._append_level_suffix(c.get("uri", ""), level)
             abstract = c.get("abstract", "")
+            if level == ContextLevel.DETAIL and c.get("context_type") == ContextType.MEMORY.value:
+                from openviking.retrieve.context_assembler.tiers import extract_summary_section
+
+                abstract = extract_summary_section(str(abstract or ""))
             if level in {ContextLevel.ABSTRACT, ContextLevel.OVERVIEW}:
                 # New records persist body-only rerank scalars, but imported or
                 # legacy indexes may still contain the full OKF document. Keep
