@@ -13,6 +13,7 @@ from openviking.session.memory.extraction_output_protocol.base import (
 )
 from openviking.session.memory.tools import add_tool_call_pair_to_messages
 from openviking.session.memory.utils import parse_json_with_stability
+from openviking_cli.utils.config import get_openviking_config
 
 
 class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
@@ -51,7 +52,17 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         )
 
     def render_reference_rules(self, context: ExtractionOutputContext) -> str:
-        rules = """
+        if not get_openviking_config().memory.whole_item_deletion_enabled:
+            rules = """
+## Page ID Rules
+- Every memory item you create or edit MUST include "page_id".
+- For existing items, reuse the page_id shown in read/search results.
+- For new items, assign a unique page_id >= 100.
+- Whole-record deletion is disabled for automatic extraction. Leave delete_ids empty.
+- Add new facts or apply exact edits to the existing record, preserving its other facts.
+"""
+        else:
+            rules = """
 ## Page ID Rules
 - Every memory item you create or edit MUST include "page_id".
 - For existing items, use the page_id shown in read/search results.

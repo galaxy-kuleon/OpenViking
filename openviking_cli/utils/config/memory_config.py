@@ -71,6 +71,10 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    whole_item_deletion_enabled: bool = Field(
+        default=True,
+        description="Allow automatic memory extraction to delete entire existing records. Direct filesystem removal is independent.",
+    )
     extraction_output_format: Literal["json", "python"] = Field(
         default="python",
         description=(

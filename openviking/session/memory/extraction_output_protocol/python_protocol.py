@@ -27,6 +27,7 @@ from openviking.session.memory.merge_op import (
     StrPatch,
 )
 from openviking.session.memory.utils.description_template import render_description_template
+from openviking_cli.utils.config import get_openviking_config
 from openviking.session.memory.utils.line_numbers import (
     every_line_has_line_numbers,
     strip_line_numbers,
@@ -258,6 +259,13 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         return lines
 
     def render_reference_rules(self, context: ExtractionOutputContext) -> str:
+        if not get_openviking_config().memory.whole_item_deletion_enabled:
+            return """
+## Memory Object Rules
+- Whole-record deletion is disabled for automatic extraction; do not call obj.delete().
+- Create memories through the listed methods and edit existing records through their bound objects.
+- Apply exact content edits while preserving existing identity and all unrelated facts.
+"""
         del context
         return """
 ## Memory Object Rules
@@ -1001,6 +1009,8 @@ class _PythonProgramCompiler:
             self._update(owner, kwargs, node)
             return None
         if method == "delete":
+            if not get_openviking_config().memory.whole_item_deletion_enabled:
+                self._error(node, "Whole-record deletion is disabled for automatic memory extraction")
             kwargs = self._eval_keywords(node)
             if node.args or set(kwargs) - {"replacement"}:
                 self._error(node, "delete() accepts only replacement=")

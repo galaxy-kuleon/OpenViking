@@ -24,6 +24,7 @@ from openviking.session.memory.merge_op import MergeOp, MergeOpFactory
 from openviking.session.memory.merge_op.base import FieldType, get_python_type_for_field
 from openviking.session.memory.utils.description_template import render_description_template
 from openviking_cli.utils import get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -265,21 +266,21 @@ class SchemaModelGenerator:
         # so excluding this field prevents the LLM from hallucinating fake deletes.
         has_deletable_schema = any(mt.operation_mode != "add_only" for mt in enabled_memory_types)
         if has_deletable_schema:
+            deletion_enabled = get_openviking_config().memory.whole_item_deletion_enabled
             field_definitions["delete_ids"] = (
                 List[DeleteId],
                 Field(
                     default_factory=list,
+                    max_length=None if deletion_enabled else 0,
                     description=(
                         "Delete operations by page_id. Each item has delete_page_id and "
                         "replacement_page_id; set replacement_page_id to null for a pure delete, "
                         "or to the canonical replacement page_id so existing links/backlinks are inherited."
-                    ),
+                    ) if deletion_enabled else "Whole-record deletion is disabled; this list must be empty.",
                 ),
             )
 
         # Add links field for link extraction (only when enabled globally)
-        from openviking_cli.utils.config import get_openviking_config
-
         config = get_openviking_config()
         link_enabled = config.memory.link_enabled if config.memory else False
         if link_enabled:

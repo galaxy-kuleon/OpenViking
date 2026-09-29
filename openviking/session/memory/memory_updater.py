@@ -51,6 +51,7 @@ from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.utils import VikingURI, get_logger
+from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
@@ -892,6 +893,13 @@ class MemoryUpdater:
 
         if not self._registry:
             raise ValueError("MemoryTypeRegistry is required for URI resolution")
+
+        if not get_openviking_config().memory.whole_item_deletion_enabled and operations.delete_file_contents:
+            for memory in operations.delete_file_contents:
+                error = ValueError("Whole-record deletion is disabled for automatic memory extraction")
+                result.add_error(memory.uri, error)
+                logger.warning("memory_delete_denied uri=%s reason=whole_item_deletion_disabled", memory.uri)
+            operations = operations.model_copy(update={"delete_file_contents": [], "delete_replacements": {}})
 
         # Resolve all URIs first (pass extract_context for template rendering)
         tracer.info(f"[MemoryUpdater] applying operations, isolation_handler={isolation_handler}")
