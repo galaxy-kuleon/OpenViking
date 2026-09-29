@@ -34,6 +34,14 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
             replay = next((a for a in attempts.values() if a.get("retry_of_task_id") == expected_task_id), None)
             if replay:
                 msg = SessionCommitMsg.from_dict(replay["queue_message"])
+                existing = await tracker.get(msg.task_id, **owner)
+                if not existing:
+                    latest_failure = {}
+                    if await session._archive_file_exists(uri, ".failed.json"):
+                        latest_failure = json.loads(await session._viking_fs.read_file(f"{uri}/.failed.json", ctx=session.ctx))
+                    if (replay["state"] != "admitted" or await session._archive_file_exists(uri, ".done")
+                            or latest_failure.get("task_id") == msg.task_id):
+                        raise FailedPreconditionError("Retry task expired; retained archive requires reconciliation")
             else:
                 task = await tracker.get(expected_task_id, **owner)
                 if not task:
