@@ -72,6 +72,7 @@ _CONTRACT_PREAMBLE = (
     "## Output Format: restricted Python memory SDK",
     "Return only Python code, optionally wrapped in one ```python code fence.",
     "The code is interpreted as a restricted DSL and cannot access Python modules, files, or the network.",
+    "The variable sdk is already bound by the system. Never import sdk or any Python module.",
     "The SDK is write-only. To inspect memories, call the native search/read tools before returning the program; never emit sdk.search(), sdk.read(), or sdk.existing() (only the system binds existing objects).",
     "Never return memory content as bare Markdown; all changes must be arguments to SDK calls.",
     "Existing objects shown by the system may use obj.update(field=value, ...) to set complete "

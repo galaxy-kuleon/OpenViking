@@ -395,6 +395,10 @@ class ExtractLoop:
             failure_kind = self._last_llm_failure_kind or "unknown"
             failure_preview = _preview_text(self._last_llm_failure_content)
             parse_error = self._last_parse_error
+            tracer.set(f"memory.extraction.format_failures.{iteration}", {
+                "kind": failure_kind, "error": parse_error,
+                "response": self._last_llm_failure_content,
+            })
             # Add format error message if parse failed (max 1 retry). This may raise
             # max_iterations, granting one more attempt after this failure.
             if self._format_retry_count == 0:
@@ -402,10 +406,11 @@ class ExtractLoop:
                 max_iterations += 1
                 retry_reason = "refusal_text" if failure_kind == "refusal_text" else "format_retry"
                 tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
-                self._add_format_error_message(messages)
 
             # A failure is only terminal when no retry attempt remains after it.
             retry_remaining = iteration < max_iterations
+            if retry_remaining:
+                self._add_format_error_message(messages)
             failure_message = (
                 "Failed to parse memory operations "
                 f"(iteration {iteration}/{max_iterations}) "
@@ -1230,6 +1235,8 @@ class ExtractLoop:
 
     def _add_format_error_message(self, messages: List[Dict[str, Any]]) -> None:
         """Add format error guidance message to prompt."""
+        if self._last_llm_failure_content:
+            messages.append({"role": "assistant", "content": self._last_llm_failure_content})
         messages.append(
             {
                 "role": "user",
