@@ -19,6 +19,22 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
         uri = archive["archive_uri"]
         if not re.fullmatch(r"archive_[0-9]{3,}", archive["archive_id"]):
             continue
+        meta = await session._read_archive_meta(uri)
+        original = (meta.get("phase1") or {}).get("queue_message") or {}
+        attempts = meta.get("retry_attempts") or {}
+        if expected_task_id != original.get("task_id") and expected_task_id not in attempts:
+            continue
+        if (original.get("user") != owner or original.get("session_id") != session.session_id
+                or original.get("session_uri") != session.uri or original.get("archive_uri") != uri):
+            raise FailedPreconditionError("Archived commit ownership does not match this session")
+        replay = next((a for a in attempts.values() if a.get("retry_of_task_id") == expected_task_id), None)
+        if replay and replay.get("state") == "queued":
+            msg = SessionCommitMsg.from_dict(replay["queue_message"])
+            task = await tracker.get(msg.task_id, **owner)
+            if not task:
+                raise FailedPreconditionError("Retry task is unavailable; retained archive requires reconciliation")
+            return {"session_id": session.session_id, "status": "accepted", "task_id": msg.task_id,
+                    "archive_uri": uri, "archived": False, "retry_of_task_id": expected_task_id}
         path = session._viking_fs._uri_to_path(uri, ctx=session.ctx)
         lease = await session._viking_fs._async_agfs.pathlock_acquire_exact(path, timeout_secs=10)
         try:
@@ -60,14 +76,14 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
                           "prior_failure_raw": failure_raw, "state": "admitted",
                           "created_at": get_current_timestamp()}
                 attempts[msg.task_id] = replay
-                await session._merge_archive_meta(uri, {"retry_attempts": attempts}, lease_ref=lease)
+                await session._merge_archive_meta(uri, {"retry_attempts": attempts})
             task = await tracker.create("session_commit", resource_id=session.session_id,
                                         task_id=msg.task_id, meta={"archive_uri": uri,
                                         "retry_of_task_id": expected_task_id}, **owner)
             if replay["state"] == "admitted" and task.status.value == "pending" and not tracker._work_index.has_work(msg.task_id):
                 await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, msg.to_dict())
                 replay["state"] = "queued"
-                await session._merge_archive_meta(uri, {"retry_attempts": attempts}, lease_ref=lease)
+                await session._merge_archive_meta(uri, {"retry_attempts": attempts})
             return {"session_id": session.session_id, "status": "accepted", "task_id": msg.task_id,
                     "archive_uri": uri, "archived": False, "retry_of_task_id": expected_task_id}
         finally:
