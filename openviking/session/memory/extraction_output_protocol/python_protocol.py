@@ -173,6 +173,14 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
     def render_contract(self, context: ExtractionOutputContext) -> str:
         _validate_alias_uniqueness(context.schemas)
         lines = list(_CONTRACT_PREAMBLE)
+        if not get_openviking_config().memory.whole_item_deletion_enabled:
+            lines = [line.replace(", obj.delete(replacement=None)", "") for line in lines]
+            lines = [
+                "Use the system-provided existing-object names exactly as shown. Assign a new object to a variable before linking it. Never recreate or rebind an existing object with sdk.existing()."
+                if "duplicate_1.delete(" in line else line
+                for line in lines
+            ]
+            lines.append("Whole-record deletion is disabled; obj.delete() is unavailable.")
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
         if not context.link_enabled:
