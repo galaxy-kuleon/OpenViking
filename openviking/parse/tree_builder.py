@@ -25,14 +25,15 @@ from typing import Any, Optional
 
 from openviking.core.building_tree import BuildingTree
 from openviking.core.context import Context
-from openviking.core.namespace import is_content_root_uri
+from openviking.core.namespace import canonical_user_root, classify_uri, is_content_root_uri, uri_parts
 from openviking.parse.parsers.media.utils import get_media_base_uri, get_media_type
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.utils import parse_code_hosting_url
 from openviking.utils.path_safety import normalize_storage_target_uri
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.uri import VikingURI
+from openviking_cli.exceptions import PermissionDeniedError
 
 logger = get_logger(__name__)
 
@@ -98,6 +99,16 @@ class TreeBuilder:
             to_uri = normalize_storage_target_uri(to_uri)
         if parent_uri:
             parent_uri = normalize_storage_target_uri(parent_uri)
+
+        if scope == "resources" and ctx.role != Role.ROOT:
+            for target in (to_uri, parent_uri):
+                if target and (
+                    uri_parts(target)[:2] != ["user", ctx.user.user_id]
+                    or classify_uri(target).context_type != "resource"
+                ) and not (ctx.role == Role.ADMIN and uri_parts(target)[:1] == ["resources"]):
+                    raise PermissionDeniedError("Resource ingestion requires your own user resource namespace.")
+            if not to_uri and not parent_uri:
+                parent_uri = f"{canonical_user_root(ctx)}/resources"
 
         final_doc_name = VikingURI.sanitize_segment(doc_name)
         if source_path and source_format == "repository":

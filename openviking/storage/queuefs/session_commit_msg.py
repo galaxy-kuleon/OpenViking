@@ -21,6 +21,7 @@ class SessionCommitMsg:
     # commit. Already normalized by the producer; empty means "no tags".
     event_search_tags: List[str] = field(default_factory=list)
     auto_commit_policy: Dict[str, Any] = field(default_factory=dict)
+    retry_of_task_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

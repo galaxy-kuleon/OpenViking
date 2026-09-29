@@ -710,6 +710,22 @@ async def commit_session(
     ).model_dump(exclude_none=True)
 
 
+class RetryCommitRequest(BaseModel):
+    task_id: str = Field(min_length=1, max_length=128)
+    archive_uri: Optional[str] = None
+
+
+@router.post("/{session_id}/commit/retry")
+async def retry_session_commit(
+    session_id: str,
+    body: RetryCommitRequest,
+    _ctx: RequestContext = Depends(get_session_request_context),
+):
+    from openviking.session.commit_retry import retry_commit
+    session = await get_service().sessions.get(session_id, _ctx, auto_create=False)
+    return Response(status="ok", result=await retry_commit(session, body.task_id, body.archive_uri))
+
+
 @router.post("/{session_id}/extract")
 async def extract_session(
     session_id: str = Path(..., description="Session ID"),

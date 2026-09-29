@@ -2242,6 +2242,14 @@ class Session:
         )
 
     async def resume_queued_commit(self, msg: "SessionCommitMsg") -> bool:
+        path = self._viking_fs._uri_to_path(msg.archive_uri, ctx=self.ctx)
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(path, timeout_secs=10)
+        try:
+            return await self._resume_queued_commit_locked(msg)
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(lease)
+
+    async def _resume_queued_commit_locked(self, msg: "SessionCommitMsg") -> bool:
         """Run one durable Phase 2 job from its archived messages."""
         from openviking.service.task_tracker import get_task_tracker
 
@@ -2278,13 +2286,15 @@ class Session:
             if not _is_storage_not_found(exc):
                 raise
         else:
-            await tracker.fail(
-                msg.task_id,
-                str(failed.get("error") or "session commit failed"),
-                account_id=self.ctx.account_id,
-                user_id=self.ctx.user.user_id,
-            )
-            return True
+            from openviking.session.commit_retry import authorized_retry
+            if failed.get("task_id") == msg.task_id or not await authorized_retry(self, msg):
+                await tracker.fail(
+                    msg.task_id,
+                    str(failed.get("error") or "session commit failed"),
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                )
+                return True
 
         if not await self._ensure_phase1_ready(msg.archive_uri):
             try:
@@ -2981,6 +2991,7 @@ class Session:
                 archive_uri,
                 stage="memory_extraction",
                 error=str(e),
+                task_id=task_id,
                 completed_memory_steps=self._serialize_completed_memory_steps(
                     completed_memory_steps
                 ),
@@ -3033,6 +3044,7 @@ class Session:
         skipped: bool = True,
         completed_memory_steps: Optional[Dict[str, List[str]]] = None,
         lease_ref: Optional[Any] = None,
+        task_id: str = "",
     ) -> None:
         """Persist a terminal failure marker for the archive."""
         if not self._viking_fs:
@@ -3043,9 +3055,24 @@ class Session:
             "failed_at": get_current_timestamp(),
             "skipped": skipped,
             "completed_memory_steps": dict(completed_memory_steps or {}),
+            "task_id": task_id,
+            "user": self.ctx.user.to_dict(),
+            "session_id": self.session_id,
+            "archive_uri": archive_uri,
         }
         if blocked_by:
             payload["blocked_by"] = blocked_by
+        try:
+            previous = await self._viking_fs.read_file(f"{archive_uri}/.failed.json", ctx=self.ctx)
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                raise
+        else:
+            import hashlib
+            digest = hashlib.sha256(previous.encode("utf-8")).hexdigest()
+            await self._viking_fs.write_file(
+                uri=f"{archive_uri}/.failed.{digest}.json", content=previous,
+                ctx=self.ctx, lease_ref=lease_ref)
         await self._viking_fs.write_file(
             uri=f"{archive_uri}/.failed.json",
             content=json.dumps(payload, ensure_ascii=False),

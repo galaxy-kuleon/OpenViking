@@ -191,7 +191,7 @@ AGENT_SKILLS_ROOT = "viking://agent/skills"
 def visible_roots(ctx: RequestContext) -> list[str]:
     return [
         "viking://resources",
-        "viking://agent",
+        "viking://agent" if ctx.role == Role.ROOT else AGENT_SKILLS_ROOT,
         canonical_user_root(ctx),
     ]
 
@@ -334,7 +334,9 @@ def is_accessible(uri: str, ctx: RequestContext) -> bool:
     except NamespaceShapeError:
         return False
 
-    if target.scope in {"", "resources", "agent", "temp", "queue"}:
+    if target.scope == "agent":
+        return uri_parts(target.uri)[:2] == ["agent", "skills"]
+    if target.scope in {"", "resources", "temp", "queue"}:
         return True
     if target.scope == "upload":
         return False
