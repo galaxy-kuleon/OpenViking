@@ -681,9 +681,9 @@ class VLMConfig(BaseModel):
                     vlm_instances.append(VLMFactory.create(config_dict))
 
                 if len(vlm_instances) == 1:
-                    self._vlm_instance = vlm_instances[0]
+                    instance = vlm_instances[0]
                 else:
-                    self._vlm_instance = MultiCredentialVLM(
+                    instance = MultiCredentialVLM(
                         vlm_instances,
                         credential_ids=[c.id for c in self.credentials],
                         failback_timeout_seconds=self.failback_timeout_seconds,
@@ -697,14 +697,14 @@ class VLMConfig(BaseModel):
                 if self.backup is not None and self.backup._has_any_config():
                     backup_config_dict = self.backup._build_vlm_config_dict()
                     backup = VLMFactory.create(backup_config_dict)
-                    self._vlm_instance = FailoverVLM(primary, backup)
+                    instance = FailoverVLM(primary, backup)
                 else:
-                    self._vlm_instance = primary
+                    instance = primary
 
             if self._token_usage_tracker is not None:
-                _bind_token_usage_tracker(self._vlm_instance, self._token_usage_tracker)
+                _bind_token_usage_tracker(instance, self._token_usage_tracker)
             self._vlm_instance = ConcurrencyLimitedVLM(
-                self._vlm_instance,
+                instance,
                 max_concurrent=self.max_concurrent,
             )
 

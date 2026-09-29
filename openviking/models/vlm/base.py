@@ -424,7 +424,6 @@ class ConcurrencyLimitedVLM(VLMBase):
                 "thinking": delegate.thinking,
                 "extra_headers": delegate.extra_headers,
                 "extra_request_body": delegate.extra_request_body,
-                "stream": delegate.stream,
             }
         )
         self._delegate = delegate
