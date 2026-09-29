@@ -165,6 +165,7 @@ class ExtractLoop:
         self._isolation_handler = isolation_handler
         # Track format error retry (max 1 retry)
         self._format_retry_count = 0
+        self._format_repair_messages = []
         self._last_llm_failure_kind: Optional[str] = None
         self._last_llm_failure_content: str = ""
         self._last_parse_error: Optional[str] = None
@@ -1235,14 +1236,19 @@ class ExtractLoop:
 
     def _add_format_error_message(self, messages: List[Dict[str, Any]]) -> None:
         """Add format error guidance message to prompt."""
+        messages[:] = [message for message in messages if not any(
+            message is previous for previous in self._format_repair_messages
+        )]
+        self._format_repair_messages = []
         if self._last_llm_failure_content:
-            messages.append({"role": "assistant", "content": self._last_llm_failure_content})
-        messages.append(
+            self._format_repair_messages.append({"role": "assistant", "content": self._last_llm_failure_content})
+        self._format_repair_messages.append(
             {
                 "role": "user",
                 "content": self._output_protocol.render_format_retry(self._last_parse_error),
             }
         )
+        messages.extend(self._format_repair_messages)
 
     def _build_final_operations_instruction(self) -> str:
         """Build schema-aware final-iteration instructions for the LLM."""
