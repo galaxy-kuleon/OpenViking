@@ -400,6 +400,12 @@ class ExtractLoop:
                 "kind": failure_kind, "error": parse_error,
                 "response": self._last_llm_failure_content,
             })
+            logger.warning("Memory extraction format failure %s", json.dumps({
+                "account_id": self.ctx.account_id if self.ctx else None,
+                "user_id": self.ctx.user.user_id if self.ctx else None,
+                "iteration": iteration, "kind": failure_kind, "error": parse_error,
+                "response": self._last_llm_failure_content,
+            }, ensure_ascii=False))
             # Add format error message if parse failed (max 1 retry). This may raise
             # max_iterations, granting one more attempt after this failure.
             if self._format_retry_count == 0:
