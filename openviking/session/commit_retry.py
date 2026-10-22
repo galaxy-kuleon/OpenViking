@@ -12,14 +12,14 @@ from openviking_cli.exceptions import FailedPreconditionError, NotFoundError
 async def retry_commit(session, expected_task_id, archive_uri=None):
     tracker = get_task_tracker()
     owner = {"account_id": session.ctx.account_id, "user_id": session.ctx.user.user_id}
-    archives = await session._list_archive_refs()
+    archives = await session._archives.list_refs()
     if archive_uri:
         archives = [a for a in archives if a["archive_uri"] == archive_uri]
     for archive in archives:
         uri = archive["archive_uri"]
         if not re.fullmatch(r"archive_[0-9]{3,}", archive["archive_id"]):
             continue
-        meta = await session._read_archive_meta(uri)
+        meta = await session._archives.read_meta(uri)
         original = (meta.get("phase1") or {}).get("queue_message") or {}
         attempts = meta.get("retry_attempts") or {}
         if expected_task_id != original.get("task_id") and expected_task_id not in attempts:
@@ -38,7 +38,7 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
         path = session._viking_fs._uri_to_path(uri, ctx=session.ctx)
         lease = await session._viking_fs._async_agfs.pathlock_acquire_exact(path, timeout_secs=10)
         try:
-            meta = await session._read_archive_meta(uri)
+            meta = await session._archives.read_meta(uri)
             phase1 = meta.get("phase1") or {}
             original = phase1.get("queue_message") or {}
             attempts = dict(meta.get("retry_attempts") or {})
@@ -68,7 +68,7 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
                 if failure.get("stage") != "memory_extraction" or (
                     failure.get("task_id") or original["task_id"]) != expected_task_id:
                     raise FailedPreconditionError("Failure receipt does not identify a retryable extraction")
-                if not await session._read_archive_messages(uri):
+                if not await session._archives.read_messages(uri):
                     raise FailedPreconditionError("Archive has no intact messages to retry")
                 msg = SessionCommitMsg.from_dict({**original, "task_id": str(uuid4()),
                                                   "retry_of_task_id": expected_task_id})
@@ -94,7 +94,7 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
 async def authorized_retry(session, msg):
     if not msg.retry_of_task_id:
         return False
-    meta = await session._read_archive_meta(msg.archive_uri)
+    meta = await session._archives.read_meta(msg.archive_uri)
     receipt = (meta.get("retry_attempts") or {}).get(msg.task_id) or {}
     return (receipt.get("retry_of_task_id") == msg.retry_of_task_id
             and receipt.get("queue_message") == msg.to_dict()
