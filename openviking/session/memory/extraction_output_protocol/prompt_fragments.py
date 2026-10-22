@@ -20,6 +20,8 @@ PYTHON_FORMAT_RULES = (
     "## Output Format: restricted Python memory SDK",
     "Return only Python code, optionally wrapped in one ```python code fence.",
     "The code is interpreted as a restricted DSL and cannot access Python modules, files, or the network.",
+    "sdk is already provided. Never import sdk or any module; import statements are invalid. "
+    "Use only assignments and the available SDK/object calls below, without loops or function definitions.",
 )
 PYTHON_CONTENT_RULE = (
     "Never return memory content as bare Markdown; all changes must be arguments to SDK calls."

@@ -327,7 +327,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             )
         return (
             "Your previous output was not a valid restricted Python memory SDK program."
-            f"{detail}{tool_guidance}{binding_guidance}{quote_guidance} Regenerate the complete "
+            f"{detail}{tool_guidance}{binding_guidance}{quote_guidance} "
+            "sdk is already provided: remove every import statement. Only assignments and "
+            "the listed SDK/object calls are accepted. Regenerate the complete "
             "program and output no explanation. "
             "Put Markdown memory content inside quoted SDK arguments, using triple-quoted strings "
             '("""...""") for any multi-line or Markdown text so newlines and quotes stay inside '
