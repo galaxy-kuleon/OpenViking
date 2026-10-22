@@ -146,6 +146,20 @@ JSON_ADD_ONLY_REFERENCE_RULES = """
 - Every new memory item MUST include a unique "page_id" >= 100.
 - Create new memories only, with complete field values; do not modify or delete existing memories.
 """
+JSON_RETAINED_REFERENCE_RULES = """
+## Page ID Rules
+- Every memory item you create or edit MUST include "page_id".
+- For existing items, reuse the page_id shown in the supplied memory context.
+- For new items, assign a unique page_id >= 100.
+- Whole-record deletion is disabled for automatic extraction. Leave delete_ids empty.
+- Apply the schema-supported exact edits or complete field updates, preserving every unrelated fact.
+"""
+PYTHON_RETAINED_REFERENCE_RULES = """
+## Memory Object Rules
+- Whole-record deletion is disabled for automatic extraction; do not call obj.delete().
+- Create memories through the listed methods and edit existing records through their bound objects.
+- Apply schema-supported field edits while preserving every unrelated fact and existing identity.
+"""
 JSON_UPSERT_REFERENCE_RULES = """
 ## Page ID Rules
 - Every memory item you create or edit MUST include "page_id".
