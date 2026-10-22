@@ -59,7 +59,7 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
                     raise NotFoundError(expected_task_id, "task")
                 if task.task_type != "session_commit" or task.resource_id != session.session_id or task.status.value != "failed":
                     raise FailedPreconditionError("Only a failed session extraction can be retried")
-                if tracker._work_index.has_work(expected_task_id):
+                if await tracker.has_work(expected_task_id, **owner):
                     raise FailedPreconditionError("The previous task still owns unfinished work")
                 if phase1.get("status") != "ready" or await session._archive_file_exists(uri, ".done"):
                     raise FailedPreconditionError("Archive requires reconciliation, not extraction retry")
@@ -80,7 +80,7 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
             task = await tracker.create("session_commit", resource_id=session.session_id,
                                         task_id=msg.task_id, meta={"archive_uri": uri,
                                         "retry_of_task_id": expected_task_id}, **owner)
-            if replay["state"] == "admitted" and task.status.value == "pending" and not tracker._work_index.has_work(msg.task_id):
+            if replay["state"] == "admitted" and task.status.value == "pending" and not await tracker.has_work(msg.task_id, **owner):
                 await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, msg.to_dict())
                 replay["state"] = "queued"
                 await session._merge_archive_meta(uri, {"retry_attempts": attempts})
