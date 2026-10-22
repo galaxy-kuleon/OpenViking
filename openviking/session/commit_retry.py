@@ -3,6 +3,7 @@ import re
 from uuid import uuid4
 
 from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_work_index import bind_task_context
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
 from openviking.utils.time_utils import get_current_timestamp
@@ -81,7 +82,8 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
                                         task_id=msg.task_id, meta={"archive_uri": uri,
                                         "retry_of_task_id": expected_task_id}, **owner)
             if replay["state"] == "admitted" and task.status.value == "pending" and not await tracker.has_work(msg.task_id, **owner):
-                await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, msg.to_dict())
+                with bind_task_context(msg.task_id, owner["account_id"], owner["user_id"]):
+                    await get_queue_manager().enqueue(QueueManager.SESSION_COMMIT, msg.to_dict())
                 replay["state"] = "queued"
                 await session._merge_archive_meta(uri, {"retry_attempts": attempts})
             return {"session_id": session.session_id, "status": "accepted", "task_id": msg.task_id,
