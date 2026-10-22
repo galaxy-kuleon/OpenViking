@@ -3,7 +3,7 @@ import re
 from uuid import uuid4
 
 from openviking.service.task_tracker import get_task_tracker
-from openviking.service.task_work_index import bind_task_context
+from openviking.service.task_work_index import TASK_WORK_ID_FIELD, bind_task_context
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
 from openviking.utils.time_utils import get_current_timestamp
@@ -66,8 +66,15 @@ async def retry_commit(session, expected_task_id, archive_uri=None):
                     raise FailedPreconditionError("Archive requires reconciliation, not extraction retry")
                 failure_raw = await session._viking_fs.read_file(f"{uri}/.failed.json", ctx=session.ctx)
                 failure = json.loads(failure_raw)
+                failure_task_id = failure.get("task_id") or original["task_id"]
+                inherited_failure = (
+                    failure_task_id == original["task_id"]
+                    and expected_task_id in attempts
+                    and task.error == failure.get("error")
+                )
                 if failure.get("stage") != "memory_extraction" or (
-                    failure.get("task_id") or original["task_id"]) != expected_task_id:
+                    failure_task_id != expected_task_id and not inherited_failure
+                ):
                     raise FailedPreconditionError("Failure receipt does not identify a retryable extraction")
                 if not await session._archives.read_messages(uri):
                     raise FailedPreconditionError("Archive has no intact messages to retry")
@@ -98,7 +105,11 @@ async def authorized_retry(session, msg):
         return False
     meta = await session._archives.read_meta(msg.archive_uri)
     receipt = (meta.get("retry_attempts") or {}).get(msg.task_id) or {}
+    expected = dict(receipt.get("queue_message") or {})
+    actual = msg.to_dict()
+    expected.pop(TASK_WORK_ID_FIELD, None)
+    actual.pop(TASK_WORK_ID_FIELD, None)
     return (receipt.get("retry_of_task_id") == msg.retry_of_task_id
-            and receipt.get("queue_message") == msg.to_dict()
+            and expected == actual
             and msg.user == session.ctx.user.to_dict()
             and msg.session_uri == session.uri and msg.session_id == session.session_id)
