@@ -10,13 +10,13 @@ import { readRequestBody, withMockOpenViking, writeJson } from "../../memory-plu
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
-function runAutoCapture(input, env) {
+function runHook(script, input, env) {
   return new Promise((resolve, reject) => {
     const cleanEnv = { ...process.env };
     for (const key of Object.keys(cleanEnv)) {
       if (key.startsWith("OPENVIKING_")) delete cleanEnv[key];
     }
-    const child = spawn(process.execPath, [join(SCRIPT_DIR, "auto-capture.mjs")], {
+    const child = spawn(process.execPath, [join(SCRIPT_DIR, script)], {
       env: { ...cleanEnv, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -27,13 +27,17 @@ function runAutoCapture(input, env) {
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`auto-capture exited ${code}: ${stderr}`));
+        reject(new Error(`${script} exited ${code}: ${stderr}`));
         return;
       }
       resolve({ stdout, stderr });
     });
     child.stdin.end(JSON.stringify(input));
   });
+}
+
+function runAutoCapture(input, env) {
+  return runHook("auto-capture.mjs", input, env);
 }
 
 function hookEnv(root, baseUrl) {
@@ -117,6 +121,54 @@ test("failed non-retryable capture keeps the cursor for a later retry", async ()
       await readFile(join(root, "openviking-cc-capture-state", `${sessionId}.json`), "utf-8"),
     );
     assert.equal(state.capturedTurnCount, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("threshold commit archives every captured message", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ov-cc-capture-commit-"));
+  const transcriptPath = join(root, "transcript.jsonl");
+  const commits = [];
+
+  try {
+    await writeTranscript(transcriptPath);
+    await withMockOpenViking(async (req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") {
+        writeJson(res, { status: "ok", result: { healthy: true } });
+        return;
+      }
+      if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
+        const body = await readRequestBody(req);
+        writeJson(res, { status: "ok", result: { added: body.messages.length } });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/v1/sessions/cc-capture-commit") {
+        writeJson(res, {
+          status: "ok",
+          result: { message_count: 2, pending_tokens: 5000, commit_count: 0 },
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/v1/sessions/cc-capture-commit/commit") {
+        commits.push(await readRequestBody(req));
+        writeJson(res, { status: "ok", result: { status: "accepted" } });
+        return;
+      }
+      writeJson(res, { status: "error", error: { code: "NOT_FOUND" } }, 404);
+    }, async (baseUrl) => {
+      await runAutoCapture(
+        { session_id: "capture-commit", transcript_path: transcriptPath, cwd: root },
+        {
+          ...hookEnv(root, baseUrl),
+          OPENVIKING_COMMIT_TOKEN_THRESHOLD: "1000",
+          OPENVIKING_COMMIT_KEEP_RECENT_COUNT: "10",
+        },
+      );
+    });
+
+    assert.deepEqual(commits, [{ keep_recent_count: 0 }]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -398,6 +450,45 @@ test("capture filters rewrite and drop turns at the send site", async () => {
     );
     // The cursor counts extracted turns, so the dropped one still advances it.
     assert.equal(state.capturedTurnCount, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("subagent capture sanitizes injected text before filtering and sending", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ov-cc-subagent-filters-"));
+  const transcriptPath = join(root, "subagent.jsonl");
+  const batches = [];
+  try {
+    await writeFile(transcriptPath, [
+      JSON.stringify({ role: "user", content: "<system-reminder>approved</system-reminder>ignore this" }),
+      JSON.stringify({ role: "user", content: "<system-reminder>secret</system-reminder>approved SECRET123" }),
+    ].join("\n"));
+    await withMockOpenViking(async (req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") {
+        writeJson(res, { status: "ok", result: { healthy: true } });
+      } else if (req.method === "POST" && url.pathname.endsWith("/messages/batch")) {
+        batches.push(await readRequestBody(req));
+        writeJson(res, { status: "ok", result: { added: batches.at(-1).messages.length } });
+      } else {
+        writeJson(res, { status: "ok", result: {} });
+      }
+    }, async (baseUrl) => {
+      await runHook("subagent-stop.mjs", {
+        session_id: "parent-capture-filters",
+        agent_id: "child-1",
+        agent_transcript_path: transcriptPath,
+        cwd: root,
+      }, {
+        ...hookEnv(root, baseUrl),
+        OPENVIKING_CAPTURE_FILTERS: "user:k/approved/,user:d/secret/,user:s/SECRET123/[redacted]/g",
+      });
+    });
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].messages.map((message) => message.parts), [
+      [{ type: "text", text: "approved [redacted]" }],
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

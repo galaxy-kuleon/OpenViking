@@ -1,8 +1,7 @@
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import {
-  extractPartsFromPayload,
   extractTextFromPayload,
-  shouldCaptureText,
+  shapeCapturePayload,
 } from "./shared/capture-utils.mjs";
 
 export const OPENVIKING_PLUGIN_SOURCE = "openviking-memory";
@@ -74,36 +73,41 @@ function captureMessage(event, message, config, toolNames) {
 
   const role = message.role === "assistant" ? "assistant" : "user";
   const toolNameById = Object.fromEntries(toolNames);
-  const rawText = extractTextFromPayload(message, {
-    toolMaxChars: config.captureToolMaxChars,
-  });
-  const parts = extractPartsFromPayload(message, {
-    toolMaxChars: config.captureToolMaxChars,
+  const shaped = shapeCapturePayload(message, role, config, {
     toolNameById,
   });
-  const decision = shouldCaptureText(rawText, role, config);
-  const structuredParts = parts.filter(part => part?.type !== "text");
-  if (!decision.shouldCapture && structuredParts.length === 0) return null;
+  if (shaped.dropped) return null;
+  const structuredParts = shaped.parts.filter(part => part?.type !== "text");
+  if (!shaped.text && structuredParts.length === 0) return null;
 
-  const hasTextPart = parts.some(part => part?.type === "text");
+  const hasTextPart = shaped.parts.some(part => part?.type === "text");
   const bodyParts = [
-    ...(hasTextPart && decision.shouldCapture && decision.text
-      ? [{ type: "text", text: decision.text }]
+    ...(hasTextPart && shaped.text
+      ? [{ type: "text", text: shaped.text }]
       : []),
     ...structuredParts,
   ];
   const payload = bodyParts.length > 0
     ? { role, parts: bodyParts }
-    : { role, content: decision.text };
+    : { role, content: shaped.text };
   const createdAt = eventCreatedAt(event);
   if (createdAt) payload.created_at = createdAt;
   if (config.peerId) payload.peer_id = config.peerId;
   return payload;
 }
 
+// Recall queries use only what the user typed. Injected context (time-context,
+// job notices, other plugins' blocks, our own recall) and tool results would
+// otherwise trigger recall on their own and pollute the query text.
+function isUserInput(message) {
+  if (!message || message.role !== "user") return false;
+  if (message.source?.kind === "tool") return false;
+  return !isSyntheticUserMessage(message);
+}
+
 export function promptText(messages) {
   return (messages || [])
-    .filter(message => !isOpenVikingPluginMessage(message))
+    .filter(isUserInput)
     .map(message => extractTextFromPayload(message))
     .filter(Boolean)
     .join("\n\n")

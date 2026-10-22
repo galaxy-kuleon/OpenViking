@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 from __future__ import annotations
 
 import base64
@@ -5,8 +8,6 @@ import inspect
 import mimetypes
 import os
 import tempfile
-import uuid
-import zipfile
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Type, Union
@@ -14,7 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ._utils import _path_is_relative_to, run_async
+from ._utils import run_async
 from .actor_peer import _request_actor_peer_headers
 from .config import resolve_client_config
 from .errors import (
@@ -52,6 +53,7 @@ from .options import (
     ExperienceOutcomeOptions,
     ExperienceTrajectoryOptions,
     FindOptions,
+    ListPage,
     Message,
     PreflightAssetOptions,
     ReindexOptions,
@@ -60,10 +62,12 @@ from .options import (
     SearchContextResult,
     SearchOptions,
     SetTagsOptions,
+    TreePage,
     UpdateSessionConfigOptions,
     UpdateSkillOptions,
     WriteOptions,
 )
+from .uploads import zip_directory
 
 ERROR_CODE_TO_EXCEPTION = {
     "INVALID_ARGUMENT": InvalidArgumentError,
@@ -132,9 +136,11 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def _normalize_image_input(image: Any) -> Optional[str]:
+def _normalize_image_input(image: Any) -> str | list[str] | None:
     if image is None:
         return None
+    if isinstance(image, list):
+        return [_normalize_image_input(item) for item in image]
     if isinstance(image, (bytes, bytearray, memoryview)):
         return _image_to_data_uri(image)
     value = os.fspath(image) if isinstance(image, os.PathLike) else str(image)
@@ -479,12 +485,6 @@ class AsyncHTTPClient:
         retry_headers[GATEWAY_TOKEN_HEADER] = self._gateway_token
         return await self._send_http_request(method, url, retry_headers, request_kwargs)
 
-    def _wait_request_kwargs(self, *, wait: bool, timeout: Optional[float]) -> Dict[str, Any]:
-        if not wait or timeout is None:
-            return {}
-        read_timeout = max(self._timeout, timeout + 30.0)
-        return {"timeout": httpx.Timeout(self._timeout, read=read_timeout)}
-
     async def close(self) -> None:
         if self._http:
             try:
@@ -649,53 +649,40 @@ class AsyncHTTPClient:
         exc_class = ERROR_CODE_TO_EXCEPTION.get(code, OpenVikingError)
 
         if exc_class == OpenVikingError:
-            raise exc_class(message, code=code, details=details)
-        if exc_class in (
+            exception = exc_class(message, code=code, details=details)
+        elif exc_class in (
             InvalidArgumentError,
             FailedPreconditionError,
             ResourceExhaustedError,
             AbortedError,
             UnimplementedError,
         ):
-            raise exc_class(message, details=details)
-        if exc_class == InvalidURIError:
+            exception = exc_class(message, details=details)
+        elif exc_class == InvalidURIError:
             uri = details.get("uri", "") if details else ""
             reason = details.get("reason", "") if details else ""
-            raise exc_class(uri, reason)
-        if exc_class == NotFoundError:
+            exception = exc_class(uri, reason)
+        elif exc_class == NotFoundError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
             reason = details.get("reason") if details else None
-            raise exc_class(resource, resource_type, reason=reason)
-        if exc_class == AlreadyExistsError:
+            exception = exc_class(resource, resource_type, reason=reason)
+        elif exc_class == AlreadyExistsError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
-            raise exc_class(resource, resource_type)
-        if exc_class == UnavailableError:
+            exception = exc_class(resource, resource_type)
+        elif exc_class == UnavailableError:
             service = details.get("service", "service") if details else "service"
             reason = details.get("reason", "") if details else message
-            raise exc_class(service, reason)
-        raise exc_class(message)
+            exception = exc_class(service, reason)
+        else:
+            exception = exc_class(message)
+        if details is not None:
+            exception.details.update(details)
+        raise exception
 
     def _zip_directory(self, dir_path: str) -> str:
-        dir_path = Path(dir_path)
-        if not dir_path.is_dir():
-            raise ValueError(f"Path {dir_path} is not a directory")
-
-        root = dir_path.resolve()
-        zip_path = Path(tempfile.gettempdir()) / f"temp_upload_{uuid.uuid4().hex}.zip"
-        entry_count = 0
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in dir_path.rglob("*"):
-                if file_path.is_symlink():
-                    continue
-                if file_path.is_file():
-                    if not _path_is_relative_to(file_path.resolve(), root):
-                        continue
-                    arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
-                    zipf.write(file_path, arcname=arcname)
-                    entry_count += 1
-        return str(zip_path)
+        return zip_directory(dir_path)
 
     async def _upload_temp_file(self, file_path: str) -> str:
         with open(file_path, "rb") as f:
@@ -726,7 +713,6 @@ class AsyncHTTPClient:
         to: Optional[str] = None,
         parent: Optional[str] = None,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddResourceOptions] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
@@ -753,7 +739,6 @@ class AsyncHTTPClient:
                 "to": to,
                 "parent": parent,
                 "wait": wait,
-                "timeout": timeout,
             },
             protected={"path", "temp_file_id", "source_name"},
         )
@@ -803,7 +788,6 @@ class AsyncHTTPClient:
         self,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddSkillOptions] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
@@ -812,7 +796,7 @@ class AsyncHTTPClient:
         request_data = self._build_options_payload(
             option_values,
             AddSkillOptions,
-            fixed={"wait": wait, "timeout": timeout},
+            fixed={"wait": wait},
             protected={"data", "temp_file_id"},
         )
         if isinstance(data, str):
@@ -914,7 +898,6 @@ class AsyncHTTPClient:
         skill_name: str,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[UpdateSkillOptions] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
@@ -923,7 +906,7 @@ class AsyncHTTPClient:
         request_data = self._build_options_payload(
             option_values,
             UpdateSkillOptions,
-            fixed={"wait": wait, "timeout": timeout},
+            fixed={"wait": wait},
             protected={"data", "temp_file_id"},
         )
         if isinstance(data, str):
@@ -1050,13 +1033,11 @@ class AsyncHTTPClient:
             )
         return self._handle_response(response)
 
-    async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        http_timeout = timeout if timeout else 600.0
+    async def wait_processed(self) -> Dict[str, Any]:
         response = await self._request(
             "POST",
             "/api/v1/system/wait",
-            json={"timeout": timeout},
-            timeout=http_timeout,
+            json={},
         )
         return self._handle_response(response)
 
@@ -1076,7 +1057,51 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        page = await self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )
+        return page["result"]
+
+    async def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "simple": simple,
@@ -1086,7 +1111,12 @@ class AsyncHTTPClient:
             "show_all_hidden": show_all_hidden,
             "node_limit": node_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
         if sort_by is not None:
             params["sort_by"] = sort_by
             params["sort_order"] = sort_order
@@ -1103,7 +1133,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/ls",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def tree(
         self,
@@ -1118,7 +1152,48 @@ class AsyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        page = await self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )
+        return page["result"]
+
+    async def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
             "output": output,
@@ -1127,7 +1202,14 @@ class AsyncHTTPClient:
             "node_limit": node_limit,
             "level_limit": level_limit,
             "offset": offset,
+            "overview_limit": overview_limit,
         }
+        if include_abstract is not None:
+            params["include_abstract"] = include_abstract
+        if include_overview is not None:
+            params["include_overview"] = include_overview
+        if directories_only:
+            params["directories_only"] = True
         if extra_fields:
             params["extra_fields"] = list(extra_fields)
         if tags is not None:
@@ -1141,7 +1223,11 @@ class AsyncHTTPClient:
             "/api/v1/fs/tree",
             params=params,
         )
-        return self._handle_response(response)
+        data = self._handle_response_data(response)
+        return {
+            "result": data.get("result") or [],
+            "has_more": bool(data.get("has_more", False)),
+        }
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         response = await self._request(
@@ -1173,11 +1259,8 @@ class AsyncHTTPClient:
         uri: str,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
     ) -> None:
         params = {"uri": VikingURI.normalize(uri), "recursive": recursive, "wait": wait}
-        if timeout is not None:
-            params["timeout"] = timeout
         response = await self._request("DELETE", "/api/v1/fs", params=params)
         self._handle_response(response)
 
@@ -1244,7 +1327,6 @@ class AsyncHTTPClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[WriteOptions] = None,
     ) -> Dict[str, Any]:
         payload = self._build_options_payload(
@@ -1255,7 +1337,6 @@ class AsyncHTTPClient:
                 "content": content,
                 "mode": mode,
                 "wait": wait,
-                "timeout": timeout,
             },
         )
         response = await self._request(
@@ -1270,7 +1351,6 @@ class AsyncHTTPClient:
         root_uri: str,
         operations: List[Dict[str, Any]],
         wait: bool = True,
-        timeout: Optional[float] = None,
         options: Optional[BatchWriteOptions] = None,
     ) -> Dict[str, Any]:
         """Apply multiple content writes, then refresh semantics once."""
@@ -1286,34 +1366,34 @@ class AsyncHTTPClient:
                 "root_uri": VikingURI.normalize(root_uri),
                 "operations": normalized_operations,
                 "wait": wait,
-                "timeout": timeout,
             },
         )
         response = await self._request(
             "POST",
             "/api/v1/content/batch-write",
             json=payload,
-            **self._wait_request_kwargs(wait=wait, timeout=timeout),
         )
         return self._handle_response_data(response).get("result", {})
 
     async def set_tags(
         self,
         uri: str,
-        tags: List[str],
+        tags: Optional[List[str]] = None,
         mode: str = "replace",
         recursive: bool = False,
         options: Optional[SetTagsOptions] = None,
     ) -> Dict[str, Any]:
+        fixed: Dict[str, Any] = {
+            "uri": VikingURI.normalize(uri),
+            "mode": mode,
+            "recursive": recursive,
+        }
+        if tags is not None:
+            fixed["tags"] = tags
         payload = self._build_options_payload(
             options,
             SetTagsOptions,
-            fixed={
-                "uri": VikingURI.normalize(uri),
-                "tags": tags,
-                "mode": mode,
-                "recursive": recursive,
-            },
+            fixed=fixed,
         )
         response = await self._request(
             "POST",
@@ -1453,6 +1533,7 @@ class AsyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         request_json = {
             "uri": VikingURI.normalize(uri),
@@ -1460,6 +1541,8 @@ class AsyncHTTPClient:
             "case_insensitive": case_insensitive,
             "node_limit": node_limit,
         }
+        if level_limit is not None:
+            request_json["level_limit"] = level_limit
         if exclude_uri is not None:
             request_json["exclude_uri"] = VikingURI.normalize(exclude_uri)
         if tags is not None:
@@ -1775,8 +1858,8 @@ class AsyncHTTPClient:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
-        dry_run: bool = False,
         recursive: bool = True,
+        force: bool = False,
         options: Optional[ReindexOptions] = None,
     ) -> Dict[str, Any]:
         payload = self._build_options_payload(
@@ -1786,10 +1869,12 @@ class AsyncHTTPClient:
                 "uri": VikingURI.normalize(uri),
                 "mode": mode,
                 "wait": wait,
-                "dry_run": dry_run,
+                "force": force,
                 "recursive": recursive,
             },
         )
+        if not payload.get("force"):
+            payload.pop("force", None)
         response = await self._request(
             "POST",
             "/api/v1/content/reindex",
@@ -2074,24 +2159,16 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    def queue_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_queue_status(format=format))
 
-    def vikingdb_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_vikingdb_status(format=format))
 
-    def models_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_models_status(format=format))
 
-    def get_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return run_async(self._get_system_status(format=format))
 
     def is_healthy(self) -> bool:
@@ -2273,7 +2350,6 @@ class SyncHTTPClient:
         to: Optional[str] = None,
         parent: Optional[str] = None,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddResourceOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
@@ -2282,7 +2358,6 @@ class SyncHTTPClient:
                 to=to,
                 parent=parent,
                 wait=wait,
-                timeout=timeout,
                 options=options,
             )
         )
@@ -2299,12 +2374,9 @@ class SyncHTTPClient:
         self,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddSkillOptions] = None,
     ) -> Dict[str, Any]:
-        return run_async(
-            self._async_client.add_skill(data, wait=wait, timeout=timeout, options=options)
-        )
+        return run_async(self._async_client.add_skill(data, wait=wait, options=options))
 
     def list_skills(
         self,
@@ -2380,13 +2452,10 @@ class SyncHTTPClient:
         skill_name: str,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[UpdateSkillOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.update_skill(
-                skill_name, data, wait=wait, timeout=timeout, options=options
-            )
+            self._async_client.update_skill(skill_name, data, wait=wait, options=options)
         )
 
     def delete_skill(
@@ -2447,8 +2516,8 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.trigger_watch(task_id, to_uri=to_uri))
 
-    def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        return run_async(self._async_client.wait_processed(timeout))
+    def wait_processed(self) -> Dict[str, Any]:
+        return run_async(self._async_client.wait_processed())
 
     def ls(
         self,
@@ -2466,9 +2535,52 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
     ) -> List[Any]:
+        return self.ls_page(
+            uri,
+            simple=simple,
+            recursive=recursive,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+        )["result"]
+
+    def ls_page(
+        self,
+        uri: str,
+        simple: bool = False,
+        recursive: bool = False,
+        output: str = "original",
+        abs_limit: int = 256,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+    ) -> ListPage:
         return run_async(
-            self._async_client.ls(
+            self._async_client.ls_page(
                 uri,
                 simple=simple,
                 recursive=recursive,
@@ -2483,6 +2595,9 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
             )
         )
 
@@ -2499,9 +2614,49 @@ class SyncHTTPClient:
         include_tags: bool = False,
         offset: int = 0,
         limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        return self.tree_page(
+            uri,
+            output=output,
+            abs_limit=abs_limit,
+            show_all_hidden=show_all_hidden,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            extra_fields=extra_fields,
+            tags=tags,
+            include_tags=include_tags,
+            offset=offset,
+            limit=limit,
+            include_abstract=include_abstract,
+            include_overview=include_overview,
+            overview_limit=overview_limit,
+            directories_only=directories_only,
+        )["result"]
+
+    def tree_page(
+        self,
+        uri: str,
+        output: str = "original",
+        abs_limit: int = 128,
+        show_all_hidden: bool = False,
+        node_limit: int = 1000,
+        level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        include_tags: bool = False,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        include_abstract: Optional[bool] = None,
+        include_overview: Optional[bool] = None,
+        overview_limit: int = 4000,
+        directories_only: bool = False,
+    ) -> TreePage:
         return run_async(
-            self._async_client.tree(
+            self._async_client.tree_page(
                 uri,
                 output=output,
                 abs_limit=abs_limit,
@@ -2513,6 +2668,10 @@ class SyncHTTPClient:
                 include_tags=include_tags,
                 offset=offset,
                 limit=limit,
+                include_abstract=include_abstract,
+                include_overview=include_overview,
+                overview_limit=overview_limit,
+                directories_only=directories_only,
             )
         )
 
@@ -2532,9 +2691,8 @@ class SyncHTTPClient:
         uri: str,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
     ) -> None:
-        run_async(self._async_client.rm(uri, recursive=recursive, wait=wait, timeout=timeout))
+        run_async(self._async_client.rm(uri, recursive=recursive, wait=wait))
 
     def mv(self, from_uri: str, to_uri: str) -> None:
         run_async(self._async_client.mv(from_uri, to_uri))
@@ -2560,13 +2718,10 @@ class SyncHTTPClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[WriteOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.write(
-                uri, content, mode=mode, wait=wait, timeout=timeout, options=options
-            )
+            self._async_client.write(uri, content, mode=mode, wait=wait, options=options)
         )
 
     def batch_write(
@@ -2574,19 +2729,16 @@ class SyncHTTPClient:
         root_uri: str,
         operations: List[Dict[str, Any]],
         wait: bool = True,
-        timeout: Optional[float] = None,
         options: Optional[BatchWriteOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.batch_write(
-                root_uri, operations, wait=wait, timeout=timeout, options=options
-            )
+            self._async_client.batch_write(root_uri, operations, wait=wait, options=options)
         )
 
     def set_tags(
         self,
         uri: str,
-        tags: List[str],
+        tags: Optional[List[str]] = None,
         mode: str = "replace",
         recursive: bool = False,
         options: Optional[SetTagsOptions] = None,
@@ -2683,6 +2835,7 @@ class SyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.grep(
@@ -2693,6 +2846,7 @@ class SyncHTTPClient:
                 exclude_uri=exclude_uri,
                 tags=tags,
                 include_tags=include_tags,
+                level_limit=level_limit,
             )
         )
 
@@ -2859,20 +3013,19 @@ class SyncHTTPClient:
         uri: str,
         mode: str = "vectors_only",
         wait: bool = True,
-        dry_run: bool = False,
         recursive: bool = True,
+        force: bool = False,
         options: Optional[ReindexOptions] = None,
     ) -> Dict[str, Any]:
-        return run_async(
-            self._async_client.reindex(
-                uri,
-                mode=mode,
-                wait=wait,
-                dry_run=dry_run,
-                recursive=recursive,
-                options=options,
-            )
-        )
+        kwargs: Dict[str, Any] = {
+            "mode": mode,
+            "wait": wait,
+            "recursive": recursive,
+            "options": options,
+        }
+        if force:
+            kwargs["force"] = True
+        return run_async(self._async_client.reindex(uri, **kwargs))
 
     def admin_create_account(
         self,
@@ -3016,24 +3169,16 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.preflight_openviking_asset(name, repo_url, options))
 
-    def queue_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def queue_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.queue_status(format=format)
 
-    def vikingdb_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def vikingdb_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.vikingdb_status(format=format)
 
-    def models_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def models_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.models_status(format=format)
 
-    def get_status(
-        self, format: Optional[Literal["table", "json"]] = None
-    ) -> Dict[str, Any]:
+    def get_status(self, format: Optional[Literal["table", "json"]] = None) -> Dict[str, Any]:
         return self._async_client.get_status(format=format)
 
     def is_healthy(self) -> bool:

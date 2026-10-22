@@ -9,7 +9,7 @@ description: |
   Each topic should stay small and should not become a second profile.
   Keep each topic to roughly 3-8 bullets; if it grows beyond that or past 800 characters, split it into semantic subtopics.
 directory: "viking://user/{{ user_space }}/memories/preferences"
-filename_template: "{{ user }}/{{ topic }}.md"
+filename_template: "{{ user|lower }}/{{ topic|lower }}.md"
 enabled: true
 embedding_template: |-
   {{ user }}

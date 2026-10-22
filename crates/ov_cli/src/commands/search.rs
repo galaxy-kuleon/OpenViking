@@ -130,6 +130,7 @@ pub async fn find(
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     read_content: bool,
+    events_time_decay_protection: Option<String>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -147,6 +148,7 @@ pub async fn find(
             context_type,
             tags,
             read_content,
+            events_time_decay_protection,
         )
         .await?;
     output_search_results(
@@ -163,6 +165,8 @@ pub async fn search(
     query: &str,
     uri: &str,
     image: Option<String>,
+    search_type: &str,
+    mode: &str,
     session_id: Option<String>,
     node_limit: i32,
     threshold: Option<f64>,
@@ -173,6 +177,7 @@ pub async fn search(
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     read_content: bool,
+    events_time_decay_protection: Option<String>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -181,6 +186,8 @@ pub async fn search(
             query.to_string(),
             uri.to_string(),
             image,
+            search_type.to_string(),
+            mode.to_string(),
             session_id,
             node_limit,
             threshold,
@@ -191,15 +198,92 @@ pub async fn search(
             context_type,
             tags,
             read_content,
+            events_time_decay_protection,
         )
         .await?;
-    output_search_results(
-        &result,
-        output_format,
-        compact,
-        SearchRenderContext::search(node_limit),
-    );
+    if mode == "context" {
+        if let Some(rendered) = render_context_output_for_table(&result, output_format) {
+            for error in rendered.retrieval_errors {
+                eprintln!("Warning: context retrieval failed: {error}");
+            }
+            if !rendered.text.is_empty() {
+                println!("{}", rendered.text);
+            }
+        } else {
+            output_success(&result, output_format, compact);
+        }
+    } else {
+        output_search_results(
+            &result,
+            output_format,
+            compact,
+            SearchRenderContext::search(node_limit),
+        );
+    }
     Ok(())
+}
+
+struct ContextTextOutput {
+    text: String,
+    retrieval_errors: Vec<String>,
+}
+
+fn render_context_output_for_table(
+    value: &Value,
+    output_format: OutputFormat,
+) -> Option<ContextTextOutput> {
+    if matches!(output_format, OutputFormat::Json) {
+        return None;
+    }
+
+    let object = value.as_object()?;
+    let result = object
+        .get("result")
+        .and_then(Value::as_object)
+        .unwrap_or(object);
+    let profile = result
+        .get("profile")
+        .filter(|profile| !profile.is_null())
+        .or_else(|| object.get("profile").filter(|profile| !profile.is_null()));
+
+    let retrieval_errors: Vec<String> = result
+        .get("stats")
+        .and_then(|stats| stats.get("retrieval_errors"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|error| !error.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let no_relevant = result
+        .get("stats")
+        .and_then(|stats| stats.get("rewrite"))
+        .and_then(Value::as_str)
+        == Some("no_relevant");
+    let text = if no_relevant {
+        None
+    } else {
+        ["digest", "rendered"].into_iter().find_map(|key| {
+            result
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+        })
+    };
+
+    let mut lines = match text {
+        Some(text) => vec![text.to_string()],
+        None if !retrieval_errors.is_empty() => Vec::new(),
+        None if no_relevant => vec![theme::muted("No relevant context found.").to_string()],
+        None => vec![theme::muted("No context found.").to_string()],
+    };
+    append_profile_lines(profile, &mut lines);
+    Some(ContextTextOutput {
+        text: lines.join("\n"),
+        retrieval_errors,
+    })
 }
 
 fn output_search_results(
@@ -425,7 +509,7 @@ fn render_search_result_card(
             metadata.push(theme::value(level).bold().to_string());
         }
 
-        if let Some(score) = search_result_score(object) {
+        for score in search_result_scores(object) {
             metadata.push(theme::warning(score).bold().to_string());
         }
     }
@@ -598,13 +682,40 @@ fn normalize_level_value(level: &str) -> &str {
 }
 
 fn search_result_score(object: Option<&serde_json::Map<String, Value>>) -> Option<String> {
-    let value = object?.get("score")?;
+    parse_score(object?.get("score")?).map(|score| format!("score {score:.3}"))
+}
+
+fn search_result_scores(object: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
+    let Some(object) = object else {
+        return Vec::new();
+    };
+    if !object.contains_key("origin_score") && !object.contains_key("time_score") {
+        return search_result_score(Some(object)).into_iter().collect();
+    }
+
+    [
+        ("semantic", object.get("origin_score")),
+        ("time", object.get("time_score")),
+        ("final", object.get("score")),
+    ]
+    .into_iter()
+    .map(|(label, value)| {
+        let value = value
+            .and_then(parse_score)
+            .map(|score| format!("{score:.3}"))
+            .unwrap_or_else(|| "not provided".to_string());
+        format!("{label} {value}")
+    })
+    .collect()
+}
+
+fn parse_score(value: &Value) -> Option<f64> {
     let score = value.as_f64().or_else(|| {
         value
             .as_str()
             .and_then(|value| value.trim().parse::<f64>().ok())
     })?;
-    Some(format!("score {score:.3}"))
+    Some(score)
 }
 
 fn search_result_uri(object: Option<&serde_json::Map<String, Value>>) -> Option<&str> {
@@ -907,6 +1018,8 @@ mod tests {
                 "uri": "viking://user/default/memories/entities/.overview.md",
                 "level": 1,
                 "score": 0.3805481195449829,
+                "origin_score": 0.8,
+                "time_score": 0.5,
                 "abstract": "Entity memories from user's world. Each entity has its own subdirectory including projects, people, concepts, etc."
             }
         ]);
@@ -914,7 +1027,7 @@ mod tests {
         let rendered = strip_ansi(&render_search_results_for_table(&results).expect("cards"));
 
         assert!(rendered.starts_with("1 result\nRanked by relevance\n\n"));
-        assert!(rendered.contains("1. memory · Level 1 · score 0.381"));
+        assert!(rendered.contains("1. memory · Level 1 · semantic 0.800 · time 0.500 · final 0.381"));
         assert!(rendered.contains("viking://user/default/memories/entities/.overview.md"));
         assert!(rendered.contains("Entity memories from user's world."));
         assert!(!rendered.contains("peop\n   le"));
@@ -1116,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn search_result_cards_render_result_object_with_profile() {
+    fn search_output_preserves_content_profile_and_retrieval_failures() {
         let results = json!({
             "result": [
                 {
@@ -1134,6 +1247,47 @@ mod tests {
         assert!(rendered.contains("viking://user/default/memories/events/.abstract.md"));
         assert!(rendered.contains("profile"));
         assert!(rendered.contains("vector search: 12ms"));
+
+        let text = format!(
+            "<memory>\n  {}\n\nFinal line.\n</memory>",
+            "Full context. ".repeat(100)
+        );
+        let mut context = json!({
+            "rendered": text,
+            "digest": "",
+            "stats": {"rewrite": "off", "retrieval_errors": ["RuntimeError: index unavailable"]},
+            "profile": ["vector search: 12ms"]
+        });
+        let output = render_context_output_for_table(&context, OutputFormat::Table)
+            .expect("context with partial retrieval failure");
+        assert_eq!(
+            strip_ansi(&output.text),
+            format!("{text}\n\nprofile\nvector search: 12ms")
+        );
+        assert_eq!(output.retrieval_errors, ["RuntimeError: index unavailable"]);
+        assert!(render_context_output_for_table(&context, OutputFormat::Json).is_none());
+
+        context["digest"] = json!("Concise context.");
+        context["stats"]["rewrite"] = json!("ok");
+        let output = render_context_output_for_table(&context, OutputFormat::Table)
+            .expect("rewritten context");
+        assert_eq!(
+            strip_ansi(&output.text),
+            "Concise context.\n\nprofile\nvector search: 12ms"
+        );
+        assert_eq!(output.retrieval_errors, ["RuntimeError: index unavailable"]);
+
+        context["rendered"] = json!("");
+        context["digest"] = json!("");
+        context["stats"]["rewrite"] = json!("off");
+        context.as_object_mut().unwrap().remove("profile");
+        let output = render_context_output_for_table(&context, OutputFormat::Table)
+            .expect("total retrieval failure");
+        assert!(
+            output.text.is_empty(),
+            "retrieval failure must not look like no matches"
+        );
+        assert_eq!(output.retrieval_errors, ["RuntimeError: index unavailable"]);
     }
 
     #[test]

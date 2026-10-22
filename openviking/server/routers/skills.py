@@ -69,7 +69,6 @@ class UpdateSkillRequest(BaseModel):
     temp_file_id: Optional[str] = None
     from_source: bool = False
     wait: bool = False
-    timeout: Optional[float] = None
     source_metadata: Optional[Dict[str, Any]] = None
     telemetry: TelemetryRequest = False
     target_uri: Optional[str] = None
@@ -138,13 +137,14 @@ async def _list_skills_from_root(
     nested directories like ``<skill>/scripts`` out of the listing.
     """
     try:
-        entries = await service.fs.ls(
+        page = await service.fs.ls(
             root_uri,
             ctx=ctx,
             output="agent",
             abs_limit=1024,
             node_limit=node_limit,
         )
+        entries = page.entries
     except NotFoundError:
         return []
 
@@ -322,7 +322,7 @@ async def _list_skill_files(
         child_limit = max(node_limit - len(entries), 0)
         if child_limit <= 0:
             break
-        children = await service.fs.ls(
+        page = await service.fs.ls(
             current_uri,
             ctx=ctx,
             output="agent",
@@ -330,6 +330,7 @@ async def _list_skill_files(
             show_all_hidden=True,
             node_limit=child_limit,
         )
+        children = page.entries
         for entry in children:
             if not isinstance(entry, dict):
                 continue
@@ -981,7 +982,6 @@ async def update_skill(
                     data=preparation,
                     ctx=_ctx,
                     wait=request.wait,
-                    timeout=request.timeout,
                     allow_local_path_resolution=False,
                     source_path_hint=source_path_hint,
                     apply_privacy=False,

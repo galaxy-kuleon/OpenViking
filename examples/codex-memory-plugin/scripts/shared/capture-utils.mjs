@@ -362,14 +362,41 @@ export function extractPartsFromPayload(payload, options = {}) {
   return parts;
 }
 
+function substituteValue(value, rules, role) {
+  if (typeof value === "string") {
+    let current = value;
+    for (const rule of rules) {
+      if (rule.op !== "s" || (rule.scope && rule.scope !== role)) continue;
+      current = current.replace(rule.re, rule.replacement);
+    }
+    return current;
+  }
+  if (Array.isArray(value)) return value.map((item) => substituteValue(item, rules, role));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, substituteValue(item, rules, role)]),
+    );
+  }
+  return value;
+}
+
+function substituteToolPart(part, rules, role) {
+  if (part.type !== "tool") return part;
+  const out = { ...part };
+  if (part.tool_input !== undefined) out.tool_input = substituteValue(part.tool_input, rules, role);
+  if (part.tool_output !== undefined) out.tool_output = substituteValue(part.tool_output, rules, role);
+  return out;
+}
+
 /**
  * Prune blank text parts and run `cfg.captureFilters` over the ones that remain.
  *
  * One drop verdict is taken per turn, on the aggregate of its text parts; the
  * individual parts are then rewritten with the substitutions only, so a rule can
- * never both keep and drop the same turn. Tool call/result parts are carried
- * through untouched — filters match conversation text, not tool payloads — but a
- * turn dropped on its text takes its tool parts with it.
+ * never both keep and drop the same turn. Tool call/result parts get the
+ * substitutions too, on their input values and output, so a redaction rule also
+ * covers a secret that reached a command or its output; only text parts decide
+ * the drop verdict, and a turn dropped on its text takes its tool parts with it.
  */
 export function filterCaptureParts(parts, role, cfg = {}) {
   const kept = [];
@@ -389,7 +416,9 @@ export function filterCaptureParts(parts, role, cfg = {}) {
   if (!compiled.rules.length || kept.length === 0) return blank;
 
   const textParts = kept.filter((part) => part.type === "text");
-  if (textParts.length === 0) return blank;
+  if (textParts.length === 0) {
+    return { parts: kept.map((part) => substituteToolPart(part, compiled.rules, role)), dropped: false };
+  }
 
   const verdict = applyInputFilters(textParts.map((part) => part.text).join("\n\n"), compiled.rules, {
     role,
@@ -399,7 +428,7 @@ export function filterCaptureParts(parts, role, cfg = {}) {
   const out = [];
   for (const part of kept) {
     if (part.type !== "text") {
-      out.push(part);
+      out.push(substituteToolPart(part, compiled.rules, role));
       continue;
     }
     const shaped = applyInputFilters(part.text, compiled.rules, { role, substituteOnly: true });
@@ -407,6 +436,61 @@ export function filterCaptureParts(parts, role, cfg = {}) {
     out.push(shaped.text === part.text ? part : { ...part, text: shaped.text });
   }
   return { parts: out, dropped: out.length === 0 };
+}
+
+/** Sanitize already-extracted message parts before applying capture rules. */
+export function shapeCaptureParts(parts, role, cfg = {}) {
+  const sanitized = (parts || []).map((part) => part?.type === "text"
+    ? { ...part, text: sanitizeCapturedText(part.text) }
+    : part);
+  return filterCaptureParts(sanitized, role, cfg);
+}
+
+function faithfulCaptureDecision(text, cfg) {
+  const sanitized = sanitizeCapturedText(text);
+  if (!sanitized) return { shouldCapture: false, text: "" };
+  const capped = truncateCaptureText(sanitized, cfg.captureMaxLength || 24000);
+  const compact = oneLine(capped);
+  if (/^\[openviking-memory\]/i.test(compact) || SLASH_COMMAND_RE.test(compact)) {
+    return { shouldCapture: false, text: "" };
+  }
+  return { shouldCapture: true, text: capped };
+}
+
+/**
+ * Shape one host message before an adapter builds its session payload.
+ * Sanitize injected context before evaluating keep/drop rules, so text that
+ * will not be sent cannot satisfy a keep rule. Tool parts never decide keep or drop.
+ */
+export function shapeCapturePayload(payload, role, cfg = {}, { toolNameById = {}, faithful = false } = {}) {
+  const options = { toolMaxChars: cfg.captureToolMaxChars, toolNameById };
+  const rawText = extractTextFromPayload(payload, options);
+  const sourceParts = extractPartsFromPayload(payload, options);
+  const hasTextPart = sourceParts.some((part) => part?.type === "text");
+  const sanitizedText = sanitizeCapturedText(rawText);
+  // Some hosts supply an array of plain strings. It has text but no structured
+  // parts, so use a temporary part for the same filter verdict.
+  const fallback = sourceParts.length === 0 && sanitizedText
+    ? [{ type: "text", text: rawText }]
+    : [];
+  const shaped = shapeCaptureParts(sourceParts.length ? sourceParts : fallback, role, cfg);
+  if (shaped.dropped) return { parts: [], text: "", signalText: "", dropped: true };
+
+  const parts = sourceParts.length ? shaped.parts : [];
+  const decisionText = hasTextPart || fallback.length
+    ? shaped.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n\n")
+    : sanitizedText;
+  const decision = faithful
+    ? faithfulCaptureDecision(decisionText, cfg)
+    : shouldCaptureText(decisionText, role, cfg, { filters: false });
+  // Codex scans turn.text for explicit-memory keywords; keep that scan based
+  // on the user's original words while the filtered parts go on the wire.
+  const signalText = decision.shouldCapture && parts.length
+    ? (faithful
+      ? faithfulCaptureDecision(sanitizedText, cfg)
+      : shouldCaptureText(sanitizedText, role, cfg, { filters: false })).text
+    : decision.text;
+  return { parts, text: decision.shouldCapture ? decision.text : "", signalText: signalText || "", dropped: false };
 }
 
 export function extractCaptureTurns(rolloutEntries, cfg = {}) {
@@ -421,20 +505,9 @@ export function extractCaptureTurns(rolloutEntries, cfg = {}) {
     if (!role) continue;
     if (isAssistantSideCaptureRole(rawRole) && !cfg.captureAssistantTurns) continue;
 
-    const rawText = extractTextFromPayload(payload, { toolMaxChars: cfg.captureToolMaxChars });
-    const parts = extractPartsFromPayload(payload, {
-      toolMaxChars: cfg.captureToolMaxChars,
-      toolNameById,
-    });
-    const shaped = filterCaptureParts(parts, role, cfg);
-    if (shaped.dropped) continue;
-    // With parts on the wire the drop decision was already taken above, so the
-    // text path only runs the filters for the `content` fallback. That also
-    // keeps `turn.text` faithful for callers that scan it for trigger words.
-    const decision = shouldCaptureText(rawText, role, cfg, { filters: shaped.parts.length === 0 });
-    if (!decision.shouldCapture && shaped.parts.length === 0) continue;
-    const text = decision.shouldCapture ? decision.text : "";
-    turns.push({ role, text, parts: shaped.parts });
+    const shaped = shapeCapturePayload(payload, role, cfg, { toolNameById });
+    if (shaped.dropped || (!shaped.text && shaped.parts.length === 0)) continue;
+    turns.push({ role, text: shaped.parts.length ? shaped.signalText : shaped.text, parts: shaped.parts });
   }
   return turns;
 }
@@ -555,7 +628,7 @@ export function sanitizeCapturedText(text) {
     .replace(/^[ \t]*\[Subagent Context\][^\n]*$/gim, " ")
     .replace(/^\s*Sender\s*\([^)]+\)\s*```[\s\S]*?```\s*/gim, " ")
     .replace(/^\s*Conversation (?:metadata|info):\s*```[\s\S]*?```\s*/gim, " ")
-    .replace(/^\s*\[?\d{4}-\d{2}-\d{2}[T ][^\]\n]{3,80}\]?\s*/gm, "")
+    .replace(/^[ \t]*\[\d{4}-\d{2}-\d{2}[T ][-+0-9:.Z]{5,35}\][ \t]*/gm, "")
     .replace(/^\s*\d{10,13}\s+/gm, "");
   value = stripMetadataFences(value);
   value = stripInjectedDigestBlocks(value);
@@ -573,7 +646,7 @@ function hasEnoughSignal(text) {
 }
 
 function isPunctuationOnly(text) {
-  return !/[a-z0-9\u3400-\u9fff]/i.test(text);
+  return !/[\p{L}\p{N}\u3400-\u9fff]/u.test(text);
 }
 
 /**
@@ -598,16 +671,18 @@ export function shouldCaptureText(text, role, cfg = {}, { filters = true } = {})
   const sanitized = sanitizeCapturedText(text);
   if (!sanitized) return { shouldCapture: false, reason: "empty", text: "" };
 
-  let capped = truncateCaptureText(sanitized, maxLength);
+  // Rules judge the full sanitized turn; the wire cap applies afterward.
+  let filtered = sanitized;
   if (filters) {
     const compiled = compileInputFilters(cfg?.captureFilters);
     if (compiled.rules.length) {
-      const verdict = applyInputFilters(capped, compiled.rules, { role });
+      const verdict = applyInputFilters(filtered, compiled.rules, { role });
       if (verdict.dropped) return { shouldCapture: false, reason: "filtered", text: "" };
-      capped = verdict.text;
-      if (!capped) return { shouldCapture: false, reason: "empty", text: "" };
+      filtered = verdict.text;
+      if (!filtered) return { shouldCapture: false, reason: "empty", text: "" };
     }
   }
+  const capped = truncateCaptureText(filtered, maxLength);
   const compact = oneLine(capped);
   const isToolSummary = /^\[tool-(?:call|result)\b/i.test(compact);
 

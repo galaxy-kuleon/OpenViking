@@ -28,7 +28,8 @@ ENV PATH="/app/.venv/bin:/usr/local/cargo/bin:${PATH}"
 # Archive builds have no .git metadata. Keep the package version in this
 # committed Dockerfile so the image contents are a function of the gitlink.
 # The arg remains overridable for upstream release workflows.
-ARG OPENVIKING_VERSION=0.4.22
+ARG OPENVIKING_VERSION=0.5.1.1
+ARG UV_LOCK_STRATEGY=locked
 ARG TARGETPLATFORM
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -61,6 +62,7 @@ COPY crates/ crates/
 COPY openviking/ openviking/
 COPY --from=web-studio-builder /app/web-studio/dist/ openviking/web_studio/dist/
 COPY openviking_cli/ openviking_cli/
+COPY openviking_gateway/ openviking_gateway/
 COPY src/ src/
 COPY third_party/ third_party/
 
@@ -69,8 +71,29 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
     --mount=type=cache,target=/root/.ccache,id=ccache-${TARGETPLATFORM} \
-    export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"; \
-    uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss
+    if [ -n "${OPENVIKING_VERSION:-}" ]; then \
+        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="${OPENVIKING_VERSION}"; \
+    elif [ -f openviking/_version.py ]; then \
+        export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENVIKING="$(python -c "import runpy; print(runpy.run_path('openviking/_version.py')['version'])")"; \
+    else \
+        echo "OPENVIKING_VERSION build arg is required when building without openviking/_version.py" >&2; \
+        exit 2; \
+    fi; \
+    case "${UV_LOCK_STRATEGY}" in \
+        locked) \
+            uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss --extra expiry \
+            ;; \
+        auto) \
+            if ! uv lock --check; then \
+                uv lock; \
+            fi; \
+            uv sync --locked --no-editable --reinstall-package openviking --extra bot --extra gemini --extra opengauss --extra expiry \
+            ;; \
+        *) \
+            echo "Unsupported UV_LOCK_STRATEGY: ${UV_LOCK_STRATEGY}" >&2; \
+            exit 2 \
+            ;; \
+    esac
 
 # Stage 4: runtime
 FROM python:3.13-slim-trixie
@@ -80,14 +103,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     libstdc++6 \
+    libcairo2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Resolve relative storage paths inside the persistent mount.
 WORKDIR /app/.openviking
 
 COPY --from=py-builder /app/.venv /app/.venv
+# Exercise SVG rendering so missing Python or Cairo runtime dependencies fail the build.
+RUN /app/.venv/bin/python -I - <<'PYCODE'
+import cairosvg
+
+svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>'
+png = cairosvg.svg2png(bytestring=svg)
+assert png.startswith(b"\x89PNG\r\n\x1a\n"), "SVG conversion did not produce a PNG"
+PYCODE
 # Fail the image build if VikingBot and the separately released SDK drift apart.
-RUN /app/.venv/bin/python -I -c "import inspect; from importlib.metadata import version; from openviking_sdk.client import AsyncHTTPClient; signature = inspect.signature(AsyncHTTPClient.get_skill); raise SystemExit(0 if 'include_integrity' in signature.parameters else f\"incompatible openviking-sdk {version('openviking-sdk')}: AsyncHTTPClient.get_skill{signature} lacks include_integrity\")"
+RUN /app/.venv/bin/python -I -c "import inspect, typing; from importlib.metadata import version; from openviking_sdk.client import AsyncHTTPClient; from openviking_sdk.options import BatchWriteOptions; checks = {'get_skill.include_integrity': 'include_integrity' in inspect.signature(AsyncHTTPClient.get_skill).parameters, 'ls.offset': 'offset' in inspect.signature(AsyncHTTPClient.ls).parameters, 'grep.level_limit': 'level_limit' in inspect.signature(AsyncHTTPClient.grep).parameters, 'BatchWriteOptions.skip_conflicts': 'skip_conflicts' in typing.get_type_hints(BatchWriteOptions)}; missing = [name for name, ok in checks.items() if not ok]; raise SystemExit(f\"incompatible openviking-sdk {version('openviking-sdk')}: missing {', '.join(missing)}\" if missing else 0)"
 RUN /app/.venv/bin/python -I -c "from importlib.util import find_spec; from pathlib import Path; spec = find_spec('openviking.web_studio'); locations = list(spec.submodule_search_locations or ()) if spec else []; root = Path('/app/.venv').resolve(); p = (Path(locations[0]).resolve() / 'dist/index.html').resolve() if len(locations) == 1 else None; valid = p is not None and p.is_file() and p.is_relative_to(root); raise SystemExit(0 if valid else f'missing or misplaced Studio bundle: spec_found={spec is not None}, locations={locations!r}, resource={p}')"
 COPY deploy/docker/openviking-entrypoint.sh /usr/local/bin/openviking-entrypoint
 COPY deploy/docker/pending_health_server.py /usr/local/bin/openviking-pending-health

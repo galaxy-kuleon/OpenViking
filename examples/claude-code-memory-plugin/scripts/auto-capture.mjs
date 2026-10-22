@@ -38,7 +38,7 @@ import { readJsonState, writeJsonState } from "./lib/state.mjs";
 import { getEffectivePeerId } from "./lib/workspace-peer.mjs";
 import { runHookStage } from "./shared/agent-hook-runtime.mjs";
 import { sendSessionMessages } from "./shared/batch-send.mjs";
-import { filterCaptureParts } from "./shared/capture-utils.mjs";
+import { shapeCaptureParts } from "./shared/capture-utils.mjs";
 
 if (!isPluginEnabled()) {
   process.stdout.write(JSON.stringify({ decision: "approve" }) + "\n");
@@ -160,31 +160,13 @@ function formatTurnsAsText(turns) {
 // Persistent-session capture
 // ---------------------------------------------------------------------------
 
-// Strip plugin-injected blocks from text parts (tool parts pass through), and
-// drop parts that become empty. Mirrors the old content-path stripInjectedBlocks
-// + trim, but per text part so tool I/O is never collapsed. The configured
-// capture filters run last, here at the send site rather than in the extractor,
-// because the cursor CC advances is an index into the extracted turn list.
-function sanitizePartsForSend(parts, role = "", cfg = {}) {
-  const out = [];
-  for (const p of parts || []) {
-    if (p.type === "text") {
-      const t = sanitizeCapturedText(p.text);
-      if (t) out.push({ type: "text", text: t });
-    } else {
-      out.push(p);
-    }
-  }
-  const shaped = filterCaptureParts(out, role, cfg);
-  return shaped.dropped ? [] : shaped.parts;
-}
-
 async function pushTurnsToOv(ovSessionId, turns, peerId = "", cfg = {}) {
   const payloads = [];
   for (const turn of turns) {
     // Send structured parts: tool calls/results are dedicated `tool` parts, not
     // inlined into content, so the server can process them separately.
-    const parts = sanitizePartsForSend(turn.parts, turn.role, cfg);
+    // Shape at the send site: capturedTurnCount indexes the unfiltered turns.
+    const parts = shapeCaptureParts(turn.parts, turn.role, cfg).parts;
     if (parts.length === 0) continue;
 
     const payload = { role: turn.role, parts };
@@ -207,7 +189,7 @@ async function enqueueTurnsToPending(ovSessionId, turns, peerId = "", cfg = {}) 
   let queued = 0;
   let failed = 0;
   for (const turn of turns) {
-    const parts = sanitizePartsForSend(turn.parts, turn.role, cfg);
+    const parts = shapeCaptureParts(turn.parts, turn.role, cfg).parts;
     if (parts.length === 0) continue;
 
     const payload = { role: turn.role, parts };
@@ -428,9 +410,7 @@ async function main({ cfg, input, cwd }) {
     totalMessageCount = Number(meta?.total_message_count || 0);
     log("pending_tokens", { ovSessionId, pending: pendingTokens, threshold: cfg.commitTokenThreshold });
     if (pendingTokens >= cfg.commitTokenThreshold) {
-      const commitRes = await commitSession(fetchJSON, ovSessionId, {
-        keep_recent_count: cfg.commitKeepRecentCount,
-      });
+      const commitRes = await commitSession(fetchJSON, ovSessionId, { keep_recent_count: 0 });
       committed = commitRes.ok;
       commitTraceId = commitRes.traceId || commitRes.result?.trace_id || "";
       if (committed) commitCount += 1;
@@ -439,7 +419,6 @@ async function main({ cfg, input, cwd }) {
         ok: commitRes.ok,
         trace_id: commitTraceId || undefined,
         pending: pendingTokens,
-        keepRecentCount: cfg.commitKeepRecentCount,
       });
     }
   }

@@ -34,6 +34,9 @@ fn compact_request_body(body: &mut Value) {
         if key == "processing_mode" {
             return value != "semantic_and_vectors";
         }
+        if key == "search_type" {
+            return value != "semantic";
+        }
         true
     });
 }
@@ -346,8 +349,14 @@ impl HttpClient {
         self.get("/api/v1/content/read", &params).await
     }
 
-    pub async fn read_profiled(&self, uri: &str) -> Result<Value> {
-        let params = vec![("uri".to_string(), uri.to_string())];
+    /// Read content and optional profiling data, propagating HTTP errors.
+    /// `offset` is zero-based and nonnegative; `limit` is a line count or -1 for EOF.
+    pub async fn read_profiled(&self, uri: &str, offset: i64, limit: i64) -> Result<Value> {
+        let params = vec![
+            ("uri".to_string(), uri.to_string()),
+            ("offset".to_string(), offset.to_string()),
+            ("limit".to_string(), limit.to_string()),
+        ];
         self.get("/api/v1/content/read", &params).await
     }
 
@@ -377,13 +386,12 @@ impl HttpClient {
         content: &str,
         mode: &str,
         wait: bool,
-        timeout: Option<f64>,
         processing_mode: &str,
         tags: Vec<String>,
         tag_mode: &str,
         acl: Option<Value>,
     ) -> Result<serde_json::Value> {
-        let mut body = Self::build_write_body(uri, content, mode, wait, timeout, processing_mode);
+        let mut body = Self::build_write_body(uri, content, mode, wait, processing_mode);
         add_resource_tag_fields(&mut body, &tags, tag_mode);
         if let Some(acl) = acl {
             body["acl"] = acl;
@@ -454,7 +462,6 @@ impl HttpClient {
         content: &str,
         mode: &str,
         wait: bool,
-        timeout: Option<f64>,
         processing_mode: &str,
     ) -> Value {
         let mut body = serde_json::json!({
@@ -462,7 +469,6 @@ impl HttpClient {
             "content": content,
             "mode": mode,
             "wait": wait,
-            "timeout": timeout,
             "processing_mode": processing_mode,
         });
         compact_request_body(&mut body);
@@ -474,7 +480,7 @@ impl HttpClient {
         uri: &str,
         mode: &str,
         wait: bool,
-        dry_run: bool,
+        force: bool,
         tags: Vec<String>,
         tag_mode: &str,
         recursive: bool,
@@ -483,8 +489,10 @@ impl HttpClient {
             "uri": uri,
             "mode": mode,
             "wait": wait,
-            "dry_run": dry_run,
         });
+        if force {
+            body["force"] = serde_json::json!(true);
+        }
         if !recursive {
             body["recursive"] = serde_json::json!(false);
         }
@@ -497,20 +505,6 @@ impl HttpClient {
             "uri": uri,
         });
         self.post("/api/v1/system/consistency", &body).await
-    }
-
-    pub async fn backend_sync_status(&self, uri: &str) -> Result<serde_json::Value> {
-        let body = serde_json::json!({
-            "uri": uri,
-        });
-        self.post("/api/v1/system/backend/sync-status", &body).await
-    }
-
-    pub async fn backend_sync_retry(&self, uri: &str) -> Result<serde_json::Value> {
-        let body = serde_json::json!({
-            "uri": uri,
-        });
-        self.post("/api/v1/system/backend/sync-retry", &body).await
     }
 
     /// Download file as raw bytes
@@ -558,6 +552,9 @@ impl HttpClient {
         recursive: bool,
         output: &str,
         abs_limit: i32,
+        include_abstract: Option<bool>,
+        include_overview: Option<bool>,
+        overview_limit: i32,
         show_all_hidden: bool,
         node_limit: i32,
         offset: i32,
@@ -574,9 +571,16 @@ impl HttpClient {
             ("recursive".to_string(), recursive.to_string()),
             ("output".to_string(), output.to_string()),
             ("abs_limit".to_string(), abs_limit.to_string()),
+            ("overview_limit".to_string(), overview_limit.to_string()),
             ("show_all_hidden".to_string(), show_all_hidden.to_string()),
             ("node_limit".to_string(), node_limit.to_string()),
         ];
+        if let Some(value) = include_abstract {
+            params.push(("include_abstract".to_string(), value.to_string()));
+        }
+        if let Some(value) = include_overview {
+            params.push(("include_overview".to_string(), value.to_string()));
+        }
         if offset != 0 {
             params.push(("offset".to_string(), offset.to_string()));
         }
@@ -606,7 +610,11 @@ impl HttpClient {
         uri: &str,
         output: &str,
         abs_limit: i32,
+        include_abstract: Option<bool>,
+        include_overview: Option<bool>,
+        overview_limit: i32,
         show_all_hidden: bool,
+        directories_only: bool,
         node_limit: i32,
         level_limit: i32,
         offset: i32,
@@ -622,7 +630,17 @@ impl HttpClient {
             ("show_all_hidden".to_string(), show_all_hidden.to_string()),
             ("node_limit".to_string(), node_limit.to_string()),
             ("level_limit".to_string(), level_limit.to_string()),
+            ("overview_limit".to_string(), overview_limit.to_string()),
         ];
+        if let Some(value) = include_abstract {
+            params.push(("include_abstract".to_string(), value.to_string()));
+        }
+        if let Some(value) = include_overview {
+            params.push(("include_overview".to_string(), value.to_string()));
+        }
+        if directories_only {
+            params.push(("directories_only".to_string(), "true".to_string()));
+        }
         if offset != 0 {
             params.push(("offset".to_string(), offset.to_string()));
         }
@@ -662,16 +680,12 @@ impl HttpClient {
         uri: &str,
         recursive: bool,
         wait: bool,
-        timeout: Option<f64>,
     ) -> Result<serde_json::Value> {
-        let mut params = vec![
+        let params = vec![
             ("uri".to_string(), uri.to_string()),
             ("recursive".to_string(), recursive.to_string()),
             ("wait".to_string(), wait.to_string()),
         ];
-        if let Some(timeout) = timeout {
-            params.push(("timeout".to_string(), timeout.to_string()));
-        }
         self.delete("/api/v1/fs", &params).await
     }
 
@@ -723,6 +737,7 @@ impl HttpClient {
         context_type: Option<Vec<String>>,
         tags: Option<Vec<String>>,
         read_content: bool,
+        events_time_decay_protection: Option<String>,
     ) -> Result<serde_json::Value> {
         let image_url = normalize_image_input(image)?;
         let mut body = serde_json::json!({
@@ -738,6 +753,7 @@ impl HttpClient {
             "context_type": context_type,
             "tags": tags,
             "read_content": read_content.then_some(true),
+            "events_time_decay_protection": events_time_decay_protection,
         });
         compact_request_body(&mut body);
         self.post("/api/v1/search/find", &body).await
@@ -748,6 +764,8 @@ impl HttpClient {
         query: String,
         uri: String,
         image: Option<String>,
+        search_type: String,
+        mode: String,
         session_id: Option<String>,
         node_limit: i32,
         threshold: Option<f64>,
@@ -758,11 +776,15 @@ impl HttpClient {
         context_type: Option<Vec<String>>,
         tags: Option<Vec<String>>,
         read_content: bool,
+        events_time_decay_protection: Option<String>,
     ) -> Result<serde_json::Value> {
         let image_url = normalize_image_input(image)?;
         let mut body = serde_json::json!({
             "query": query,
             "image_url": image_url,
+            "search_type": search_type,
+            // Preserve the legacy request shape for servers without context mode.
+            "mode": (mode != "list").then_some(mode),
             "target_uri": uri,
             "session_id": session_id,
             "limit": node_limit,
@@ -774,6 +796,7 @@ impl HttpClient {
             "context_type": context_type,
             "tags": tags,
             "read_content": read_content.then_some(true),
+            "events_time_decay_protection": events_time_decay_protection,
         });
         compact_request_body(&mut body);
         self.post("/api/v1/search/search", &body).await
@@ -843,7 +866,6 @@ impl HttpClient {
         reason: &str,
         instruction: &str,
         wait: bool,
-        timeout: Option<f64>,
         strict: bool,
         ignore_dirs: Option<String>,
         include: Option<String>,
@@ -915,7 +937,6 @@ impl HttpClient {
                     "reason": reason,
                     "instruction": instruction,
                     "wait": wait,
-                    "timeout": timeout,
                     "strict": strict,
                     "ignore_dirs": ignore_dirs,
                     "include": include,
@@ -951,7 +972,6 @@ impl HttpClient {
                     "reason": reason,
                     "instruction": instruction,
                     "wait": wait,
-                    "timeout": timeout,
                     "strict": strict,
                     "ignore_dirs": ignore_dirs,
                     "include": include,
@@ -975,7 +995,6 @@ impl HttpClient {
                     "reason": reason,
                     "instruction": instruction,
                     "wait": wait,
-                    "timeout": timeout,
                     "strict": strict,
                     "ignore_dirs": ignore_dirs,
                     "include": include,
@@ -997,7 +1016,6 @@ impl HttpClient {
                 "reason": reason,
                 "instruction": instruction,
                 "wait": wait,
-                "timeout": timeout,
                 "strict": strict,
                 "ignore_dirs": ignore_dirs,
                 "include": include,
@@ -1181,7 +1199,6 @@ impl HttpClient {
         name: &str,
         data: &str,
         wait: bool,
-        timeout: Option<f64>,
         show_progress: bool,
         verbose: bool,
         source_metadata: Option<Value>,
@@ -1211,7 +1228,6 @@ impl HttpClient {
                 let mut body = serde_json::json!({
                     "temp_file_id": temp_file_id,
                     "wait": wait,
-                    "timeout": timeout,
                 });
                 if let Some(source_metadata) = source_metadata.clone() {
                     body["source_metadata"] = source_metadata;
@@ -1228,7 +1244,6 @@ impl HttpClient {
                 let mut body = serde_json::json!({
                     "temp_file_id": temp_file_id,
                     "wait": wait,
-                    "timeout": timeout,
                 });
                 if let Some(source_metadata) = source_metadata.clone() {
                     body["source_metadata"] = source_metadata;
@@ -1239,7 +1254,6 @@ impl HttpClient {
                 let mut body = serde_json::json!({
                     "data": data,
                     "wait": wait,
-                    "timeout": timeout,
                 });
                 if let Some(source_metadata) = source_metadata.clone() {
                     body["source_metadata"] = source_metadata;
@@ -1251,7 +1265,6 @@ impl HttpClient {
             let mut body = serde_json::json!({
                 "data": data,
                 "wait": wait,
-                "timeout": timeout,
             });
             if let Some(source_metadata) = source_metadata {
                 body["source_metadata"] = source_metadata;
@@ -1727,6 +1740,41 @@ impl HttpClient {
         self.get(&path, &[]).await
     }
 
+    pub async fn privacy_get_field(
+        &self,
+        category: &str,
+        target_key: &str,
+        field: &str,
+        reveal: bool,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/privacy-configs/{}/{}/field", category, target_key);
+        let mut params = vec![("field".to_string(), field.to_string())];
+        if reveal {
+            params.push(("reveal".to_string(), "true".to_string()));
+        }
+        self.get(&path, &params).await
+    }
+
+    pub async fn privacy_list_fields(
+        &self,
+        category: &str,
+        target_key: &str,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/privacy-configs/{}/{}/fields", category, target_key);
+        self.get(&path, &[]).await
+    }
+
+    pub async fn privacy_resolve_selector(
+        &self,
+        selector: &str,
+    ) -> Result<serde_json::Value> {
+        self.post(
+            "/api/v1/privacy-configs/resolve",
+            &serde_json::json!({"selector": selector}),
+        )
+        .await
+    }
+
     pub async fn privacy_upsert(
         &self,
         category: &str,
@@ -1735,6 +1783,16 @@ impl HttpClient {
     ) -> Result<serde_json::Value> {
         let path = format!("/api/v1/privacy-configs/{}/{}", category, target_key);
         self.post(&path, body).await
+    }
+
+    pub async fn privacy_patch(
+        &self,
+        category: &str,
+        target_key: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/privacy-configs/{}/{}", category, target_key);
+        self.patch(&path, body, &[]).await
     }
 
     pub async fn privacy_list_versions(
@@ -1774,6 +1832,44 @@ impl HttpClient {
         );
         let body = serde_json::json!({ "version": version });
         self.post(&path, &body).await
+    }
+
+    pub async fn privacy_delete(
+        &self,
+        category: &str,
+        target_key: &str,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/privacy-configs/{}/{}", category, target_key);
+        self.delete(&path, &[]).await
+    }
+
+    pub async fn privacy_delete_field(
+        &self,
+        category: &str,
+        target_key: &str,
+        field: &str,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/privacy-configs/{}/{}/field", category, target_key);
+        self.delete(&path, &[("field".to_string(), field.to_string())])
+            .await
+    }
+
+    pub async fn privacy_delete_selector(
+        &self,
+        selector: &str,
+    ) -> Result<serde_json::Value> {
+        self.delete_with_body(
+            "/api/v1/privacy-configs/selector",
+            &serde_json::json!({"selector": selector}),
+        )
+        .await
+    }
+
+    pub async fn privacy_scan(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.post("/api/v1/privacy-configs/scan", body).await
     }
 
     // ============ Watch Management (RFC #2104) ============
@@ -2039,7 +2135,6 @@ mod tests {
                 "",
                 "",
                 false,
-                None,
                 false,
                 None,
                 None,
@@ -2076,7 +2171,6 @@ mod tests {
                 "",
                 "",
                 false,
-                None,
                 false,
                 None,
                 None,
@@ -2117,6 +2211,86 @@ mod tests {
         });
         super::compact_request_body(&mut body);
         assert_eq!(body["processing_mode"], "vectors_only");
+    }
+
+    #[tokio::test]
+    async fn search_list_request_preserves_legacy_server_compatibility() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .search(
+                "OAuth token".to_string(),
+                String::new(),
+                None,
+                "semantic".to_string(),
+                "list".to_string(),
+                None,
+                10,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("list search should succeed");
+
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/search/search "));
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            json!({"query": "OAuth token", "target_uri": "", "limit": 10})
+        );
+    }
+
+    #[tokio::test]
+    async fn search_context_request_preserves_keywords_and_session_options() {
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .search(
+                "OAuth token".to_string(),
+                String::new(),
+                None,
+                "keywords".to_string(),
+                "context".to_string(),
+                Some("session-1".to_string()),
+                3,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec!["memory".to_string()]),
+                Some(vec!["project=openviking".to_string()]),
+                false,
+                Some("7d".to_string()),
+            )
+            .await
+            .expect("context search should succeed");
+
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("POST /api/v1/search/search "));
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            json!({
+                "query": "OAuth token",
+                "target_uri": "",
+                "search_type": "keywords",
+                "mode": "context",
+                "session_id": "session-1",
+                "limit": 3,
+                "context_type": ["memory"],
+                "tags": ["project=openviking"],
+                "events_time_decay_protection": "7d"
+            })
+        );
     }
 
     #[test]
@@ -2225,7 +2399,6 @@ mod tests {
             "updated",
             "replace",
             true,
-            Some(3.0),
             "semantic_and_vectors",
         );
 
@@ -2236,7 +2409,6 @@ mod tests {
                 "content": "updated",
                 "mode": "replace",
                 "wait": true,
-                "timeout": 3.0,
             })
         );
         assert!(body.get("regenerate_semantics").is_none());
@@ -2250,7 +2422,6 @@ mod tests {
             "updated",
             "replace",
             true,
-            None,
             "semantic_and_vectors",
         );
 
@@ -2264,7 +2435,6 @@ mod tests {
             "updated",
             "replace",
             true,
-            None,
             "vectors_only",
         );
 
@@ -2283,6 +2453,9 @@ mod tests {
                 false,
                 "agent",
                 256,
+                Some(false),
+                Some(true),
+                512,
                 false,
                 20,
                 4,
@@ -2303,6 +2476,9 @@ mod tests {
         assert!(request.contains("limit=5"));
         assert!(request.contains("sort_by=mtime"));
         assert!(request.contains("sort_order=desc"));
+        assert!(request.contains("include_abstract=false"));
+        assert!(request.contains("include_overview=true"));
+        assert!(request.contains("overview_limit=512"));
         assert!(!request.contains("tz="));
         assert!(!request.contains("include_mod_time_iso="));
 
@@ -2315,6 +2491,9 @@ mod tests {
                 false,
                 "agent",
                 256,
+                None,
+                None,
+                4000,
                 false,
                 20,
                 0,
@@ -2331,6 +2510,9 @@ mod tests {
             .await
             .expect("default request should be captured");
         assert!(!default_request.contains("offset="));
+        assert!(!default_request.contains("include_abstract="));
+        assert!(!default_request.contains("include_overview="));
+        assert!(default_request.contains("overview_limit=4000"));
         assert!(!default_request.contains("&limit="));
         assert!(!default_request.contains("sort_by="));
         assert!(!default_request.contains("sort_order="));
@@ -2477,7 +2659,11 @@ mod tests {
                 "viking://resources",
                 "agent",
                 256,
+                Some(false),
+                Some(true),
+                512,
                 false,
+                true,
                 20,
                 3,
                 4,
@@ -2494,6 +2680,10 @@ mod tests {
         assert!(request.contains("node_limit=20"));
         assert!(request.contains("offset=4"));
         assert!(request.contains("limit=5"));
+        assert!(request.contains("include_abstract=false"));
+        assert!(request.contains("include_overview=true"));
+        assert!(request.contains("overview_limit=512"));
+        assert!(request.contains("directories_only=true"));
         assert!(!request.contains("tz="));
         assert!(!request.contains("include_mod_time_iso="));
 
@@ -2504,6 +2694,10 @@ mod tests {
                 "viking://resources",
                 "agent",
                 256,
+                None,
+                None,
+                4000,
+                false,
                 false,
                 20,
                 3,
@@ -2519,6 +2713,9 @@ mod tests {
             .await
             .expect("default request should be captured");
         assert!(!default_request.contains("offset="));
+        assert!(!default_request.contains("include_abstract="));
+        assert!(!default_request.contains("include_overview="));
+        assert!(!default_request.contains("directories_only="));
         assert!(!default_request.contains("&limit="));
     }
 
@@ -2797,6 +2994,28 @@ mod tests {
         let result = crate::base_client::unwrap_success_envelope(body, false);
 
         assert_eq!(result, json!("content"));
+    }
+
+    #[tokio::test]
+    async fn read_profiled_sends_line_ranges() {
+        for (offset, limit) in [(0, -1), (10, 5), (10, -1), (0, 0)] {
+            let (base_url, request_rx) = spawn_request_capture_server().await;
+            let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+            client
+                .read_profiled("viking://resources/example.md", offset, limit)
+                .await
+                .expect("read request should succeed");
+            let request = request_rx.await.expect("request should be captured");
+            let target = request.split_whitespace().nth(1).expect("request target");
+            let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+            assert_eq!(url.path(), "/api/v1/content/read");
+            let params = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(params.get("uri").unwrap(), "viking://resources/example.md");
+            assert_eq!(params.get("offset").unwrap(), &offset.to_string());
+            assert_eq!(params.get("limit").unwrap(), &limit.to_string());
+        }
     }
 
     async fn spawn_request_capture_server() -> (String, oneshot::Receiver<String>) {

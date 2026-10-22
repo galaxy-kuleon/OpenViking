@@ -11,11 +11,25 @@ import pytest
 
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError
 from openviking.server.identity import RequestContext, Role
-from openviking.service.fs_service import FSService
+from openviking.service.fs_service import FSService, ListingPage
+from openviking.service.task_work_index import bind_task_context
 from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.errors import LockAcquisitionError
+from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
+
+
+@pytest.fixture(autouse=True)
+def run_fs_operations_inline(monkeypatch):
+    async def run_tracked_operation(_task_type, *, operation, **_kwargs):
+        with bind_task_context("test-task", "default", "test-user", enqueued_work=[]):
+            return await operation(), "test-task"
+
+    monkeypatch.setattr(
+        "openviking.service.fs_service.run_tracked_operation",
+        run_tracked_operation,
+    )
 
 
 class _FakeVikingFS:
@@ -247,41 +261,6 @@ class _FakeWatchScheduler:
         self.watch_manager = watch_manager
 
 
-class _FakeWaitTracker:
-    def __init__(self):
-        self.registered_requests = []
-        self.registered_roots = []
-        self.wait_calls = []
-        self.cleaned = []
-
-    def register_request(self, telemetry_id):
-        self.registered_requests.append(telemetry_id)
-
-    def register_semantic_root(self, telemetry_id, root_id):
-        self.registered_roots.append(
-            {
-                "telemetry_id": telemetry_id,
-                "root_id": root_id,
-                "request_was_registered": telemetry_id in self.registered_requests,
-            }
-        )
-
-    async def wait_for_request(self, telemetry_id, timeout=None):
-        self.wait_calls.append((telemetry_id, timeout))
-
-    def build_queue_status(self, telemetry_id):
-        return {
-            "Semantic": {"processed": 1, "error_count": 0, "errors": []},
-            "Embedding": {"processed": 0, "error_count": 0, "errors": []},
-        }
-
-    def mark_semantic_failed(self, telemetry_id, root_id, message):
-        pass
-
-    def cleanup(self, telemetry_id):
-        self.cleaned.append(telemetry_id)
-
-
 class _FakeQueueManager:
     SEMANTIC = "semantic"
 
@@ -483,12 +462,19 @@ async def test_grep_projects_tags_when_include_tags_is_requested(request_context
 
 
 @pytest.mark.asyncio
-async def test_ls_and_tree_skip_tag_projection_without_tags_or_include_tags(request_context):
-    entries = [{"uri": "viking://resources/a.md", "isDir": False}]
-    viking_fs = SimpleNamespace(
-        ls=AsyncMock(return_value=entries),
-        tree=AsyncMock(return_value=entries),
+async def test_plain_listing_reads_only_requested_page_summaries(request_context, monkeypatch):
+    selected = {"uri": "viking://resources/docs", "isDir": True}
+    entries = [selected, {"uri": "viking://resources/probe", "isDir": True}]
+    viking_fs = VikingFS(agfs=SimpleNamespace())
+    monkeypatch.setattr(viking_fs, "_ensure_access", AsyncMock())
+    monkeypatch.setattr(
+        viking_fs, "_ls_original", AsyncMock(return_value=[dict(e) for e in entries])
     )
+    monkeypatch.setattr(viking_fs, "_tree_original", AsyncMock(return_value=entries))
+    abstract = AsyncMock(return_value="L0 summary")
+    overview = AsyncMock(return_value="L1 overview")
+    monkeypatch.setattr(viking_fs, "_read_abstract_for_known_dir", abstract)
+    monkeypatch.setattr(viking_fs, "overview", overview)
 
     class FakeVikingDB:
         async def filter(self, **_kwargs):
@@ -496,8 +482,56 @@ async def test_ls_and_tree_skip_tag_projection_without_tags_or_include_tags(requ
 
     service = FSService(viking_fs=viking_fs, vikingdb=FakeVikingDB())
 
-    assert await service.ls("viking://resources", ctx=request_context) == entries
-    assert await service.tree("viking://resources", ctx=request_context) == entries
+    assert await service.ls(
+        "viking://resources",
+        ctx=request_context,
+        node_limit=1,
+        include_abstract=True,
+        include_overview=True,
+    ) == ListingPage(
+        entries=[{**selected, "abstract": "L0 summary", "overview": "L1 overview"}],
+        has_more=True,
+    )
+    assert await service.tree("viking://resources", ctx=request_context) == ListingPage(
+        entries=entries, has_more=False
+    )
+    abstract.assert_awaited_once_with(selected["uri"], ctx=request_context)
+    overview.assert_awaited_once_with(selected["uri"], ctx=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["ls", "tree"])
+@pytest.mark.parametrize(
+    ("entry_count", "expected_has_more"),
+    [(1, False), (2, False), (3, True)],
+)
+async def test_ls_and_tree_detect_more_entries_with_n_plus_one(
+    request_context, method_name, entry_count, expected_has_more
+):
+    entries = [
+        {"uri": f"viking://resources/{index}.md", "isDir": False} for index in range(entry_count)
+    ]
+
+    async def fetch(*_args, offset=0, node_limit=None, **_kwargs):
+        return entries[offset:] if node_limit is None else entries[offset : offset + node_limit]
+
+    viking_fs = SimpleNamespace(
+        ls=AsyncMock(side_effect=fetch),
+        tree=AsyncMock(side_effect=fetch),
+    )
+    service = FSService(viking_fs=viking_fs)
+
+    page = await getattr(service, method_name)(
+        "viking://resources",
+        ctx=request_context,
+        offset=0,
+        node_limit=2,
+    )
+
+    assert page.entries == entries[:2]
+    assert page.has_more is expected_has_more
+    fetch_mock = getattr(viking_fs, method_name)
+    assert fetch_mock.await_args.kwargs["node_limit"] == 3
 
 
 @pytest.mark.asyncio
@@ -647,7 +681,7 @@ async def test_tagged_grep_reuses_tags_returned_by_viking_fs(request_context):
 
 
 @pytest.mark.asyncio
-async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_context):
+async def test_ls_filters_and_paginates_before_reading_summaries(request_context, monkeypatch):
     entries = [
         {
             "uri": f"viking://resources/unmatched-{index:03d}.md",
@@ -656,17 +690,20 @@ async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_cont
         for index in range(256)
     ] + [
         {"uri": "viking://resources/b.md", "isDir": False},
-        {"uri": "viking://resources/c.md", "isDir": False},
+        {"uri": "viking://resources/docs", "isDir": True},
+        {"uri": "viking://resources/d.md", "isDir": False},
     ]
 
     async def fake_ls(*_args, offset=0, node_limit=None, **_kwargs):
         return entries[offset:] if node_limit is None else entries[offset : offset + node_limit]
 
-    finalized = [{"uri": "viking://resources/c.md", "isDir": False, "abstract": "summary"}]
-    viking_fs = SimpleNamespace(
-        ls=AsyncMock(side_effect=fake_ls),
-        _finalize_listing_entries=AsyncMock(return_value=finalized),
-    )
+    viking_fs = VikingFS(agfs=SimpleNamespace())
+    monkeypatch.setattr(viking_fs, "_ensure_access", AsyncMock())
+    monkeypatch.setattr(viking_fs, "_ls_original", AsyncMock(side_effect=fake_ls))
+    abstract = AsyncMock(return_value="L0 summary")
+    overview = AsyncMock(return_value="L1 overview")
+    monkeypatch.setattr(viking_fs, "_read_abstract_for_known_dir", abstract)
+    monkeypatch.setattr(viking_fs, "overview", overview)
 
     class FakeVikingDB:
         async def filter(self, **_kwargs):
@@ -677,7 +714,17 @@ async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_cont
                     "search_tags": ["team=search", "env=prod"],
                 },
                 {
-                    "uri": "viking://resources/c.md",
+                    "uri": "viking://resources/docs",
+                    "level": 0,
+                    "search_tags": ["team=search"],
+                },
+                {
+                    "uri": "viking://resources/docs",
+                    "level": 1,
+                    "search_tags": ["env=prod", "team=search"],
+                },
+                {
+                    "uri": "viking://resources/d.md",
                     "level": 2,
                     "search_tags": ["team=search", "env=prod"],
                 },
@@ -690,18 +737,24 @@ async def test_ls_applies_offset_and_node_limit_after_tag_filtering(request_cont
         tags=["team=search", "env=prod"],
         node_limit=1,
         offset=1,
-        output="agent",
+        include_abstract=True,
+        include_overview=True,
     )
 
-    assert result == finalized
-    assert viking_fs.ls.await_count == 2
-    assert viking_fs.ls.await_args_list[0].kwargs["output"] == "original"
-    assert viking_fs.ls.await_args_list[0].kwargs["node_limit"] == 256
-    assert viking_fs.ls.await_args_list[1].kwargs["offset"] == 256
-    selected = viking_fs._finalize_listing_entries.await_args.args[0]
-    assert selected == [
-        {"uri": "viking://resources/c.md", "isDir": False, "tags": ["team=search", "env=prod"]}
-    ]
+    assert result == ListingPage(
+        entries=[
+            {
+                "uri": "viking://resources/docs",
+                "isDir": True,
+                "tags": ["team=search", "env=prod"],
+                "abstract": "L0 summary",
+                "overview": "L1 overview",
+            }
+        ],
+        has_more=True,
+    )
+    abstract.assert_awaited_once_with("viking://resources/docs", ctx=request_context)
+    overview.assert_awaited_once_with("viking://resources/docs", ctx=request_context)
 
 
 @pytest.mark.asyncio
@@ -737,21 +790,40 @@ async def test_ls_tag_filter_keeps_zero_node_limit_unbounded_for_entry_and_simpl
         node_limit=0,
     )
 
-    assert [entry["uri"] for entry in entry_result] == [
+    assert [entry["uri"] for entry in entry_result.entries] == [
         "viking://resources/a.md",
         "viking://resources/b.md",
     ]
-    assert simple_result == ["viking://resources/a.md", "viking://resources/b.md"]
+    assert simple_result == ListingPage(
+        entries=["viking://resources/a.md", "viking://resources/b.md"], has_more=False
+    )
 
 
 @pytest.mark.asyncio
-async def test_tree_projects_directory_tags_from_abstract_and_overview_records(request_context):
+async def test_tree_projects_directory_tags_before_pagination_and_summaries(
+    request_context, monkeypatch
+):
     directory = {"uri": "viking://resources/docs", "isDir": True}
-    viking_fs = SimpleNamespace(tree=AsyncMock(return_value=[directory]))
+    entries = [
+        {"uri": "viking://resources/unmatched", "isDir": True},
+        {"uri": "viking://resources/skipped", "isDir": True},
+        directory,
+    ]
+    viking_fs = VikingFS(agfs=SimpleNamespace())
+    monkeypatch.setattr(viking_fs, "tree", AsyncMock(return_value=entries))
+    abstract = AsyncMock(return_value="L0 summary")
+    overview = AsyncMock(return_value="L1 overview")
+    monkeypatch.setattr(viking_fs, "_read_abstract_for_known_dir", abstract)
+    monkeypatch.setattr(viking_fs, "overview", overview)
 
     class FakeVikingDB:
         async def filter(self, **_kwargs):
             return [
+                {
+                    "uri": "viking://resources/skipped",
+                    "level": 0,
+                    "search_tags": ["team=search", "env=prod"],
+                },
                 {"uri": "viking://resources/docs", "level": 0, "search_tags": ["team=search"]},
                 {
                     "uri": "viking://resources/docs",
@@ -766,12 +838,30 @@ async def test_tree_projects_directory_tags_from_abstract_and_overview_records(r
         "viking://resources",
         ctx=request_context,
         tags=["team=search", "env=prod"],
+        node_limit=1,
+        offset=1,
+        include_abstract=True,
+        include_overview=True,
     )
 
-    assert result == [
-        {"uri": "viking://resources/docs", "isDir": True, "tags": ["team=search", "env=prod"]}
-    ]
-    assert viking_fs.tree.await_args.kwargs["node_limit"] == 1000
+    assert result == ListingPage(
+        entries=[
+            {
+                **directory,
+                "tags": ["team=search", "env=prod"],
+                "abstract": "L0 summary",
+                "overview": "L1 overview",
+            }
+        ],
+        has_more=False,
+    )
+    # Intermediate pages must not load summaries before tag filtering selects the final page.
+    fetch_options = viking_fs.tree.await_args.kwargs
+    assert fetch_options["output"] == "original"
+    assert fetch_options["include_abstract"] is None
+    assert fetch_options["include_overview"] is False
+    abstract.assert_awaited_once_with(directory["uri"], ctx=request_context)
+    overview.assert_awaited_once_with(directory["uri"], ctx=request_context)
 
 
 @pytest.mark.asyncio
@@ -793,18 +883,20 @@ async def test_tree_tag_filter_keeps_zero_node_limit_unbounded(request_context):
         "viking://resources", ctx=request_context, tags=["env=prod"], node_limit=0
     )
 
-    assert [entry["uri"] for entry in result] == [
+    assert [entry["uri"] for entry in result.entries] == [
         "viking://resources/a.md",
         "viking://resources/b.md",
     ]
+    assert result.has_more is False
     assert viking_fs.tree.await_args.kwargs["node_limit"] is None
 
 
 @pytest.mark.asyncio
-async def test_resource_rm_enqueues_parent_delete_refresh_and_waits(request_context):
+async def test_resource_rm_enqueues_parent_delete_refresh_and_waits(request_context, monkeypatch):
     viking_fs = _FakeVikingFS()
     service = FSService(viking_fs=viking_fs)
-    service._enqueue_delete_refresh = AsyncMock()
+    queue_manager = _FakeQueueManager()
+    monkeypatch.setattr("openviking.service.fs_service.get_queue_manager", lambda: queue_manager)
     service._wait_for_refresh = AsyncMock(return_value={"Semantic": {"pending_count": 0}})
 
     uri = "viking://resources/images/2026/06/10/不二周助_jpeg"
@@ -813,18 +905,15 @@ async def test_resource_rm_enqueues_parent_delete_refresh_and_waits(request_cont
         ctx=request_context,
         recursive=True,
         wait=True,
-        timeout=12.0,
     )
 
     assert viking_fs.rm_calls == [{"uri": uri, "recursive": True, "ctx": request_context}]
-    service._enqueue_delete_refresh.assert_awaited_once_with(
-        root_uri="viking://resources/images/2026/06/10",
-        deleted_uri=uri,
-        context_type="resource",
-        ctx=request_context,
-        force_refresh=True,
-    )
-    service._wait_for_refresh.assert_awaited_once_with(timeout=12.0)
+    assert len(queue_manager.messages) == 1
+    msg = queue_manager.messages[0]
+    assert msg.uri == "viking://resources/images/2026/06/10"
+    assert msg.context_type == "resource"
+    assert msg.recursive is False
+    assert msg.changes == {"deleted": [uri]}
     assert result["semantic_root_uri"] == "viking://resources/images/2026/06/10"
     assert result["semantic_status"] == "complete"
     assert result["queue_status"] == {"Semantic": {"pending_count": 0}}
@@ -832,7 +921,7 @@ async def test_resource_rm_enqueues_parent_delete_refresh_and_waits(request_cont
 
 @pytest.mark.asyncio
 async def test_resource_rm_reports_failed_semantic_status_when_wait_queue_has_errors(
-    request_context,
+    request_context, monkeypatch
 ):
     viking_fs = _FakeVikingFS()
     service = FSService(viking_fs=viking_fs)
@@ -877,13 +966,11 @@ async def test_resource_rm_without_wait_only_queues_refresh(request_context):
     viking_fs = _FakeVikingFS()
     service = FSService(viking_fs=viking_fs)
     service._enqueue_delete_refresh = AsyncMock()
-    service._wait_for_refresh = AsyncMock()
 
     uri = "viking://resources/images/2026/06/10/不二周助_jpeg"
     result = await service.rm(uri, ctx=request_context, recursive=True)
 
     service._enqueue_delete_refresh.assert_awaited_once()
-    service._wait_for_refresh.assert_not_awaited()
     assert result["semantic_status"] == "queued"
 
 
@@ -891,7 +978,6 @@ async def test_resource_rm_without_wait_only_queues_refresh(request_context):
 async def test_resource_scope_rm_does_not_refresh_global_root(request_context):
     service = FSService(viking_fs=_FakeVikingFS())
     service._enqueue_delete_refresh = AsyncMock()
-    service._wait_for_refresh = AsyncMock()
 
     result = await service.rm(
         "viking://resources",
@@ -901,7 +987,6 @@ async def test_resource_scope_rm_does_not_refresh_global_root(request_context):
     )
 
     service._enqueue_delete_refresh.assert_not_awaited()
-    service._wait_for_refresh.assert_not_awaited()
     assert "semantic_root_uri" not in result
 
 
@@ -1356,46 +1441,6 @@ async def test_transfer_refresh_message_records_deleted_source_entry(
 
     assert status == "queued"
     assert queue_manager.messages[0].changes == {"deleted": ["viking://resources/source/moved.md"]}
-
-
-@pytest.mark.asyncio
-async def test_resource_rm_wait_registers_request_before_semantic_root(
-    request_context,
-    monkeypatch,
-):
-    viking_fs = _FakeVikingFS()
-    service = FSService(viking_fs=viking_fs)
-    tracker = _FakeWaitTracker()
-    queue_manager = _FakeQueueManager()
-
-    monkeypatch.setattr(
-        "openviking.service.fs_service.get_current_telemetry",
-        lambda: SimpleNamespace(telemetry_id="tm-fs-rm"),
-    )
-    monkeypatch.setattr(
-        "openviking.service.fs_service.get_request_wait_tracker",
-        lambda: tracker,
-    )
-    monkeypatch.setattr(
-        "openviking.service.fs_service.get_queue_manager",
-        lambda: queue_manager,
-    )
-
-    result = await service.rm(
-        "viking://resources/images/2026/06/10/不二周助_jpeg",
-        ctx=request_context,
-        recursive=True,
-        wait=True,
-        timeout=3,
-    )
-
-    assert tracker.registered_requests == ["tm-fs-rm"]
-    assert tracker.registered_roots
-    assert tracker.registered_roots[0]["request_was_registered"] is True
-    assert queue_manager.messages[0].recursive is False
-    assert tracker.wait_calls == [("tm-fs-rm", 3)]
-    assert tracker.cleaned == ["tm-fs-rm"]
-    assert result["semantic_status"] == "complete"
 
 
 @pytest.mark.asyncio
